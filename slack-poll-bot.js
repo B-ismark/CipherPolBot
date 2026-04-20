@@ -31,8 +31,9 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS questions TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS anonymous BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS allow_revote BOOLEAN NOT NULL DEFAULT false`);
-  // Drop legacy single-question column if it exists (old schema used 'question' singular)
+  // Drop legacy columns from old single-question schema
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
+  await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
 }
 
 async function savePoll(poll) {
