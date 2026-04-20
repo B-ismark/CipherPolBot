@@ -504,79 +504,160 @@ function buildVoteModal(poll, previousVotes = {}) {
 
 // ==================== POLL DISPLAY ====================
 
+function pollProgressBar(count, total, width = 18) {
+  if (total === 0) return '░'.repeat(width);
+  const filled = Math.round((count / total) * width);
+  return '▓'.repeat(filled) + '░'.repeat(width - filled);
+}
+
 function buildPollBlocks(poll) {
   const questions = poll.questions || [];
-  const tags = [];
-  if (poll.anonymous)   tags.push('🔒 Anonymous');
-  if (poll.allowRevote) tags.push('🔄 Vote changes on');
+  const isClosed = poll.status === 'closed';
+
+  const settingTags = [
+    isClosed                ? '🔒 Closed'          : null,
+    poll.anonymous          ? '👁️ Anonymous'        : null,
+    poll.allowRevote        ? '🔄 Revote enabled'   : null,
+    `${questions.length} ${questions.length === 1 ? 'question' : 'questions'}` : null
+  ].filter(Boolean);
 
   const questionBlocks = questions.flatMap((q, qi) => {
     const qVotes = poll.votes[qi] || {};
 
+    // ── Open-ended ──────────────────────────────────────────────────────────
     if (q.type === 'open_ended') {
       const responses = Object.entries(qVotes);
       const count = responses.length;
-      const responseLines = !poll.anonymous && count > 0
-        ? responses.map(([uid, text]) => `> <@${uid}>: ${text}`).join('\n')
-        : '';
+      let body = count === 0
+        ? '_No responses yet_'
+        : poll.anonymous
+          ? `_${count} anonymous response${count !== 1 ? 's' : ''}_`
+          : responses.map(([uid, t]) => `> <@${uid}>:  ${t}`).join('\n');
       return [
         {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `*${qi + 1}. ${q.text}*\n_${count} ${count === 1 ? 'response' : 'responses'}_${responseLines ? '\n' + responseLines : ''}`
+            text: `*${qi + 1}.  ${q.text}*\n_Open ended  ·  ${count} response${count !== 1 ? 's' : ''}_\n${body}`
           }
         },
         { type: 'divider' }
       ];
     }
 
+    // ── Choice question ──────────────────────────────────────────────────────
     const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-    const qLabel = q.allowMultiple ? `*${qi + 1}. ${q.text}*  _(multi-select)_` : `*${qi + 1}. ${q.text}*`;
+    const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
+    const typeHint   = q.allowMultiple ? `${getTypeLabel(q.type)}  ·  multi-select` : getTypeLabel(q.type);
+
+    const optionBlocks = q.options.map((option, oi) => {
+      const voters = qVotes[oi] || [];
+      const count  = voters.length;
+      const pct    = totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
+      const bar    = `\`${pollProgressBar(count, totalVotes)}\``;
+      const isWinner = totalVotes > 0 && count === maxVotes && count > 0;
+      const medal    = isWinner ? '  🏆' : '';
+      const voterLine = !poll.anonymous && count > 0
+        ? `\n${voters.map(id => `<@${id}>`).join('  ')}`
+        : '';
+
+      const label = `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*${medal}`;
+      const stats = totalVotes === 0
+        ? ''
+        : `\n${bar}  *${count}* ${count === 1 ? 'vote' : 'votes'}  ·  ${pct}%${voterLine}`;
+
+      return {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `${label}${stats}` }
+      };
+    });
 
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: qLabel } },
-      ...q.options.map((option, oi) => {
-        const voters = qVotes[oi] || [];
-        const count = voters.length;
-        const pct = totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
-        const bar = '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5));
-        const voterLine = !poll.anonymous && count > 0 ? '\n' + voters.map(id => `<@${id}>`).join(' ') : '';
-        return {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: totalVotes === 0
-              ? `${OPTION_EMOJIS[oi] || `${oi + 1}.`} ${option}`
-              : `${OPTION_EMOJIS[oi] || `${oi + 1}.`} ${option}\n${bar} ${count} ${count === 1 ? 'vote' : 'votes'} (${pct}%)${voterLine}`
-          }
-        };
-      }),
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${qi + 1}.  ${q.text}*\n_${typeHint}${totalVotes > 0 ? `  ·  ${totalVotes} ${totalVotes === 1 ? 'vote' : 'votes'} cast` : ''}_`
+        }
+      },
+      ...optionBlocks,
       { type: 'divider' }
     ];
   });
 
+  const actionButtons = isClosed
+    ? [
+        { type: 'button', text: { type: 'plain_text', text: '🔒  Voting Closed', emoji: true }, action_id: 'open_vote_modal', value: poll.id },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results', emoji: true }, action_id: 'share_poll',      value: poll.id }
+      ]
+    : [
+        { type: 'button', text: { type: 'plain_text', text: '🗳️  Vote',  emoji: true }, style: 'primary', action_id: 'open_vote_modal', value: poll.id },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share', emoji: true },                  action_id: 'share_poll',       value: poll.id }
+      ];
+
   return [
-    { type: 'section', text: { type: 'mrkdwn', text: `📊 *${poll.title}*` } },
+    { type: 'header', text: { type: 'plain_text', text: `📊  ${poll.title}`, emoji: true } },
     ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-    ...(tags.length ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: tags.join('  ·  ') }] }] : []),
+    { type: 'context', elements: [{ type: 'mrkdwn', text: settingTags.join('  ·  ') }] },
     { type: 'divider' },
     ...questionBlocks,
-    {
-      type: 'actions',
-      elements: [{
-        type: 'button', text: { type: 'plain_text', text: '🗳️ Vote' },
-        style: 'primary', action_id: 'open_vote_modal', value: poll.id
-      }]
-    },
+    { type: 'actions', elements: actionButtons },
     {
       type: 'context',
       elements: [{
         type: 'mrkdwn',
-        text: `Created by <@${poll.creator}> • ID: \`${poll.id}\` • ${questions.length} ${questions.length === 1 ? 'question' : 'questions'}`
+        text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`  ·  Use \`/poll-share ${poll.id}\` to repost`
       }]
     }
   ];
+}
+
+// Share-poll modal — lets user pick a channel to repost the poll
+function buildShareModal(poll) {
+  const totalParticipants = new Set(
+    Object.values(poll.votes).flatMap(qv => {
+      const vals = Object.values(qv);
+      if (!vals.length) return [];
+      return Array.isArray(vals[0]) ? vals.flat() : Object.keys(qv);
+    })
+  ).size;
+
+  return {
+    type: 'modal',
+    callback_id: 'share_poll_submit',
+    title: { type: 'plain_text', text: 'Share Poll' },
+    submit: { type: 'plain_text', text: '📤  Post to Channel' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    private_metadata: JSON.stringify({ pollId: poll.id }),
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${poll.title}*\n_${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}  ·  ${totalParticipants} participant${totalParticipants !== 1 ? 's' : ''} so far_`
+        }
+      },
+      { type: 'divider' },
+      {
+        type: 'input',
+        block_id: 'share_channel',
+        label: { type: 'plain_text', text: 'Post to channel' },
+        element: {
+          type: 'conversations_select',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Choose a channel...' },
+          filter: { include: ['public', 'private', 'im', 'mpim'], exclude_bot_users: true }
+        }
+      },
+      {
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: `The poll and its *Vote* button will be posted there. Votes cast from any channel all count toward the same poll.\nPoll ID: \`${poll.id}\``
+        }]
+      }
+    ]
+  };
 }
 
 function buildResultsBlocks(poll, heading) {
@@ -1101,6 +1182,39 @@ app.view('poll_preview_submit', async ({ ack, body, view, client }) => {
   } catch (err) {
     console.error('poll_preview_submit error:', err);
     await notifyError(client, meta.userId, `❌ Failed to create poll: ${err.message}`);
+  }
+});
+
+// "📤 Share" button on poll message — opens channel picker modal
+app.action('share_poll', async ({ ack, body, client, action }) => {
+  await ack();
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) return;
+    await client.views.open({ trigger_id: body.trigger_id, view: buildShareModal(poll) });
+  } catch (err) {
+    console.error('share_poll error:', err);
+  }
+});
+
+// Share modal submitted — post the poll to the chosen channel
+app.view('share_poll_submit', async ({ ack, body, view, client }) => {
+  await ack();
+  const { pollId } = JSON.parse(view.private_metadata);
+  const channelId = view.state.values.share_channel?.value?.selected_conversation;
+  if (!channelId) return;
+
+  try {
+    const poll = await getPoll(pollId);
+    if (!poll) return;
+    await client.chat.postMessage({
+      channel: channelId,
+      text: `📊 ${poll.title}`,
+      blocks: buildPollBlocks(poll)
+    });
+  } catch (err) {
+    console.error('share_poll_submit error:', err);
+    await notifyError(client, body.user.id, `❌ Failed to share poll: ${err.message}`);
   }
 });
 
