@@ -643,7 +643,12 @@ function buildResultsBlocks(poll, heading) {
 
 async function updatePollMessage(client, poll) {
   try {
-    await client.chat.update({ channel: poll.channelId, ts: poll.messageTs, blocks: buildPollBlocks(poll) });
+    await client.chat.update({
+      channel: poll.channelId,
+      ts: poll.messageTs,
+      text: `📊 ${poll.title}`,
+      blocks: buildPollBlocks(poll)
+    });
   } catch (err) { console.error('updatePollMessage error:', err.message); }
 }
 
@@ -675,7 +680,11 @@ async function createAndPostPoll(client, meta) {
 
   await savePoll(poll);
   const channel = await resolveChannel(client, channelId, userId);
-  const result = await client.chat.postMessage({ channel, blocks: buildPollBlocks(poll) });
+  const result = await client.chat.postMessage({
+    channel,
+    text: `📊 ${poll.title}`,
+    blocks: buildPollBlocks(poll)
+  });
   poll.messageTs = result.ts;
   poll.channelId = channel;
   await savePoll(poll);
@@ -722,62 +731,88 @@ app.command('/newpoll', async ({ ack, body, client }) => {
 
 app.command('/poll-results', async ({ ack, body, client }) => {
   await ack();
-  const userId = body.user_id;
-  const channel = await resolveChannel(client, body.channel_id, userId);
-  const pollId = body.text.trim();
-  if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-results POLL_ID`' });
-  const poll = await getPoll(pollId);
-  if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-  await client.chat.postMessage({ channel, blocks: buildResultsBlocks(poll, 'Poll Results') });
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const pollId = body.text.trim();
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-results POLL_ID`' });
+    const poll = await getPoll(pollId);
+    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+    await client.chat.postMessage({ channel, text: `📊 Results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Poll Results') });
+  } catch (err) {
+    console.error('/poll-results error:', err);
+    await notifyError(client, body.user_id, `❌ /poll-results failed: ${err.message}`);
+  }
 });
 
 app.command('/poll-share', async ({ ack, body, client }) => {
   await ack();
-  const userId = body.user_id;
-  const channel = await resolveChannel(client, body.channel_id, userId);
-  const pollId = body.text.trim();
-  if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID`' });
-  const poll = await getPoll(pollId);
-  if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-  await client.chat.postMessage({ channel, blocks: buildResultsBlocks(poll, 'Current Results') });
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const pollId = body.text.trim();
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID`' });
+    const poll = await getPoll(pollId);
+    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+    await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results') });
+  } catch (err) {
+    console.error('/poll-share error:', err);
+    await notifyError(client, body.user_id, `❌ /poll-share failed: ${err.message}`);
+  }
 });
 
 app.command('/polls-list', async ({ ack, body, client }) => {
   await ack();
-  const userId = body.user_id;
-  const channel = await resolveChannel(client, body.channel_id, userId);
-  const polls = await getAllPolls();
-  if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now.' });
-  await client.chat.postMessage({
-    channel,
-    blocks: [
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const polls = await getAllPolls();
+    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now.' });
+    const listBlocks = [
       { type: 'header', text: { type: 'plain_text', text: 'Active Polls' } },
       ...polls.map((p, i) => {
         const participants = new Set(
           Object.values(p.votes).flatMap(qv => {
             const vals = Object.values(qv);
-            return vals.length && Array.isArray(vals[0]) ? vals.flat() : Object.keys(qv);
+            if (!vals.length) return [];
+            return Array.isArray(vals[0]) ? vals.flat() : Object.keys(qv);
           })
         ).size;
-        const tags = [`${p.questions.length} q`, `${participants} participant${participants !== 1 ? 's' : ''}`,
-          ...(p.anonymous ? ['🔒'] : []), ...(p.allowRevote ? ['🔄'] : [])];
-        return { type: 'section', text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` } };
+        const tags = [
+          `${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}`,
+          `${participants} participant${participants !== 1 ? 's' : ''}`,
+          ...(p.anonymous   ? ['🔒 Anonymous'] : []),
+          ...(p.allowRevote ? ['🔄 Revote on'] : [])
+        ];
+        return {
+          type: 'section',
+          text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` }
+        };
       })
-    ]
-  });
+    ];
+    await client.chat.postMessage({ channel, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+  } catch (err) {
+    console.error('/polls-list error:', err);
+    await notifyError(client, body.user_id, `❌ /polls-list failed: ${err.message}`);
+  }
 });
 
 app.command('/poll-close', async ({ ack, body, client }) => {
   await ack();
-  const userId = body.user_id;
-  const channel = await resolveChannel(client, body.channel_id, userId);
-  const pollId = body.text.trim();
-  if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
-  const poll = await getPoll(pollId);
-  if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-  if (poll.creator !== userId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
-  await closePoll(pollId);
-  await client.chat.postMessage({ channel, blocks: buildResultsBlocks({ ...poll, status: 'closed' }, '🔒 Final Results') });
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const pollId = body.text.trim();
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
+    const poll = await getPoll(pollId);
+    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+    if (poll.creator !== userId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
+    await closePoll(pollId);
+    await client.chat.postMessage({ channel, text: `🔒 Poll closed: ${poll.title}`, blocks: buildResultsBlocks({ ...poll, status: 'closed' }, '🔒 Final Results') });
+  } catch (err) {
+    console.error('/poll-close error:', err);
+    await notifyError(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
+  }
 });
 
 // ==================== MAIN MODAL ACTIONS ====================
