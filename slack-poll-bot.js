@@ -99,8 +99,8 @@ const OPTION_EMOJIS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6
 
 // ==================== COMMANDS ====================
 
-// /poll - Create a new poll
-app.command('/poll', async ({ ack, body, client }) => {
+// /newpoll - Create a new poll
+app.command('/newpoll', async ({ ack, body, client }) => {
   await ack();
 
   const userId = body.user_id;
