@@ -99,6 +99,15 @@ app.error(async (error) => {
   console.error('Bolt error:', JSON.stringify(error, null, 2));
 });
 
+// Resolves the correct channel to post to — handles DM channel IDs
+async function resolveChannel(client, channelId, userId) {
+  if (channelId.startsWith('D')) {
+    const result = await client.conversations.open({ users: userId });
+    return result.channel.id;
+  }
+  return channelId;
+}
+
 const OPTION_EMOJIS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
 
 // ==================== COMMANDS ====================
@@ -110,11 +119,12 @@ app.command('/newpoll', async ({ ack, body, client }) => {
   const userId = body.user_id;
 
   try {
+    const channel = await resolveChannel(client, body.channel_id, userId);
     const parts = body.text.split('|').map(p => p.trim()).filter(Boolean);
 
     if (parts.length < 3) {
       return client.chat.postEphemeral({
-        channel: body.channel_id,
+        channel,
         user: userId,
         text: '❌ Invalid format. Usage:\n`/newpoll Your question? | Option A | Option B | Option C`'
       });
@@ -124,7 +134,7 @@ app.command('/newpoll', async ({ ack, body, client }) => {
 
     if (options.length > 10) {
       return client.chat.postEphemeral({
-        channel: body.channel_id,
+        channel,
         user: userId,
         text: '❌ Maximum 10 options allowed.'
       });
@@ -137,14 +147,14 @@ app.command('/newpoll', async ({ ack, body, client }) => {
       options,
       votes: Object.fromEntries(options.map((_, i) => [i, []])),
       creator: userId,
-      channelId: body.channel_id,
+      channelId: channel,
       status: 'active'
     };
 
     await savePoll(poll);
 
     const result = await client.chat.postMessage({
-      channel: body.channel_id,
+      channel,
       blocks: buildPollBlocks(poll)
     });
 
@@ -164,11 +174,13 @@ app.command('/newpoll', async ({ ack, body, client }) => {
 app.command('/poll-results', async ({ ack, body, client }) => {
   await ack();
 
+  const userId = body.user_id;
+  const channel = await resolveChannel(client, body.channel_id, userId);
   const pollId = body.text.trim();
   if (!pollId) {
     return client.chat.postEphemeral({
-      channel: body.channel_id,
-      user: body.user_id,
+      channel,
+      user: userId,
       text: '❌ Usage: `/poll-results POLL_ID`'
     });
   }
@@ -176,8 +188,8 @@ app.command('/poll-results', async ({ ack, body, client }) => {
   const poll = await getPoll(pollId);
   if (!poll) {
     return client.chat.postEphemeral({
-      channel: body.channel_id,
-      user: body.user_id,
+      channel,
+      user: userId,
       text: `❌ Poll not found: \`${pollId}\``
     });
   }
@@ -185,7 +197,7 @@ app.command('/poll-results', async ({ ack, body, client }) => {
   const totalVotes = Object.values(poll.votes).reduce((sum, v) => sum + v.length, 0);
 
   await client.chat.postMessage({
-    channel: body.channel_id,
+    channel,
     blocks: [
       { type: 'header', text: { type: 'plain_text', text: `📊 ${poll.question}` } },
       ...poll.options.map((option, i) => {
@@ -215,18 +227,20 @@ app.command('/poll-results', async ({ ack, body, client }) => {
 app.command('/polls-list', async ({ ack, body, client }) => {
   await ack();
 
+  const userId = body.user_id;
+  const channel = await resolveChannel(client, body.channel_id, userId);
   const activePolls = await getAllPolls();
 
   if (activePolls.length === 0) {
     return client.chat.postEphemeral({
-      channel: body.channel_id,
-      user: body.user_id,
+      channel,
+      user: userId,
       text: '📭 No active polls right now.'
     });
   }
 
   await client.chat.postMessage({
-    channel: body.channel_id,
+    channel,
     blocks: [
       { type: 'header', text: { type: 'plain_text', text: '📋 Active Polls' } },
       ...activePolls.map((poll, i) => {
@@ -249,11 +263,12 @@ app.command('/poll-close', async ({ ack, body, client }) => {
 
   const pollId = body.text.trim();
   const userId = body.user_id;
+  const channel = await resolveChannel(client, body.channel_id, userId);
 
   const poll = await getPoll(pollId);
   if (!poll) {
     return client.chat.postEphemeral({
-      channel: body.channel_id,
+      channel,
       user: userId,
       text: `❌ Poll not found: \`${pollId}\``
     });
@@ -261,7 +276,7 @@ app.command('/poll-close', async ({ ack, body, client }) => {
 
   if (poll.creator !== userId) {
     return client.chat.postEphemeral({
-      channel: body.channel_id,
+      channel,
       user: userId,
       text: '❌ Only the poll creator can close this poll.'
     });
@@ -270,7 +285,7 @@ app.command('/poll-close', async ({ ack, body, client }) => {
   await closePoll(pollId);
 
   await client.chat.postMessage({
-    channel: body.channel_id,
+    channel,
     text: `🔒 Poll closed: *${poll.question}*`
   });
 });
