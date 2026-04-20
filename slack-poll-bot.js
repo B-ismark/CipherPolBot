@@ -6,7 +6,10 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 5
 });
 
 async function initDb() {
@@ -1332,9 +1335,18 @@ receiver.router.get('/health', (req, res) => res.json({ status: 'ok', uptime: pr
 // ==================== START ====================
 
 (async () => {
-  await initDb();
-  await app.start(process.env.PORT || 3000);
-  console.log('⚡️ Slack Poll Bot is running!');
-  console.log(`📍 Port: ${process.env.PORT || 3000}`);
-  console.log(`💾 Database: Neon PostgreSQL`);
+  const port = process.env.PORT || 3000;
+
+  // Bind the port FIRST — Render will kill the process if no port is open within ~60s
+  await app.start(port);
+  console.log(`⚡️ Server listening on port ${port}`);
+
+  // Init DB after port is bound so Render sees the service as healthy
+  try {
+    await initDb();
+    console.log('💾 Database ready');
+  } catch (err) {
+    // Log the error but don't crash — health check still passes, DB ops will surface errors per-request
+    console.error('⚠️  DB init error (will retry on next request):', err.message);
+  }
 })();
