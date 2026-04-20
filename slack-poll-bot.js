@@ -31,6 +31,8 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS questions TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS anonymous BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS allow_revote BOOLEAN NOT NULL DEFAULT false`);
+  // Drop legacy single-question column if it exists (old schema used 'question' singular)
+  await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
 }
 
 async function savePoll(poll) {
@@ -225,19 +227,66 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
 }
 
 // The pushed question-form modal (opened via views.push from the main modal)
-function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {}) {
+function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {}, errorMsg = null) {
   const { savedQuestions = [], editingIndex } = meta;
   const isEditing = editingIndex !== undefined && editingIndex !== null;
   const qNum = savedQuestions.length + 1;
+
+  const savedCount = savedQuestions.length;
+  const savedSummary = savedCount > 0
+    ? `_${savedCount} ${savedCount === 1 ? 'question' : 'questions'} saved: ${savedQuestions.map((q, i) => `${i + 1}. ${q.text.length > 30 ? q.text.slice(0, 30) + '…' : q.text}`).join('  ·  ')}_`
+    : '_No questions added yet_';
+
+  const actionButtons = isEditing ? [] : [
+    { type: 'divider' },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: savedSummary }]
+    },
+    {
+      type: 'actions',
+      block_id: 'question_actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '＋  Add Another Question' },
+          action_id: 'add_another_question'
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '✓  Create Poll' },
+          style: 'primary',
+          action_id: 'finish_and_create'
+        }
+      ]
+    }
+  ];
 
   return {
     type: 'modal',
     callback_id: 'question_submit',
     title: { type: 'plain_text', text: isEditing ? 'Edit Question' : 'New Question' },
-    submit: { type: 'plain_text', text: isEditing ? 'Update' : 'Add Question' },
+    submit: { type: 'plain_text', text: isEditing ? 'Update' : '← Done (review)' },
     close: { type: 'plain_text', text: '← Back' },
     private_metadata: JSON.stringify(meta),
-    blocks: questionFormBlocks(qNum, currentType, restore)
+    blocks: [
+      ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
+      ...questionFormBlocks(qNum, currentType, restore),
+      ...actionButtons
+    ]
+  };
+}
+
+// Success modal shown after poll is created
+function buildSuccessModal(pollTitle) {
+  return {
+    type: 'modal',
+    title: { type: 'plain_text', text: 'Poll Created! 🎉' },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: `✅ *${pollTitle || 'Your poll'}* has been posted to the channel.` } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Head back to the chat to see it and start collecting votes.' }] }
+    ]
   };
 }
 
@@ -845,6 +894,94 @@ app.action('question_type_changed', async ({ ack, body, client }) => {
     view_id: body.view.id,
     view: buildQuestionModal(meta, newType, { text: currentText, options: currentOptions, allowMultiple })
   });
+});
+
+// "＋ Add Another Question" — validates current form, saves question, resets form (stay in modal)
+app.action('add_another_question', async ({ ack, body, client }) => {
+  await ack();
+  const meta = JSON.parse(body.view.private_metadata);
+  const values = body.view.state.values;
+  const qNum = meta.savedQuestions.length + 1;
+  const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
+
+  if (!text) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter a question.')
+    });
+  }
+  if (!AUTO_OPTION_TYPES.includes(type) && parseOptions(optionsRaw).length < 2) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter at least 2 options.')
+    });
+  }
+
+  const updatedMeta = {
+    ...meta,
+    savedQuestions: [...meta.savedQuestions, buildQuestion(text, type, optionsRaw, allowMultiple)],
+    editingIndex: null
+  };
+
+  // Refresh the question modal with an empty form
+  await client.views.update({
+    view_id: body.view.id,
+    view: buildQuestionModal(updatedMeta)
+  });
+
+  // Keep the main modal in sync
+  try {
+    await client.views.update({
+      view_id: body.view.root_view_id,
+      view: buildCreationModal(updatedMeta)
+    });
+  } catch (_) {}
+});
+
+// "✓ Create Poll" — validates, saves current question, creates poll, shows success
+app.action('finish_and_create', async ({ ack, body, client }) => {
+  await ack();
+  const meta = JSON.parse(body.view.private_metadata);
+  const values = body.view.state.values;
+  const qNum = meta.savedQuestions.length + 1;
+  const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
+
+  let allQuestions = [...meta.savedQuestions];
+
+  // Include current in-progress question if it has text
+  if (text) {
+    if (!AUTO_OPTION_TYPES.includes(type) && parseOptions(optionsRaw).length < 2) {
+      return client.views.update({
+        view_id: body.view.id,
+        view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter at least 2 options.')
+      });
+    }
+    allQuestions.push(buildQuestion(text, type, optionsRaw, allowMultiple));
+  }
+
+  if (allQuestions.length === 0) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please add at least one question.')
+    });
+  }
+
+  try {
+    await createAndPostPoll(client, { ...meta, savedQuestions: allQuestions });
+    const title = meta.pollTitle || allQuestions[0]?.text || 'Poll';
+    // Update both modals to success state so user sees a clean result
+    await Promise.allSettled([
+      client.views.update({ view_id: body.view.id,           view: buildSuccessModal(title) }),
+      client.views.update({ view_id: body.view.root_view_id, view: buildSuccessModal(title) })
+    ]);
+  } catch (err) {
+    console.error('finish_and_create error:', err);
+    client.views.update({
+      view_id: body.view.id,
+      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, `Failed to create poll: ${err.message}`)
+    });
+    await notifyError(client, meta.userId, `❌ Failed to create poll: ${err.message}`);
+  }
 });
 
 // ==================== VIEW SUBMISSIONS ====================
