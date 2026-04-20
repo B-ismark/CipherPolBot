@@ -1,0 +1,21 @@
+{
+  "name": "slack-poll-bot",
+  "version": "1.0.0",
+  "description": "A Slack bot for creating and managing polls — all free, no paid services",
+  "main": "slack-poll-bot.js",
+  "scripts": {
+    "start": "node slack-poll-bot.js",
+    "dev": "nodemon slack-poll-bot.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.18.0",
+    "dotenv": "^16.3.1",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
