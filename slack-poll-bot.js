@@ -818,7 +818,7 @@ app.command('/poll-results', async ({ ack, body, client }) => {
   try {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
-    const pollId = body.text.trim();
+    const pollId = body.text.trim().replace(/`/g, '');
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-results POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
@@ -834,7 +834,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
   try {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
-    const pollId = body.text.trim();
+    const pollId = body.text.trim().replace(/`/g, '');
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
@@ -886,7 +886,7 @@ app.command('/poll-close', async ({ ack, body, client }) => {
   try {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
-    const pollId = body.text.trim();
+    const pollId = body.text.trim().replace(/`/g, '');
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
