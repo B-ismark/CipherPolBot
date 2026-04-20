@@ -104,46 +104,56 @@ app.command('/newpoll', async ({ ack, body, client }) => {
   await ack();
 
   const userId = body.user_id;
-  const parts = body.text.split('|').map(p => p.trim()).filter(Boolean);
 
-  if (parts.length < 3) {
-    return client.chat.postEphemeral({
+  try {
+    const parts = body.text.split('|').map(p => p.trim()).filter(Boolean);
+
+    if (parts.length < 3) {
+      return client.chat.postEphemeral({
+        channel: body.channel_id,
+        user: userId,
+        text: '❌ Invalid format. Usage:\n`/newpoll Your question? | Option A | Option B | Option C`'
+      });
+    }
+
+    const [question, ...options] = parts;
+
+    if (options.length > 10) {
+      return client.chat.postEphemeral({
+        channel: body.channel_id,
+        user: userId,
+        text: '❌ Maximum 10 options allowed.'
+      });
+    }
+
+    const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
+    const poll = {
+      id: pollId,
+      question,
+      options,
+      votes: Object.fromEntries(options.map((_, i) => [i, []])),
+      creator: userId,
+      channelId: body.channel_id,
+      status: 'active'
+    };
+
+    await savePoll(poll);
+
+    const result = await client.chat.postMessage({
+      channel: body.channel_id,
+      blocks: buildPollBlocks(poll)
+    });
+
+    poll.messageTs = result.ts;
+    await savePoll(poll);
+  } catch (err) {
+    console.error('/newpoll error:', err);
+    await client.chat.postEphemeral({
       channel: body.channel_id,
       user: userId,
-      text: '❌ Invalid format. Usage:\n`/poll Your question? | Option A | Option B | Option C`'
+      text: `❌ Something went wrong: ${err.message}`
     });
   }
-
-  const [question, ...options] = parts;
-
-  if (options.length > 10) {
-    return client.chat.postEphemeral({
-      channel: body.channel_id,
-      user: userId,
-      text: '❌ Maximum 10 options allowed.'
-    });
-  }
-
-  const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
-  const poll = {
-    id: pollId,
-    question,
-    options,
-    votes: Object.fromEntries(options.map((_, i) => [i, []])),
-    creator: userId,
-    channelId: body.channel_id,
-    status: 'active'
-  };
-
-  await savePoll(poll);
-
-  const result = await client.chat.postMessage({
-    channel: body.channel_id,
-    blocks: buildPollBlocks(poll)
-  });
-
-  poll.messageTs = result.ts;
-  await savePoll(poll);
 });
 
 // /poll-results - Show results for a poll
