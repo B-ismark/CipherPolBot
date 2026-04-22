@@ -34,6 +34,8 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS questions TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS anonymous BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS allow_revote BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS close_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS vote_timestamps TEXT NOT NULL DEFAULT '{}'`);
   // Drop legacy columns from old single-question schema
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
@@ -41,18 +43,20 @@ async function initDb() {
 
 async function savePoll(poll) {
   await pool.query(`
-    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
     ON CONFLICT (id) DO UPDATE SET
       title=EXCLUDED.title, description=EXCLUDED.description, questions=EXCLUDED.questions,
       votes=EXCLUDED.votes, anonymous=EXCLUDED.anonymous, allow_revote=EXCLUDED.allow_revote,
       creator=EXCLUDED.creator, channel_id=EXCLUDED.channel_id,
-      message_ts=EXCLUDED.message_ts, status=EXCLUDED.status
+      message_ts=EXCLUDED.message_ts, status=EXCLUDED.status,
+      close_at=EXCLUDED.close_at, vote_timestamps=EXCLUDED.vote_timestamps
   `, [
     poll.id, poll.title, poll.description || '',
     JSON.stringify(poll.questions), JSON.stringify(poll.votes),
     poll.anonymous || false, poll.allowRevote || false,
-    poll.creator, poll.channelId, poll.messageTs || null, poll.status || 'active'
+    poll.creator, poll.channelId, poll.messageTs || null, poll.status || 'active',
+    poll.closeAt || null, JSON.stringify(poll.voteTimestamps || {})
   ]);
 }
 
@@ -60,10 +64,29 @@ function rowToPoll(row) {
   return {
     ...row,
     channelId: row.channel_id, messageTs: row.message_ts, createdAt: row.created_at,
-    allowRevote: row.allow_revote,
+    allowRevote: row.allow_revote, closeAt: row.close_at,
     questions: JSON.parse(row.questions || '[]'),
-    votes: JSON.parse(row.votes || '{}')
+    votes: JSON.parse(row.votes || '{}'),
+    voteTimestamps: JSON.parse(row.vote_timestamps || '{}')
   };
+}
+
+function getAllVoters(poll) {
+  const voters = new Set();
+  Object.entries(poll.votes).forEach(([qi, qv]) => {
+    const q = poll.questions[parseInt(qi)];
+    if (!q) return;
+    if (q.type === 'open_ended' || q.type === 'ranking') {
+      Object.keys(qv).forEach(uid => voters.add(uid));
+    } else if (q.type === 'likert') {
+      Object.values(qv).forEach(ratings =>
+        Object.values(ratings).forEach(uids => uids.forEach(uid => voters.add(uid)))
+      );
+    } else {
+      Object.values(qv).forEach(uids => uids.forEach(uid => voters.add(uid)));
+    }
+  });
+  return voters;
 }
 
 async function getPoll(id) {
@@ -76,8 +99,11 @@ async function getAllPolls() {
   return rows.map(rowToPoll);
 }
 
-async function updatePollVotes(pollId, votes) {
-  await pool.query('UPDATE polls SET votes=$1 WHERE id=$2', [JSON.stringify(votes), pollId]);
+async function updatePollVotes(pollId, votes, voteTimestamps) {
+  await pool.query(
+    'UPDATE polls SET votes=$1, vote_timestamps=$2 WHERE id=$3',
+    [JSON.stringify(votes), JSON.stringify(voteTimestamps || {}), pollId]
+  );
 }
 
 async function closePoll(pollId) {
@@ -117,7 +143,23 @@ const QUESTION_TYPES = [
   { value: 'scale_5',         label: '1-to-5 scale' },
   { value: 'scale_10',        label: '1-to-10 scale' },
   { value: 'nps',             label: 'NPS (0–10)' },
+  { value: 'likert',          label: 'Likert matrix' },
+  { value: 'ranking',         label: 'Ranking' },
   { value: 'open_ended',      label: 'Open ended' }
+];
+
+const QUESTION_TYPE_ICONS = {
+  multiple_choice: '📋', yes_no: '✅', agree_disagree: '⚖️',
+  scale_5: '⭐', scale_10: '🔢', nps: '📈',
+  likert: '📊', ranking: '🏅', open_ended: '💬'
+};
+
+const LIKERT_SCALE = [
+  { label: '1 — Strongly Disagree', value: '0' },
+  { label: '2 — Disagree',          value: '1' },
+  { label: '3 — Neutral',           value: '2' },
+  { label: '4 — Agree',             value: '3' },
+  { label: '5 — Strongly Agree',    value: '4' }
 ];
 
 // Types that auto-generate their options — no choices input needed
@@ -137,6 +179,10 @@ function getAutoOptions(type) {
 
 function getTypeLabel(type) {
   return QUESTION_TYPES.find(t => t.value === type)?.label || type;
+}
+
+function getTypeIcon(type) {
+  return QUESTION_TYPE_ICONS[type] || '❓';
 }
 
 function parseOptions(raw) {
@@ -182,17 +228,28 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
   ];
 
   if (needsOptions) {
+    const isLikert  = questionType === 'likert';
+    const isRanking = questionType === 'ranking';
+    const optLabel  = isLikert  ? 'Statements to rate (one per line)'
+                    : isRanking ? 'Items to rank (one per line)'
+                    : 'Answer choices';
+    const optHint   = isLikert  ? 'Each statement will be rated on a 1–5 Strongly Disagree → Strongly Agree scale'
+                    : isRanking ? 'Voters will assign a rank to each item (1 = top choice)'
+                    : 'One option per line, or separate with commas — e.g. Python, JavaScript, Go';
+    const optPlaceholder = isLikert  ? 'The onboarding process is clear\nI feel supported by my team'
+                         : isRanking ? 'Feature A\nFeature B\nFeature C'
+                         : 'Option 1\nOption 2\nOption 3';
     blocks.push({
       type: 'input',
       block_id: `q_options_${qNum}`,
-      label: { type: 'plain_text', text: 'Answer choices' },
-      hint: { type: 'plain_text', text: 'One option per line, or separate with commas — e.g. Python, JavaScript, Go' },
+      label: { type: 'plain_text', text: optLabel },
+      hint: { type: 'plain_text', text: optHint },
       optional: false,
       element: {
         type: 'plain_text_input',
         action_id: 'value',
         multiline: true,
-        placeholder: { type: 'plain_text', text: 'Option 1\nOption 2\nOption 3' },
+        placeholder: { type: 'plain_text', text: optPlaceholder },
         ...(restore.options ? { initial_value: restore.options } : {})
       }
     });
@@ -294,10 +351,8 @@ function buildSuccessModal(pollTitle) {
   };
 }
 
-// The main creation modal — shows poll settings + saved question list.
-// No inline question form; questions are added via the pushed modal.
 function buildCreationModal(meta, errorMsg = null) {
-  const { savedQuestions = [], pollTitle = '', pollDescription = '', pollSettings = [] } = meta;
+  const { savedQuestions = [], pollTitle = '', pollDescription = '', pollSettings = [], closeAt } = meta;
 
   const settingsOptions = [
     { text: { type: 'mrkdwn', text: '*Anonymous* — hide who voted for what' }, value: 'anonymous' },
@@ -331,9 +386,11 @@ function buildCreationModal(meta, errorMsg = null) {
         block_id: 'poll_description',
         label: { type: 'plain_text', text: 'Description' },
         optional: true,
+        hint: { type: 'plain_text', text: 'Supports *bold*, _italic_, and `code` formatting' },
         element: {
           type: 'plain_text_input',
           action_id: 'value',
+          multiline: true,
           placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
           ...(pollDescription ? { initial_value: pollDescription } : {})
         }
@@ -350,6 +407,18 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(activeSettings.length ? {
             initial_options: activeSettings.map(v => settingsOptions.find(o => o.value === v))
           } : {})
+        }
+      },
+      {
+        type: 'input',
+        block_id: 'poll_close_at',
+        label: { type: 'plain_text', text: 'Auto-close date & time' },
+        optional: true,
+        hint: { type: 'plain_text', text: 'Poll will stop accepting votes at this time' },
+        element: {
+          type: 'datetimepicker',
+          action_id: 'value',
+          ...(closeAt ? { initial_date_time: Math.floor(new Date(closeAt).getTime() / 1000) } : {})
         }
       },
       { type: 'divider' },
@@ -447,6 +516,93 @@ function buildPreviewModal(meta) {
 }
 
 function buildVoteModal(poll, previousVotes = {}) {
+  const questionBlocks = poll.questions.flatMap((q, qi) => {
+    const prev = previousVotes[qi] || [];
+    const label = `${getTypeIcon(q.type)}  ${qi + 1}. ${q.text}`;
+
+    if (q.type === 'open_ended') {
+      return [{
+        type: 'input',
+        block_id: `vote_q${qi}`,
+        label: { type: 'plain_text', text: label },
+        element: {
+          type: 'plain_text_input',
+          action_id: 'response',
+          multiline: true,
+          placeholder: { type: 'plain_text', text: 'Type your response...' },
+          ...(prev[0] ? { initial_value: prev[0] } : {})
+        }
+      }];
+    }
+
+    if (q.type === 'likert') {
+      const likertOpts = LIKERT_SCALE.map(s => ({ text: { type: 'plain_text', text: s.label }, value: s.value }));
+      return [
+        { type: 'section', text: { type: 'mrkdwn', text: `*${label}*\n_Rate each statement on a 1–5 scale_` } },
+        ...q.options.map((stmt, si) => ({
+          type: 'input',
+          block_id: `vote_q${qi}_s${si}`,
+          label: { type: 'plain_text', text: stmt },
+          element: {
+            type: 'static_select',
+            action_id: 'rating',
+            placeholder: { type: 'plain_text', text: 'Choose a rating...' },
+            options: likertOpts
+          }
+        }))
+      ];
+    }
+
+    if (q.type === 'ranking') {
+      const rankOpts = q.options.map((_, i) => ({
+        text: { type: 'plain_text', text: `#${i + 1}` },
+        value: String(i + 1)
+      }));
+      return [
+        { type: 'section', text: { type: 'mrkdwn', text: `*${label}*\n_Assign a rank to each item — 1 = top choice_` } },
+        ...q.options.map((opt, oi) => ({
+          type: 'input',
+          block_id: `vote_q${qi}_r${oi}`,
+          label: { type: 'plain_text', text: opt },
+          element: {
+            type: 'static_select',
+            action_id: 'rank',
+            placeholder: { type: 'plain_text', text: 'Rank...' },
+            options: rankOpts
+          }
+        }))
+      ];
+    }
+
+    if (q.allowMultiple) {
+      return [{
+        type: 'input',
+        block_id: `vote_q${qi}`,
+        label: { type: 'plain_text', text: label },
+        hint: { type: 'plain_text', text: 'Select all that apply' },
+        element: {
+          type: 'checkboxes',
+          action_id: 'selected',
+          options: q.options.map((opt, oi) => ({ text: { type: 'mrkdwn', text: opt }, value: String(oi) })),
+          ...(prev.length ? { initial_options: prev.map(oi => ({ text: { type: 'mrkdwn', text: q.options[oi] }, value: String(oi) })) } : {})
+        }
+      }];
+    }
+
+    return [{
+      type: 'input',
+      block_id: `vote_q${qi}`,
+      label: { type: 'plain_text', text: label },
+      element: {
+        type: 'static_select',
+        action_id: 'selected',
+        placeholder: { type: 'plain_text', text: 'Select an option' },
+        options: q.options.map((opt, oi) => ({ text: { type: 'plain_text', text: opt }, value: String(oi) })),
+        ...(prev.length ? { initial_option: { text: { type: 'plain_text', text: q.options[prev[0]] }, value: String(prev[0]) } } : {})
+      }
+    }];
+  });
+
   return {
     type: 'modal',
     callback_id: 'vote_submit',
@@ -455,143 +611,147 @@ function buildVoteModal(poll, previousVotes = {}) {
     close: { type: 'plain_text', text: 'Cancel' },
     private_metadata: JSON.stringify({ pollId: poll.id }),
     blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: `📊 *${poll.title}*` } },
+      { type: 'header', text: { type: 'plain_text', text: poll.title } },
       ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
+      { type: 'context', elements: [{ type: 'mrkdwn', text: `${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}${poll.anonymous ? '  ·  🔒 Anonymous' : ''}${poll.closeAt ? `  ·  ⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : ''}` }] },
       { type: 'divider' },
-      ...poll.questions.map((q, qi) => {
-        const prev = previousVotes[qi] || [];
-        if (q.type === 'open_ended') {
-          return {
-            type: 'input',
-            block_id: `vote_q${qi}`,
-            label: { type: 'plain_text', text: `${qi + 1}. ${q.text}` },
-            element: {
-              type: 'plain_text_input',
-              action_id: 'response',
-              multiline: true,
-              placeholder: { type: 'plain_text', text: 'Type your response...' },
-              ...(prev[0] ? { initial_value: prev[0] } : {})
-            }
-          };
-        }
-        if (q.allowMultiple) {
-          return {
-            type: 'input',
-            block_id: `vote_q${qi}`,
-            label: { type: 'plain_text', text: `${qi + 1}. ${q.text}` },
-            hint: { type: 'plain_text', text: 'Select all that apply' },
-            element: {
-              type: 'checkboxes',
-              action_id: 'selected',
-              options: q.options.map((opt, oi) => ({ text: { type: 'mrkdwn', text: opt }, value: String(oi) })),
-              ...(prev.length ? { initial_options: prev.map(oi => ({ text: { type: 'mrkdwn', text: q.options[oi] }, value: String(oi) })) } : {})
-            }
-          };
-        }
-        return {
-          type: 'input',
-          block_id: `vote_q${qi}`,
-          label: { type: 'plain_text', text: `${qi + 1}. ${q.text}` },
-          element: {
-            type: 'static_select',
-            action_id: 'selected',
-            placeholder: { type: 'plain_text', text: 'Select an option' },
-            options: q.options.map((opt, oi) => ({ text: { type: 'plain_text', text: opt }, value: String(oi) })),
-            ...(prev.length ? { initial_option: { text: { type: 'plain_text', text: q.options[prev[0]] }, value: String(prev[0]) } } : {})
-          }
-        };
-      })
+      ...questionBlocks
     ]
   };
 }
 
 // ==================== POLL DISPLAY ====================
 
-function pollProgressBar(count, total, width = 18) {
+function pollProgressBar(count, total, width = 16) {
   if (total === 0) return '░'.repeat(width);
   const filled = Math.round((count / total) * width);
-  return '▓'.repeat(filled) + '░'.repeat(width - filled);
+  return '█'.repeat(filled) + '░'.repeat(width - filled);
 }
 
-function buildPollBlocks(poll) {
-  const questions = poll.questions || [];
-  const isClosed = poll.status === 'closed';
+function buildQuestionResultBlock(q, qi, poll) {
+  const qVotes = poll.votes[qi] || {};
 
-  const settingTags = [
-    isClosed                ? '🔒 Closed'          : null,
-    poll.anonymous          ? '👁️ Anonymous'        : null,
-    poll.allowRevote        ? '🔄 Revote enabled'   : null,
-    `${questions.length} ${questions.length === 1 ? 'question' : 'questions'}` : null
-  ].filter(Boolean);
-
-  const questionBlocks = questions.flatMap((q, qi) => {
-    const qVotes = poll.votes[qi] || {};
-
-    // ── Open-ended ──────────────────────────────────────────────────────────
-    if (q.type === 'open_ended') {
-      const responses = Object.entries(qVotes);
-      const count = responses.length;
-      let body = count === 0
-        ? '_No responses yet_'
-        : poll.anonymous
-          ? `_${count} anonymous response${count !== 1 ? 's' : ''}_`
-          : responses.map(([uid, t]) => `> <@${uid}>:  ${t}`).join('\n');
-      return [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*${qi + 1}.  ${q.text}*\n_Open ended  ·  ${count} response${count !== 1 ? 's' : ''}_\n${body}`
-          }
-        },
-        { type: 'divider' }
-      ];
-    }
-
-    // ── Choice question ──────────────────────────────────────────────────────
-    const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-    const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
-    const typeHint   = q.allowMultiple ? `${getTypeLabel(q.type)}  ·  multi-select` : getTypeLabel(q.type);
-
-    const optionBlocks = q.options.map((option, oi) => {
-      const voters = qVotes[oi] || [];
-      const count  = voters.length;
-      const pct    = totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
-      const bar    = `\`${pollProgressBar(count, totalVotes)}\``;
-      const isWinner = totalVotes > 0 && count === maxVotes && count > 0;
-      const medal    = isWinner ? '  🏆' : '';
-      const voterLine = !poll.anonymous && count > 0
-        ? `\n${voters.map(id => `<@${id}>`).join('  ')}`
-        : '';
-
-      const label = `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*${medal}`;
-      const stats = totalVotes === 0
-        ? ''
-        : `\n${bar}  *${count}* ${count === 1 ? 'vote' : 'votes'}  ·  ${pct}%${voterLine}`;
-
-      return {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `${label}${stats}` }
-      };
-    });
-
+  // ── Open-ended ──────────────────────────────────────────────────────────────
+  if (q.type === 'open_ended') {
+    const responses = Object.entries(qVotes);
+    const count = responses.length;
+    const body = count === 0
+      ? '_No responses yet_'
+      : poll.anonymous
+        ? `_${count} anonymous response${count !== 1 ? 's' : ''}_`
+        : responses.map(([uid, t]) => `> <@${uid}>:  ${t}`).join('\n');
     return [
       {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*${qi + 1}.  ${q.text}*\n_${typeHint}${totalVotes > 0 ? `  ·  ${totalVotes} ${totalVotes === 1 ? 'vote' : 'votes'} cast` : ''}_`
+          text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${count} response${count !== 1 ? 's' : ''}_\n${body}`
         }
       },
-      ...optionBlocks,
       { type: 'divider' }
     ];
+  }
+
+  // ── Likert ──────────────────────────────────────────────────────────────────
+  if (q.type === 'likert') {
+    const stmtBlocks = q.options.flatMap((stmt, si) => {
+      const ratings = qVotes[si] || {};
+      const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
+      const bars = LIKERT_SCALE.map(({ label, value }) => {
+        const cnt = (ratings[value] || []).length;
+        const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
+        const bar = pollProgressBar(cnt, total, 10);
+        return `  \`${bar}\`  *${pct}%*  ${label}`;
+      }).join('\n');
+      return [{
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*${stmt}*  —  _${total} response${total !== 1 ? 's' : ''}_\n${bars}` }
+      }];
+    });
+    return [
+      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_Likert matrix_` } },
+      ...stmtBlocks,
+      { type: 'divider' }
+    ];
+  }
+
+  // ── Ranking ─────────────────────────────────────────────────────────────────
+  if (q.type === 'ranking') {
+    const allRankings = Object.values(qVotes);
+    const avgRanks = q.options.map((_, oi) => {
+      if (!allRankings.length) return null;
+      const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
+      return ranks.length ? ranks.reduce((a, b) => a + b, 0) / ranks.length : null;
+    });
+    const sorted = q.options
+      .map((opt, oi) => ({ opt, avg: avgRanks[oi] }))
+      .sort((a, b) => (a.avg ?? 999) - (b.avg ?? 999));
+    const medals = ['🥇', '🥈', '🥉'];
+    const optBlocks = sorted.map(({ opt, avg }, rank) => ({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${medals[rank] || `${rank + 1}.`}  *${opt}*  ${avg !== null ? `·  avg rank *${avg.toFixed(1)}*` : '·  _no votes yet_'}`
+      }
+    }));
+    return [
+      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_Ranking  ·  ${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
+      ...optBlocks,
+      { type: 'divider' }
+    ];
+  }
+
+  // ── Choice question ──────────────────────────────────────────────────────────
+  const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
+  const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
+  const typeHint   = `${getTypeIcon(q.type)} _${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}_`;
+
+  const optionBlocks = q.options.map((option, oi) => {
+    const voters   = qVotes[oi] || [];
+    const count    = voters.length;
+    const pct      = totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
+    const bar      = pollProgressBar(count, totalVotes);
+    const isWinner = totalVotes > 0 && count === maxVotes && count > 0;
+    const voterLine = !poll.anonymous && count > 0
+      ? `\n${voters.map(id => `<@${id}>`).join('  ')}`
+      : '';
+    const statLine = totalVotes === 0
+      ? '_No votes yet_'
+      : `\`${bar}\`  *${pct}%*  (${count} vote${count !== 1 ? 's' : ''})`;
+
+    return {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*${isWinner ? '  🏆' : ''}\n${statLine}${voterLine}`
+      }
+    };
   });
+
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n${typeHint}` } },
+    ...optionBlocks,
+    { type: 'divider' }
+  ];
+}
+
+function buildPollBlocks(poll) {
+  const questions = poll.questions || [];
+  const isClosed  = poll.status === 'closed';
+  const participants = getAllVoters(poll).size;
+
+  const statusParts = [
+    isClosed ? '🔒 *Closed*' : '🟢 *Active*',
+    poll.anonymous   ? '👁 Anonymous'            : null,
+    poll.allowRevote ? '🔄 Vote changes allowed'  : null,
+    participants > 0 ? `*${participants}* participant${participants !== 1 ? 's' : ''}` : '_No responses yet_',
+    poll.closeAt && !isClosed ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
+  ].filter(Boolean);
 
   const actionButtons = isClosed
     ? [
         { type: 'button', text: { type: 'plain_text', text: '🔒  Voting Closed', emoji: true }, action_id: 'open_vote_modal', value: poll.id },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results', emoji: true }, action_id: 'share_poll',      value: poll.id }
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results',  emoji: true }, action_id: 'share_poll',      value: poll.id }
       ]
     : [
         { type: 'button', text: { type: 'plain_text', text: '🗳️  Vote',  emoji: true }, style: 'primary', action_id: 'open_vote_modal', value: poll.id },
@@ -601,15 +761,15 @@ function buildPollBlocks(poll) {
   return [
     { type: 'header', text: { type: 'plain_text', text: `📊  ${poll.title}`, emoji: true } },
     ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: settingTags.join('  ·  ') }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: statusParts.join('  ·  ') }] },
     { type: 'divider' },
-    ...questionBlocks,
+    ...questions.flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll)),
     { type: 'actions', elements: actionButtons },
     {
       type: 'context',
       elements: [{
         type: 'mrkdwn',
-        text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`  ·  Use \`/poll-share ${poll.id}\` to repost`
+        text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`  ·  \`/poll-share ${poll.id}\` to repost  ·  \`/poll-export ${poll.id}\` to download`
       }]
     }
   ];
@@ -617,13 +777,7 @@ function buildPollBlocks(poll) {
 
 // Share-poll modal — lets user pick a channel to repost the poll
 function buildShareModal(poll) {
-  const totalParticipants = new Set(
-    Object.values(poll.votes).flatMap(qv => {
-      const vals = Object.values(qv);
-      if (!vals.length) return [];
-      return Array.isArray(vals[0]) ? vals.flat() : Object.keys(qv);
-    })
-  ).size;
+  const totalParticipants = getAllVoters(poll).size;
 
   return {
     type: 'modal',
@@ -664,64 +818,14 @@ function buildShareModal(poll) {
 }
 
 function buildResultsBlocks(poll, heading) {
-  const questions = poll.questions || [];
-  const participants = new Set(
-    Object.values(poll.votes).flatMap(qv => {
-      const vals = Object.values(qv);
-      if (!vals.length) return [];
-      return Array.isArray(vals[0]) ? vals.flat() : Object.keys(qv);
-    })
-  ).size;
-
-  const questionBlocks = questions.flatMap((q, qi) => {
-    const qVotes = poll.votes[qi] || {};
-
-    if (q.type === 'open_ended') {
-      const responses = Object.entries(qVotes);
-      return [
-        { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*` } },
-        ...(responses.length
-          ? (poll.anonymous
-              ? [{ type: 'section', text: { type: 'mrkdwn', text: `_${responses.length} response(s) — anonymous_` } }]
-              : responses.map(([uid, text]) => ({ type: 'section', text: { type: 'mrkdwn', text: `> <@${uid}>: ${text}` } }))
-            )
-          : [{ type: 'section', text: { type: 'mrkdwn', text: '_No responses yet_' } }]
-        ),
-        { type: 'divider' }
-      ];
-    }
-
-    const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-    return [
-      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*` } },
-      ...q.options.map((opt, oi) => {
-        const voters = qVotes[oi] || [];
-        const count = voters.length;
-        const pct = totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
-        const bar = '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5));
-        const voterLine = !poll.anonymous && count > 0 ? '\n' + voters.map(id => `<@${id}>`).join(' ') : '';
-        return {
-          type: 'section',
-          text: { type: 'mrkdwn', text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`} ${opt}\n${bar} ${count} ${count === 1 ? 'vote' : 'votes'} (${pct}%)${voterLine}` }
-        };
-      }),
-      { type: 'divider' }
-    ];
-  });
-
+  const participants = getAllVoters(poll).size;
   return [
     { type: 'header', text: { type: 'plain_text', text: heading } },
     { type: 'section', text: { type: 'mrkdwn', text: `📊 *${poll.title}*` } },
     ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* ${participants === 1 ? 'participant' : 'participants'}  ·  Created by <@${poll.creator}>${poll.anonymous ? '  ·  🔒 Anonymous' : ''}` }] },
     { type: 'divider' },
-    ...questionBlocks,
-    {
-      type: 'context',
-      elements: [{
-        type: 'mrkdwn',
-        text: `${participants} ${participants === 1 ? 'participant' : 'participants'} • Created by <@${poll.creator}>${poll.anonymous ? '  ·  🔒 Anonymous' : ''}`
-      }]
-    }
+    ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll))
   ];
 }
 
@@ -739,14 +843,18 @@ async function updatePollMessage(client, poll) {
 // ==================== POLL CREATION HELPER ====================
 
 async function createAndPostPoll(client, meta) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [] } = meta;
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt } = meta;
 
   const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
   const votes = {};
   savedQuestions.forEach((q, qi) => {
-    votes[qi] = q.type === 'open_ended'
-      ? {}
-      : Object.fromEntries(q.options.map((_, oi) => [oi, []]));
+    if (q.type === 'open_ended' || q.type === 'ranking') {
+      votes[qi] = {};
+    } else if (q.type === 'likert') {
+      votes[qi] = {};
+    } else {
+      votes[qi] = Object.fromEntries(q.options.map((_, oi) => [oi, []]));
+    }
   });
 
   const poll = {
@@ -759,6 +867,8 @@ async function createAndPostPoll(client, meta) {
     allowRevote: pollSettings.includes('allow_revote'),
     creator: userId,
     channelId,
+    closeAt: closeAt || null,
+    voteTimestamps: {},
     status: 'active'
   };
 
@@ -786,10 +896,12 @@ function readCurrentQuestion(values, qNum) {
 }
 
 function readMainModalSettings(values, meta) {
+  const closeAtRaw = values.poll_close_at?.value?.selected_date_time;
   return {
     pollTitle:       (values.poll_title?.value?.value       ?? meta.pollTitle       ?? '').trim(),
     pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
-    pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? []
+    pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
+    closeAt:         closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : (meta.closeAt || null)
   };
 }
 
@@ -1245,6 +1357,11 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
     const qv = poll.votes[qi] || {};
     if (q.type === 'open_ended') {
       if (qv[userId]) previousVotes[qi] = [qv[userId]];
+    } else if (q.type === 'ranking' || q.type === 'likert') {
+      // no pre-fill for these types — just detect participation
+      if (qv[userId] || Object.values(qv).some(r => typeof r === 'object' && Object.values(r).some(v => v.includes && v.includes(userId)))) {
+        previousVotes[qi] = true;
+      }
     } else {
       Object.entries(qv).forEach(([oi, voters]) => {
         if (voters.includes(userId)) {
@@ -1282,26 +1399,68 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
   const poll = await getPoll(pollId);
   if (!poll || poll.status === 'closed') return;
 
-  if (poll.allowRevote) {
+  // Lazy auto-close check
+  if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
+    await closePoll(pollId);
+    await updatePollMessage(client, { ...poll, status: 'closed' });
+    return;
+  }
+
+  const hasVoted = poll.questions.some((q, qi) => {
+    const qv = poll.votes[qi] || {};
+    if (q.type === 'open_ended' || q.type === 'ranking') return !!qv[userId];
+    if (q.type === 'likert') return Object.values(qv).some(r => Object.values(r).some(v => v.includes(userId)));
+    return Object.values(qv).some(v => v.includes(userId));
+  });
+
+  if (hasVoted && !poll.allowRevote) return;
+
+  if (hasVoted && poll.allowRevote) {
     poll.questions.forEach((q, qi) => {
-      if (q.type === 'open_ended') {
+      if (q.type === 'open_ended' || q.type === 'ranking') {
         delete poll.votes[qi][userId];
+      } else if (q.type === 'likert') {
+        Object.values(poll.votes[qi] || {}).forEach(ratings => {
+          Object.keys(ratings).forEach(ri => {
+            ratings[ri] = (ratings[ri] || []).filter(id => id !== userId);
+          });
+        });
       } else {
         Object.keys(poll.votes[qi] || {}).forEach(oi => {
           poll.votes[qi][oi] = (poll.votes[qi][oi] || []).filter(id => id !== userId);
         });
       }
     });
-  } else {
-    const hasVoted = poll.questions.some((q, qi) => {
-      const qv = poll.votes[qi] || {};
-      return q.type === 'open_ended' ? !!qv[userId] : Object.values(qv).some(v => v.includes(userId));
-    });
-    if (hasVoted) return;
   }
 
   const values = view.state.values;
+  const voteTimestamps = poll.voteTimestamps || {};
+  voteTimestamps[userId] = new Date().toISOString();
+
   poll.questions.forEach((q, qi) => {
+    if (q.type === 'likert') {
+      if (!poll.votes[qi]) poll.votes[qi] = {};
+      q.options.forEach((_, si) => {
+        const block = values[`vote_q${qi}_s${si}`];
+        const rating = block?.rating?.selected_option?.value;
+        if (rating !== undefined) {
+          if (!poll.votes[qi][si]) poll.votes[qi][si] = {};
+          if (!poll.votes[qi][si][rating]) poll.votes[qi][si][rating] = [];
+          poll.votes[qi][si][rating].push(userId);
+        }
+      });
+      return;
+    }
+
+    if (q.type === 'ranking') {
+      const ranks = q.options.map((_, oi) => {
+        const block = values[`vote_q${qi}_r${oi}`];
+        return block?.rank?.selected_option?.value || '0';
+      });
+      poll.votes[qi][userId] = ranks.join(',');
+      return;
+    }
+
     const block = values[`vote_q${qi}`];
     if (!block) return;
     if (q.type === 'open_ended') {
@@ -1323,8 +1482,71 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
     }
   });
 
-  await updatePollVotes(pollId, poll.votes);
+  await updatePollVotes(pollId, poll.votes, voteTimestamps);
+  poll.voteTimestamps = voteTimestamps;
   await updatePollMessage(client, poll);
+});
+
+app.command('/poll-export', async ({ ack, body, client }) => {
+  await ack();
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const pollId = body.text.trim().replace(/`/g, '');
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
+    const poll = await getPoll(pollId);
+    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+
+    const esc = v => `"${String(v).replace(/"/g, '""')}"`;
+    const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
+
+    poll.questions.forEach((q, qi) => {
+      const qVotes = poll.votes[qi] || {};
+      if (q.type === 'open_ended') {
+        Object.entries(qVotes).forEach(([uid, text]) => {
+          const ts = poll.voteTimestamps?.[uid] || '';
+          rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
+        });
+        if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
+      } else if (q.type === 'ranking') {
+        const allRankings = Object.values(qVotes);
+        q.options.forEach((opt, oi) => {
+          const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
+          const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
+          rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
+        });
+      } else if (q.type === 'likert') {
+        q.options.forEach((stmt, si) => {
+          const ratings = qVotes[si] || {};
+          const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
+          LIKERT_SCALE.forEach(({ label, value }) => {
+            const cnt = (ratings[value] || []).length;
+            const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
+            rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
+          });
+        });
+      } else {
+        const total = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
+        q.options.forEach((opt, oi) => {
+          const voters = qVotes[oi] || [];
+          const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
+          rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
+        });
+      }
+    });
+
+    const csv = rows.map(r => r.map(esc).join(',')).join('\n');
+    await client.files.uploadV2({
+      channel_id: channel,
+      filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
+      content: csv,
+      title: `Results: ${poll.title}`,
+      initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
+    });
+  } catch (err) {
+    console.error('/poll-export error:', err);
+    await notifyError(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
+  }
 });
 
 // ==================== HEALTH CHECK ====================
