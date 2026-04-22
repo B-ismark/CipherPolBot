@@ -38,6 +38,7 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS vote_timestamps TEXT NOT NULL DEFAULT '{}'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS show_results TEXT NOT NULL DEFAULT 'realtime'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS order_by_votes BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS message_refs TEXT NOT NULL DEFAULT '[]'`);
   // Drop legacy columns from old single-question schema
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
@@ -45,22 +46,24 @@ async function initDb() {
 
 async function savePoll(poll) {
   await pool.query(`
-    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     ON CONFLICT (id) DO UPDATE SET
       title=EXCLUDED.title, description=EXCLUDED.description, questions=EXCLUDED.questions,
       votes=EXCLUDED.votes, anonymous=EXCLUDED.anonymous, allow_revote=EXCLUDED.allow_revote,
       creator=EXCLUDED.creator, channel_id=EXCLUDED.channel_id,
       message_ts=EXCLUDED.message_ts, status=EXCLUDED.status,
       close_at=EXCLUDED.close_at, vote_timestamps=EXCLUDED.vote_timestamps,
-      show_results=EXCLUDED.show_results, order_by_votes=EXCLUDED.order_by_votes
+      show_results=EXCLUDED.show_results, order_by_votes=EXCLUDED.order_by_votes,
+      message_refs=EXCLUDED.message_refs
   `, [
     poll.id, poll.title, poll.description || '',
     JSON.stringify(poll.questions), JSON.stringify(poll.votes),
     poll.anonymous || false, poll.allowRevote || false,
     poll.creator, poll.channelId, poll.messageTs || null, poll.status || 'active',
     poll.closeAt || null, JSON.stringify(poll.voteTimestamps || {}),
-    poll.showResults || 'realtime', poll.orderByVotes || false
+    poll.showResults || 'realtime', poll.orderByVotes || false,
+    JSON.stringify(poll.messageRefs || [])
   ]);
 }
 
@@ -71,6 +74,7 @@ function rowToPoll(row) {
     allowRevote: row.allow_revote, closeAt: row.close_at,
     showResults: row.show_results || 'realtime',
     orderByVotes: row.order_by_votes || false,
+    messageRefs: JSON.parse(row.message_refs || '[]'),
     questions: JSON.parse(row.questions || '[]'),
     votes: JSON.parse(row.votes || '{}'),
     voteTimestamps: JSON.parse(row.vote_timestamps || '{}')
@@ -760,14 +764,15 @@ function buildPollBlocks(poll) {
     poll.closeAt && !isClosed ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
   ].filter(Boolean);
 
+  const voteLabel = isClosed ? '🔒  Voting Closed' : poll.allowRevote ? '🔄  Change Vote' : '🗳️  Vote';
   const actionButtons = isClosed
     ? [
-        { type: 'button', text: { type: 'plain_text', text: '🔒  Voting Closed', emoji: true }, action_id: 'open_vote_modal', value: poll.id },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results',  emoji: true }, action_id: 'share_poll',      value: poll.id }
+        { type: 'button', text: { type: 'plain_text', text: voteLabel,           emoji: true }, action_id: 'open_vote_modal', value: poll.id },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results', emoji: true }, action_id: 'share_poll',      value: poll.id }
       ]
     : [
-        { type: 'button', text: { type: 'plain_text', text: '🗳️  Vote',  emoji: true }, style: 'primary', action_id: 'open_vote_modal', value: poll.id },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share', emoji: true },                  action_id: 'share_poll',       value: poll.id }
+        { type: 'button', text: { type: 'plain_text', text: voteLabel,    emoji: true }, style: 'primary', action_id: 'open_vote_modal', value: poll.id },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share',  emoji: true },                  action_id: 'share_poll',       value: poll.id }
       ];
 
   return [
@@ -842,14 +847,28 @@ function buildResultsBlocks(poll, heading) {
 }
 
 async function updatePollMessage(client, poll) {
-  try {
-    await client.chat.update({
-      channel: poll.channelId,
-      ts: poll.messageTs,
-      text: `📊 ${poll.title}`,
-      blocks: buildPollBlocks(poll)
-    });
-  } catch (err) { console.error('updatePollMessage error:', err.message); }
+  const refs = poll.messageRefs?.length
+    ? poll.messageRefs
+    : (poll.channelId && poll.messageTs ? [{ channelId: poll.channelId, messageTs: poll.messageTs }] : []);
+  const blocks = buildPollBlocks(poll);
+  await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
+    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${poll.title}`, blocks })
+  ));
+}
+
+function buildPostVoteModal(poll) {
+  const participants = getAllVoters(poll).size;
+  return {
+    type: 'modal',
+    title: { type: 'plain_text', text: '✅ Vote Recorded' },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: `Your vote has been recorded for *${poll.title}*!` } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* participant${participants !== 1 ? 's' : ''} so far` }] },
+      { type: 'divider' },
+      ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, { ...poll, showResults: 'realtime' }))
+    ]
+  };
 }
 
 // ==================== POLL CREATION HELPER ====================
@@ -895,6 +914,7 @@ async function createAndPostPoll(client, meta) {
   });
   poll.messageTs = result.ts;
   poll.channelId = channel;
+  poll.messageRefs = [{ channelId: channel, messageTs: result.ts }];
   await savePoll(poll);
 }
 
@@ -1215,7 +1235,7 @@ app.action('share_poll', async ({ ack, body, client, action }) => {
   }
 });
 
-// Share modal submitted — post the poll to the chosen channel
+// Share modal submitted — post poll to chosen channel and track the new message ref
 app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   await ack();
   const { pollId } = JSON.parse(view.private_metadata);
@@ -1225,11 +1245,14 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   try {
     const poll = await getPoll(pollId);
     if (!poll) return;
-    await client.chat.postMessage({
+    const result = await client.chat.postMessage({
       channel: channelId,
       text: `📊 ${poll.title}`,
       blocks: buildPollBlocks(poll)
     });
+    // Register this shared copy so future vote updates propagate to it
+    const updatedRefs = [...(poll.messageRefs || []), { channelId, messageTs: result.ts }];
+    await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(updatedRefs), pollId]);
   } catch (err) {
     console.error('share_poll_submit error:', err);
     await notifyError(client, body.user.id, `❌ Failed to share poll: ${err.message}`);
@@ -1294,100 +1317,127 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
   });
 });
 
-// Vote modal submitted
+// Vote modal submitted — uses DB transaction to prevent race conditions on concurrent votes
 app.view('vote_submit', async ({ ack, body, view, client }) => {
-  await ack();
   const { pollId } = JSON.parse(view.private_metadata);
   const userId = body.user.id;
-  const poll = await getPoll(pollId);
-  if (!poll || poll.status === 'closed') return;
-
-  // Lazy auto-close check
-  if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
-    await closePoll(pollId);
-    await updatePollMessage(client, { ...poll, status: 'closed' });
-    return;
-  }
-
-  const hasVoted = poll.questions.some((q, qi) => {
-    const qv = poll.votes[qi] || {};
-    if (q.type === 'open_ended' || q.type === 'ranking') return !!qv[userId];
-    if (q.type === 'likert') return Object.values(qv).some(r => Object.values(r).some(v => v.includes(userId)));
-    return Object.values(qv).some(v => v.includes(userId));
-  });
-
-  if (hasVoted && !poll.allowRevote) return;
-
-  if (hasVoted && poll.allowRevote) {
-    poll.questions.forEach((q, qi) => {
-      if (q.type === 'open_ended' || q.type === 'ranking') {
-        delete poll.votes[qi][userId];
-      } else if (q.type === 'likert') {
-        Object.values(poll.votes[qi] || {}).forEach(ratings => {
-          Object.keys(ratings).forEach(ri => {
-            ratings[ri] = (ratings[ri] || []).filter(id => id !== userId);
-          });
-        });
-      } else {
-        Object.keys(poll.votes[qi] || {}).forEach(oi => {
-          poll.votes[qi][oi] = (poll.votes[qi][oi] || []).filter(id => id !== userId);
-        });
-      }
-    });
-  }
-
   const values = view.state.values;
-  const voteTimestamps = poll.voteTimestamps || {};
-  voteTimestamps[userId] = new Date().toISOString();
 
-  poll.questions.forEach((q, qi) => {
-    if (q.type === 'likert') {
-      if (!poll.votes[qi]) poll.votes[qi] = {};
-      q.options.forEach((_, si) => {
-        const block = values[`vote_q${qi}_s${si}`];
-        const rating = block?.rating?.selected_option?.value;
-        if (rating !== undefined) {
-          if (!poll.votes[qi][si]) poll.votes[qi][si] = {};
-          if (!poll.votes[qi][si][rating]) poll.votes[qi][si][rating] = [];
-          poll.votes[qi][si][rating].push(userId);
+  const dbClient = await pool.connect();
+  let finalPoll = null;
+  try {
+    await dbClient.query('BEGIN');
+    const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
+
+    if (!rows.length || rows[0].status === 'closed') {
+      await dbClient.query('ROLLBACK');
+      await ack();
+      return;
+    }
+
+    const poll = rowToPoll(rows[0]);
+
+    // Lazy auto-close
+    if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
+      await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
+      await dbClient.query('COMMIT');
+      await ack();
+      await updatePollMessage(client, { ...poll, status: 'closed' });
+      return;
+    }
+
+    const hasVoted = poll.questions.some((q, qi) => {
+      const qv = poll.votes[qi] || {};
+      if (q.type === 'open_ended' || q.type === 'ranking') return !!qv[userId];
+      if (q.type === 'likert') return Object.values(qv).some(r => typeof r === 'object' && Object.values(r).some(v => Array.isArray(v) && v.includes(userId)));
+      return Object.values(qv).some(v => Array.isArray(v) && v.includes(userId));
+    });
+
+    if (hasVoted && !poll.allowRevote) {
+      await dbClient.query('ROLLBACK');
+      await ack();
+      return;
+    }
+
+    if (hasVoted) {
+      poll.questions.forEach((q, qi) => {
+        if (q.type === 'open_ended' || q.type === 'ranking') {
+          delete poll.votes[qi][userId];
+        } else if (q.type === 'likert') {
+          Object.values(poll.votes[qi] || {}).forEach(ratings => {
+            Object.keys(ratings).forEach(ri => { ratings[ri] = (ratings[ri] || []).filter(id => id !== userId); });
+          });
+        } else {
+          Object.keys(poll.votes[qi] || {}).forEach(oi => {
+            poll.votes[qi][oi] = (poll.votes[qi][oi] || []).filter(id => id !== userId);
+          });
         }
       });
-      return;
     }
 
-    if (q.type === 'ranking') {
-      const ranks = q.options.map((_, oi) => {
-        const block = values[`vote_q${qi}_r${oi}`];
-        return block?.rank?.selected_option?.value || '0';
-      });
-      poll.votes[qi][userId] = ranks.join(',');
-      return;
-    }
+    const voteTimestamps = poll.voteTimestamps || {};
+    voteTimestamps[userId] = new Date().toISOString();
 
-    const block = values[`vote_q${qi}`];
-    if (!block) return;
-    if (q.type === 'open_ended') {
-      const text = block.response?.value;
-      if (text) poll.votes[qi][userId] = text;
-    } else if (q.allowMultiple) {
-      (block.selected?.selected_options || []).forEach(opt => {
-        const oi = parseInt(opt.value);
-        if (!poll.votes[qi][oi]) poll.votes[qi][oi] = [];
-        poll.votes[qi][oi].push(userId);
-      });
-    } else {
-      const sel = block.selected?.selected_option?.value;
-      if (sel !== undefined) {
-        const oi = parseInt(sel);
-        if (!poll.votes[qi][oi]) poll.votes[qi][oi] = [];
-        poll.votes[qi][oi].push(userId);
+    poll.questions.forEach((q, qi) => {
+      if (q.type === 'likert') {
+        if (!poll.votes[qi]) poll.votes[qi] = {};
+        q.options.forEach((_, si) => {
+          const block = values[`vote_q${qi}_s${si}`];
+          const rating = block?.rating?.selected_option?.value;
+          if (rating !== undefined) {
+            if (!poll.votes[qi][si]) poll.votes[qi][si] = {};
+            if (!poll.votes[qi][si][rating]) poll.votes[qi][si][rating] = [];
+            poll.votes[qi][si][rating].push(userId);
+          }
+        });
+        return;
       }
-    }
-  });
+      if (q.type === 'ranking') {
+        const ranks = q.options.map((_, oi) => values[`vote_q${qi}_r${oi}`]?.rank?.selected_option?.value || '0');
+        poll.votes[qi][userId] = ranks.join(',');
+        return;
+      }
+      const block = values[`vote_q${qi}`];
+      if (!block) return;
+      if (q.type === 'open_ended') {
+        const text = block.response?.value;
+        if (text) poll.votes[qi][userId] = text;
+      } else if (q.allowMultiple) {
+        (block.selected?.selected_options || []).forEach(opt => {
+          const oi = parseInt(opt.value);
+          if (!poll.votes[qi][oi]) poll.votes[qi][oi] = [];
+          poll.votes[qi][oi].push(userId);
+        });
+      } else {
+        const sel = block.selected?.selected_option?.value;
+        if (sel !== undefined) {
+          const oi = parseInt(sel);
+          if (!poll.votes[qi][oi]) poll.votes[qi][oi] = [];
+          poll.votes[qi][oi].push(userId);
+        }
+      }
+    });
 
-  await updatePollVotes(pollId, poll.votes, voteTimestamps);
-  poll.voteTimestamps = voteTimestamps;
-  await updatePollMessage(client, poll);
+    await dbClient.query(
+      'UPDATE polls SET votes=$1, vote_timestamps=$2 WHERE id=$3',
+      [JSON.stringify(poll.votes), JSON.stringify(voteTimestamps), pollId]
+    );
+    await dbClient.query('COMMIT');
+    poll.voteTimestamps = voteTimestamps;
+    finalPoll = poll;
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    console.error('vote_submit transaction error:', err.message);
+    await ack();
+    return;
+  } finally {
+    dbClient.release();
+  }
+
+  // Show results to voter immediately after voting
+  await ack({ response_action: 'update', view: buildPostVoteModal(finalPoll) });
+  // Update all shared copies of the poll message
+  await updatePollMessage(client, finalPoll);
 });
 
 app.command('/poll-export', async ({ ack, body, client }) => {
