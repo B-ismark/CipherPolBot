@@ -764,7 +764,8 @@ function buildPollBlocks(poll) {
     poll.closeAt && !isClosed ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
   ].filter(Boolean);
 
-  const voteLabel = isClosed ? '🔒  Voting Closed' : poll.allowRevote ? '🔄  Change Vote' : '🗳️  Vote';
+  const hasAnyVotes = getAllVoters(poll).size > 0;
+  const voteLabel = isClosed ? '🔒  Voting Closed' : (poll.allowRevote && hasAnyVotes) ? '🔄  Change Vote' : '🗳️  Vote';
   const actionButtons = isClosed
     ? [
         { type: 'button', text: { type: 'plain_text', text: voteLabel,           emoji: true }, action_id: 'open_vote_modal', value: poll.id },
