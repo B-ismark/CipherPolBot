@@ -43,6 +43,13 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS co_creators TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS slack_installations (
+      team_id TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 }
 
 async function savePoll(poll) {
@@ -234,8 +241,39 @@ async function sendCloseNotifications(client, poll) {
 
 // ==================== APP SETUP ====================
 
-const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET });
-const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
+const installationStore = {
+  storeInstallation: async (installation) => {
+    const teamId = installation.team?.id || installation.enterprise?.id;
+    await pool.query(
+      `INSERT INTO slack_installations (team_id, data, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (team_id) DO UPDATE SET data = $2, updated_at = NOW()`,
+      [teamId, JSON.stringify(installation)]
+    );
+  },
+  fetchInstallation: async (query) => {
+    const teamId = query.teamId || query.enterpriseId;
+    const { rows } = await pool.query(
+      'SELECT data FROM slack_installations WHERE team_id = $1',
+      [teamId]
+    );
+    if (!rows.length) throw new Error('Installation not found for team: ' + teamId);
+    return JSON.parse(rows[0].data);
+  },
+  deleteInstallation: async (query) => {
+    const teamId = query.teamId || query.enterpriseId;
+    await pool.query('DELETE FROM slack_installations WHERE team_id = $1', [teamId]);
+  }
+};
+
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  clientId: process.env.SLACK_CLIENT_ID,
+  clientSecret: process.env.SLACK_CLIENT_SECRET,
+  stateSecret: process.env.SLACK_STATE_SECRET || 'cipherpolbot-state-secret',
+  installationStore
+});
+const app = new App({ receiver });
 
 app.error(async (err) => console.error('Bolt error:', JSON.stringify(err, null, 2)));
 
