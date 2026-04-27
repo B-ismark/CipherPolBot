@@ -64,7 +64,7 @@ async function savePoll(poll) {
     poll.anonymous || false, poll.allowRevote || false,
     poll.creator, poll.channelId, poll.messageTs || null, poll.status || 'active',
     poll.closeAt || null, JSON.stringify(poll.voteTimestamps || {}),
-    poll.showResults || 'realtime', poll.orderByVotes || false,
+    poll.showResults || 'creator_only', poll.orderByVotes || false,
     JSON.stringify(poll.messageRefs || []),
     JSON.stringify(poll.notifyOnClose || []),
     JSON.stringify(poll.coCreators || [])
@@ -76,7 +76,7 @@ function rowToPoll(row) {
     ...row,
     channelId: row.channel_id, messageTs: row.message_ts, createdAt: row.created_at,
     allowRevote: row.allow_revote, closeAt: row.close_at,
-    showResults: row.show_results || 'realtime',
+    showResults: row.show_results || 'creator_only',
     orderByVotes: row.order_by_votes || false,
     messageRefs: JSON.parse(row.message_refs || '[]'),
     questions: JSON.parse(row.questions || '[]'),
@@ -126,11 +126,99 @@ async function closePoll(pollId) {
   await pool.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
 }
 
+// ==================== SECURITY: RATE LIMITING & VALIDATION ====================
+
+const MAX_POLL_TITLE_LENGTH = 200;
+const MAX_POLL_DESCRIPTION_LENGTH = 1000;
+const MAX_QUESTION_TEXT_LENGTH = 500;
+const MAX_OPTION_TEXT_LENGTH = 200;
+const MAX_QUESTIONS_PER_POLL = 50;
+const MAX_OPTIONS_PER_QUESTION = 10;
+const MAX_POLLS_PER_USER_PER_DAY = 10;
+const MAX_NOTIFY_SUBSCRIBERS_PER_POLL = 20;
+const MAX_NOTIFICATIONS_PER_USER_PER_HOUR = 5;
+
+const pollCreationTracker = {}; // { userId: [{ timestamp }] }
+const notificationTracker = {}; // { userId: [{ timestamp }] }
+
+function validatePollInputs(title, description, questions) {
+  if (!title || title.trim().length === 0) {
+    throw new Error('Poll title is required.');
+  }
+  if (title.length > MAX_POLL_TITLE_LENGTH) {
+    throw new Error(`Poll title exceeds maximum length of ${MAX_POLL_TITLE_LENGTH} characters.`);
+  }
+  if (description && description.length > MAX_POLL_DESCRIPTION_LENGTH) {
+    throw new Error(`Poll description exceeds maximum length of ${MAX_POLL_DESCRIPTION_LENGTH} characters.`);
+  }
+  if (!Array.isArray(questions) || questions.length === 0) {
+    throw new Error('Poll must have at least one question.');
+  }
+  if (questions.length > MAX_QUESTIONS_PER_POLL) {
+    throw new Error(`Poll exceeds maximum number of questions (${MAX_QUESTIONS_PER_POLL}).`);
+  }
+  questions.forEach((q, idx) => {
+    if (!q.text || q.text.trim().length === 0) {
+      throw new Error(`Question ${idx + 1}: text is required.`);
+    }
+    if (q.text.length > MAX_QUESTION_TEXT_LENGTH) {
+      throw new Error(`Question ${idx + 1}: exceeds maximum length of ${MAX_QUESTION_TEXT_LENGTH} characters.`);
+    }
+    if (q.options && Array.isArray(q.options)) {
+      if (q.options.length > MAX_OPTIONS_PER_QUESTION) {
+        throw new Error(`Question ${idx + 1}: exceeds maximum number of options (${MAX_OPTIONS_PER_QUESTION}).`);
+      }
+      q.options.forEach((opt, oidx) => {
+        if (opt.length > MAX_OPTION_TEXT_LENGTH) {
+          throw new Error(`Question ${idx + 1}, Option ${oidx + 1}: exceeds maximum length of ${MAX_OPTION_TEXT_LENGTH} characters.`);
+        }
+      });
+    }
+  });
+}
+
+async function checkPollCreationRateLimit(userId) {
+  const now = Date.now();
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+
+  if (!pollCreationTracker[userId]) {
+    pollCreationTracker[userId] = [];
+  }
+
+  pollCreationTracker[userId] = pollCreationTracker[userId].filter(entry => entry.timestamp > dayAgo);
+
+  if (pollCreationTracker[userId].length >= MAX_POLLS_PER_USER_PER_DAY) {
+    throw new Error(`Rate limit: You can create a maximum of ${MAX_POLLS_PER_USER_PER_DAY} polls per day.`);
+  }
+
+  pollCreationTracker[userId].push({ timestamp: now });
+}
+
+async function checkNotificationRateLimit(userId) {
+  const now = Date.now();
+  const hourAgo = now - 60 * 60 * 1000;
+
+  if (!notificationTracker[userId]) {
+    notificationTracker[userId] = [];
+  }
+
+  notificationTracker[userId] = notificationTracker[userId].filter(entry => entry.timestamp > hourAgo);
+
+  if (notificationTracker[userId].length >= MAX_NOTIFICATIONS_PER_USER_PER_HOUR) {
+    return false; // User has hit limit for this hour
+  }
+
+  notificationTracker[userId].push({ timestamp: now });
+  return true;
+}
+
 async function sendCloseNotifications(client, poll) {
-  const notifyUsers = poll.notifyOnClose || [];
+  const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
   if (!notifyUsers.length) return;
   await Promise.allSettled(notifyUsers.map(async uid => {
     try {
+      const allowed = await checkNotificationRateLimit(uid);
+      if (!allowed) return; // User has hit their hourly notification limit
       const dm = await client.conversations.open({ users: uid });
       await client.chat.postMessage({
         channel: dm.channel.id,
@@ -417,7 +505,7 @@ const SHOW_RESULTS_OPTIONS = [
 function buildCreationModal(meta, errorMsg = null) {
   const {
     pollTitle = '', pollDescription = '', pollSettings = [],
-    closeAt, showResults = 'realtime', orderByVotes = false
+    closeAt, showResults = 'creator_only', orderByVotes = false
   } = meta;
 
   const settingsOptions = [
@@ -1028,7 +1116,15 @@ function buildPostVoteModal(poll) {
 // ==================== POLL CREATION HELPER ====================
 
 async function createAndPostPoll(client, meta) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'realtime', orderByVotes = false } = meta;
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false } = meta;
+
+  // Rate limiting check
+  await checkPollCreationRateLimit(userId);
+
+  // Input validation
+  const title = (pollTitle || savedQuestions[0]?.text || '').trim();
+  const description = (pollDescription || '').trim();
+  validatePollInputs(title, description, savedQuestions);
 
   const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
   const votes = {};
@@ -1044,8 +1140,8 @@ async function createAndPostPoll(client, meta) {
 
   const poll = {
     id: pollId,
-    title: pollTitle || savedQuestions[0]?.text || 'Poll',
-    description: pollDescription || '',
+    title,
+    description,
     questions: savedQuestions,
     votes,
     anonymous: pollSettings.includes('anonymous'),
@@ -1092,7 +1188,7 @@ function readMainModalSettings(values, meta) {
     pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
     pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
     closeAt:         closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : (meta.closeAt || null),
-    showResults:     values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? 'realtime',
+    showResults:     values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? 'creator_only',
     orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false)
   };
 }
@@ -1491,7 +1587,8 @@ app.view('poll_preview_submit', async ({ ack, body, view, client }) => {
   } catch (err) {
     console.error('poll_preview_submit error:', err);
     await ack();
-    await notifyError(client, meta.userId, `❌ Failed to create poll: ${err.message}`);
+    const errorMsg = err.message || 'Failed to create poll.';
+    await notifyError(client, meta.userId, `❌ ${errorMsg}`);
   }
 });
 
@@ -1503,6 +1600,12 @@ app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
 
   if (!newTitle) {
     return await ack({ response_action: 'errors', errors: { edit_title: 'Title is required.' } });
+  }
+  if (newTitle.length > MAX_POLL_TITLE_LENGTH) {
+    return await ack({ response_action: 'errors', errors: { edit_title: `Title exceeds maximum length of ${MAX_POLL_TITLE_LENGTH} characters.` } });
+  }
+  if (newDesc.length > MAX_POLL_DESCRIPTION_LENGTH) {
+    return await ack({ response_action: 'errors', errors: { edit_description: `Description exceeds maximum length of ${MAX_POLL_DESCRIPTION_LENGTH} characters.` } });
   }
 
   try {
