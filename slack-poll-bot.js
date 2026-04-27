@@ -241,39 +241,25 @@ async function sendCloseNotifications(client, poll) {
 
 // ==================== APP SETUP ====================
 
-const installationStore = {
-  storeInstallation: async (installation) => {
-    const teamId = installation.team?.id || installation.enterprise?.id;
-    await pool.query(
-      `INSERT INTO slack_installations (team_id, data, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (team_id) DO UPDATE SET data = $2, updated_at = NOW()`,
-      [teamId, JSON.stringify(installation)]
-    );
-  },
-  fetchInstallation: async (query) => {
-    const teamId = query.teamId || query.enterpriseId;
-    const { rows } = await pool.query(
-      'SELECT data FROM slack_installations WHERE team_id = $1',
-      [teamId]
-    );
-    if (!rows.length) throw new Error('Installation not found for team: ' + teamId);
-    return JSON.parse(rows[0].data);
-  },
-  deleteInstallation: async (query) => {
-    const teamId = query.teamId || query.enterpriseId;
-    await pool.query('DELETE FROM slack_installations WHERE team_id = $1', [teamId]);
-  }
-};
+const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET });
 
-const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  clientId: process.env.SLACK_CLIENT_ID,
-  clientSecret: process.env.SLACK_CLIENT_SECRET,
-  stateSecret: process.env.SLACK_STATE_SECRET || 'cipherpolbot-state-secret',
-  installationStore
+const app = new App({
+  receiver,
+  authorize: async ({ teamId, enterpriseId }) => {
+    const id = teamId || enterpriseId;
+    const { rows } = await pool.query(
+      'SELECT data FROM slack_installations WHERE team_id = $1', [id]
+    );
+    if (rows.length) {
+      const d = JSON.parse(rows[0].data);
+      return { botToken: d.access_token, botUserId: d.bot_user_id };
+    }
+    if (process.env.SLACK_BOT_TOKEN) {
+      return { botToken: process.env.SLACK_BOT_TOKEN };
+    }
+    throw new Error('No installation found. Please install the bot first.');
+  }
 });
-const app = new App({ receiver });
 
 app.error(async (err) => console.error('Bolt error:', JSON.stringify(err, null, 2)));
 
@@ -1935,6 +1921,29 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
 
 receiver.router.get('/', (req, res) => res.send('Slack Poll Bot is running ✓'));
 receiver.router.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+receiver.router.get('/slack/oauth_redirect', async (req, res) => {
+  const { code, error } = req.query;
+  if (error) return res.status(400).send(`❌ OAuth error: ${error}`);
+  if (!code) return res.status(400).send('❌ Missing authorization code.');
+  try {
+    const result = await app.client.oauth.v2.access({
+      client_id: process.env.SLACK_CLIENT_ID,
+      client_secret: process.env.SLACK_CLIENT_SECRET,
+      code
+    });
+    await pool.query(
+      `INSERT INTO slack_installations (team_id, data, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (team_id) DO UPDATE SET data = $2, updated_at = NOW()`,
+      [result.team.id, JSON.stringify(result)]
+    );
+    res.send('<h2>✅ CipherPol Bot installed!</h2><p>You can close this window and return to Slack.</p>');
+  } catch (e) {
+    console.error('OAuth redirect error:', e.message);
+    res.status(500).send(`<h2>❌ Installation failed</h2><p>${e.message}</p>`);
+  }
+});
 
 // ==================== START ====================
 
