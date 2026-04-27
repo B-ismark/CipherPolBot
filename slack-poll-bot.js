@@ -39,15 +39,16 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS show_results TEXT NOT NULL DEFAULT 'realtime'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS order_by_votes BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS message_refs TEXT NOT NULL DEFAULT '[]'`);
-  // Drop legacy columns from old single-question schema
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS notify_on_close TEXT NOT NULL DEFAULT '[]'`);
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS co_creators TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
 }
 
 async function savePoll(poll) {
   await pool.query(`
-    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs, notify_on_close, co_creators)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
     ON CONFLICT (id) DO UPDATE SET
       title=EXCLUDED.title, description=EXCLUDED.description, questions=EXCLUDED.questions,
       votes=EXCLUDED.votes, anonymous=EXCLUDED.anonymous, allow_revote=EXCLUDED.allow_revote,
@@ -55,7 +56,8 @@ async function savePoll(poll) {
       message_ts=EXCLUDED.message_ts, status=EXCLUDED.status,
       close_at=EXCLUDED.close_at, vote_timestamps=EXCLUDED.vote_timestamps,
       show_results=EXCLUDED.show_results, order_by_votes=EXCLUDED.order_by_votes,
-      message_refs=EXCLUDED.message_refs
+      message_refs=EXCLUDED.message_refs, notify_on_close=EXCLUDED.notify_on_close,
+      co_creators=EXCLUDED.co_creators
   `, [
     poll.id, poll.title, poll.description || '',
     JSON.stringify(poll.questions), JSON.stringify(poll.votes),
@@ -63,7 +65,9 @@ async function savePoll(poll) {
     poll.creator, poll.channelId, poll.messageTs || null, poll.status || 'active',
     poll.closeAt || null, JSON.stringify(poll.voteTimestamps || {}),
     poll.showResults || 'realtime', poll.orderByVotes || false,
-    JSON.stringify(poll.messageRefs || [])
+    JSON.stringify(poll.messageRefs || []),
+    JSON.stringify(poll.notifyOnClose || []),
+    JSON.stringify(poll.coCreators || [])
   ]);
 }
 
@@ -77,7 +81,9 @@ function rowToPoll(row) {
     messageRefs: JSON.parse(row.message_refs || '[]'),
     questions: JSON.parse(row.questions || '[]'),
     votes: JSON.parse(row.votes || '{}'),
-    voteTimestamps: JSON.parse(row.vote_timestamps || '{}')
+    voteTimestamps: JSON.parse(row.vote_timestamps || '{}'),
+    notifyOnClose: JSON.parse(row.notify_on_close || '[]'),
+    coCreators: JSON.parse(row.co_creators || '[]')
   };
 }
 
@@ -104,8 +110,8 @@ async function getPoll(id) {
   return rows.length ? rowToPoll(rows[0]) : null;
 }
 
-async function getAllPolls() {
-  const { rows } = await pool.query("SELECT * FROM polls WHERE status='active' ORDER BY created_at DESC");
+async function getAllPolls(status = 'active') {
+  const { rows } = await pool.query("SELECT * FROM polls WHERE status=$1 ORDER BY created_at DESC", [status]);
   return rows.map(rowToPoll);
 }
 
@@ -118,6 +124,24 @@ async function updatePollVotes(pollId, votes, voteTimestamps) {
 
 async function closePoll(pollId) {
   await pool.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
+}
+
+async function sendCloseNotifications(client, poll) {
+  const notifyUsers = poll.notifyOnClose || [];
+  if (!notifyUsers.length) return;
+  await Promise.allSettled(notifyUsers.map(async uid => {
+    try {
+      const dm = await client.conversations.open({ users: uid });
+      await client.chat.postMessage({
+        channel: dm.channel.id,
+        text: `🔒 Poll closed: *${poll.title}*`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `🔒 The poll *${poll.title}* has been closed.` } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`` }] }
+        ]
+      });
+    } catch (e) { console.error('notify error:', e.message); }
+  }));
 }
 
 // ==================== APP SETUP ====================
@@ -140,6 +164,10 @@ async function notifyError(client, userId, text) {
     const r = await client.conversations.open({ users: userId });
     await client.chat.postMessage({ channel: r.channel.id, text });
   } catch (e) { console.error('notifyError failed:', e.message); }
+}
+
+function isCreatorOrAdmin(poll, userId) {
+  return poll.creator === userId || (poll.coCreators || []).includes(userId);
 }
 
 // ==================== CONSTANTS ====================
@@ -172,7 +200,6 @@ const LIKERT_SCALE = [
   { label: '5 — Strongly Agree',    value: '4' }
 ];
 
-// Types that auto-generate their options — no choices input needed
 const AUTO_OPTION_TYPES = ['yes_no', 'agree_disagree', 'scale_5', 'scale_10', 'nps', 'open_ended'];
 
 function getAutoOptions(type) {
@@ -202,14 +229,44 @@ function parseOptions(raw) {
 
 // ==================== MODAL BUILDERS ====================
 
-// Question form blocks — used inside the pushed question modal.
-// qNum keeps block IDs unique so Slack always renders fresh inputs.
+// Grouped options for question type picker (Hick's Law — scannable categories)
+const QUESTION_TYPE_GROUPS = [
+  {
+    label: { type: 'plain_text', text: 'Basic' },
+    options: [
+      { text: { type: 'plain_text', text: '📋 Multiple choice' }, value: 'multiple_choice' },
+      { text: { type: 'plain_text', text: '✅ Yes / No' },        value: 'yes_no' },
+      { text: { type: 'plain_text', text: '⚖️ Agree / Disagree' }, value: 'agree_disagree' }
+    ]
+  },
+  {
+    label: { type: 'plain_text', text: 'Scales' },
+    options: [
+      { text: { type: 'plain_text', text: '⭐ 1-to-5 scale' },  value: 'scale_5' },
+      { text: { type: 'plain_text', text: '🔢 1-to-10 scale' }, value: 'scale_10' },
+      { text: { type: 'plain_text', text: '📈 NPS (0–10)' },    value: 'nps' }
+    ]
+  },
+  {
+    label: { type: 'plain_text', text: 'Advanced' },
+    options: [
+      { text: { type: 'plain_text', text: '📊 Likert matrix' }, value: 'likert' },
+      { text: { type: 'plain_text', text: '🏅 Ranking' },       value: 'ranking' },
+      { text: { type: 'plain_text', text: '💬 Open ended' },    value: 'open_ended' }
+    ]
+  }
+];
+
+function findTypeOption(type) {
+  for (const group of QUESTION_TYPE_GROUPS) {
+    const opt = group.options.find(o => o.value === type);
+    if (opt) return opt;
+  }
+  return QUESTION_TYPE_GROUPS[0].options[0];
+}
+
 function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}) {
   const needsOptions = !AUTO_OPTION_TYPES.includes(questionType);
-  const typeOptions = QUESTION_TYPES.map(t => ({
-    text: { type: 'plain_text', text: t.label },
-    value: t.value
-  }));
 
   const blocks = [
     {
@@ -231,8 +288,8 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
       element: {
         type: 'static_select',
         action_id: 'question_type_changed',
-        options: typeOptions,
-        initial_option: typeOptions.find(o => o.value === questionType) || typeOptions[0]
+        option_groups: QUESTION_TYPE_GROUPS,
+        initial_option: findTypeOption(questionType)
       }
     }
   ];
@@ -245,7 +302,7 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
                     : 'Answer choices';
     const optHint   = isLikert  ? 'Each statement will be rated on a 1–5 Strongly Disagree → Strongly Agree scale'
                     : isRanking ? 'Voters will assign a rank to each item (1 = top choice)'
-                    : 'One option per line, or separate with commas — e.g. Python, JavaScript, Go';
+                    : 'One option per line, or separate with commas';
     const optPlaceholder = isLikert  ? 'The onboarding process is clear\nI feel supported by my team'
                          : isRanking ? 'Feature A\nFeature B\nFeature C'
                          : 'Option 1\nOption 2\nOption 3';
@@ -266,33 +323,37 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
   } else if (questionType === 'open_ended') {
     blocks.push({
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: '_Open ended — voters will type a free-text response_' }]
+      elements: [{ type: 'mrkdwn', text: '_💬 Open ended — voters will type a free-text response_' }]
     });
   } else {
     const preview = getAutoOptions(questionType).join(' · ');
     blocks.push({
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `_Auto-generated options:  ${preview}_` }]
+      elements: [{ type: 'mrkdwn', text: `_Auto-generated options: ${preview}_` }]
     });
   }
 
-  blocks.push({
-    type: 'input',
-    block_id: `q_multiple_${qNum}`,
-    label: { type: 'plain_text', text: 'Options' },
-    optional: true,
-    element: {
-      type: 'checkboxes',
-      action_id: 'value',
-      options: [{
-        text: { type: 'mrkdwn', text: '*Allow multiple selections*' },
-        value: 'multiple'
-      }],
-      ...(restore.allowMultiple ? {
-        initial_options: [{ text: { type: 'mrkdwn', text: '*Allow multiple selections*' }, value: 'multiple' }]
-      } : {})
-    }
-  });
+  // Only show multi-select for applicable types
+  const multiSelectApplicable = !['open_ended', 'yes_no', 'agree_disagree', 'scale_5', 'scale_10', 'nps', 'likert', 'ranking'].includes(questionType);
+  if (multiSelectApplicable) {
+    blocks.push({
+      type: 'input',
+      block_id: `q_multiple_${qNum}`,
+      label: { type: 'plain_text', text: 'Options' },
+      optional: true,
+      element: {
+        type: 'checkboxes',
+        action_id: 'value',
+        options: [{
+          text: { type: 'mrkdwn', text: '*Allow multiple selections*' },
+          value: 'multiple'
+        }],
+        ...(restore.allowMultiple ? {
+          initial_options: [{ text: { type: 'mrkdwn', text: '*Allow multiple selections*' }, value: 'multiple' }]
+        } : {})
+      }
+    });
+  }
 
   return blocks;
 }
@@ -309,7 +370,7 @@ function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {},
       block_id: 'question_actions',
       elements: [{
         type: 'button',
-        text: { type: 'plain_text', text: '＋  Add Question' },
+        text: { type: 'plain_text', text: '＋  Add another question' },
         action_id: 'add_another_question'
       }]
     }
@@ -318,15 +379,15 @@ function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {},
   return {
     type: 'modal',
     callback_id: 'question_submit',
-    title: { type: 'plain_text', text: isEditing ? 'Edit Question' : 'Questions' },
-    submit: { type: 'plain_text', text: isEditing ? 'Update' : 'Done' },
+    title: { type: 'plain_text', text: isEditing ? 'Edit Question' : 'Add Question' },
+    submit: { type: 'plain_text', text: isEditing ? 'Save Changes' : 'Continue →' },
     close: { type: 'plain_text', text: '← Back' },
     notify_on_close: true,
     private_metadata: JSON.stringify(meta),
     blocks: [
       ...(savedQuestions.length > 0 && !isEditing ? [
         ...savedQuestionsBlocks(savedQuestions),
-        { type: 'section', text: { type: 'mrkdwn', text: '*Add a question:*' } }
+        { type: 'section', text: { type: 'mrkdwn', text: '*Add another question:*' } }
       ] : []),
       ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
       ...questionFormBlocks(qNum, currentType, restore),
@@ -335,12 +396,11 @@ function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {},
   };
 }
 
-// Success modal shown after poll is created
 function buildSuccessModal(pollTitle) {
   return {
     type: 'modal',
-    title: { type: 'plain_text', text: 'Poll Created! 🎉' },
-    close: { type: 'plain_text', text: 'Close' },
+    title: { type: 'plain_text', text: 'Poll Created!' },
+    close: { type: 'plain_text', text: 'Done' },
     blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: `✅ *${pollTitle || 'Your poll'}* has been posted to the channel.` } },
       { type: 'context', elements: [{ type: 'mrkdwn', text: 'Head back to the chat to see it and start collecting votes.' }] }
@@ -370,13 +430,26 @@ function buildCreationModal(meta, errorMsg = null) {
   return {
     type: 'modal',
     callback_id: 'poll_submit',
-    title: { type: 'plain_text', text: 'Create a Poll' },
-    submit: { type: 'plain_text', text: '＋  Add Question' },
+    title: { type: 'plain_text', text: 'Create Poll' },
+    submit: { type: 'plain_text', text: meta.savedQuestions?.length ? `＋  Add Questions  (${meta.savedQuestions.length} added)` : '＋  Add Questions' },
     close: { type: 'plain_text', text: 'Cancel' },
     notify_on_close: true,
     private_metadata: JSON.stringify(meta),
     blocks: [
       ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
+      // ── Questions summary (progressive disclosure) ────
+      ...((meta.savedQuestions?.length) ? [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Questions added (${meta.savedQuestions.length}):*\n` +
+              meta.savedQuestions.map((q, i) => `${i + 1}. ${getTypeIcon(q.type)} ${q.text}`).join('\n')
+          }
+        },
+        { type: 'divider' }
+      ] : []),
+      // ── Content ──────────────────────────────────────
       {
         type: 'input', block_id: 'poll_title',
         label: { type: 'plain_text', text: 'Poll title' },
@@ -397,9 +470,12 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(pollDescription ? { initial_value: pollDescription } : {})
         }
       },
+      // ── Privacy & Voting ──────────────────────────────
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*Privacy & Voting*' } },
       {
         type: 'input', block_id: 'poll_settings',
-        label: { type: 'plain_text', text: 'Poll settings' },
+        label: { type: 'plain_text', text: 'Options' },
         optional: true,
         element: {
           type: 'checkboxes', action_id: 'value',
@@ -407,9 +483,12 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(activeSettings.length ? { initial_options: activeSettings.map(v => settingsOptions.find(o => o.value === v)) } : {})
         }
       },
+      // ── Results ───────────────────────────────────────
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*Results*' } },
       {
         type: 'input', block_id: 'poll_show_results',
-        label: { type: 'plain_text', text: 'Show results of the poll' },
+        label: { type: 'plain_text', text: 'Show results' },
         element: {
           type: 'static_select', action_id: 'value',
           options: SHOW_RESULTS_OPTIONS,
@@ -418,7 +497,7 @@ function buildCreationModal(meta, errorMsg = null) {
       },
       {
         type: 'input', block_id: 'poll_order_by_votes',
-        label: { type: 'plain_text', text: 'Order results by most votes' },
+        label: { type: 'plain_text', text: 'Sort by most votes' },
         optional: true,
         element: {
           type: 'checkboxes', action_id: 'value',
@@ -426,6 +505,9 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(orderByVotes ? { initial_options: orderOpt } : {})
         }
       },
+      // ── Schedule ──────────────────────────────────────
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*Schedule*' } },
       {
         type: 'input', block_id: 'poll_close_at',
         label: { type: 'plain_text', text: 'Auto-close date & time' },
@@ -440,6 +522,42 @@ function buildCreationModal(meta, errorMsg = null) {
   };
 }
 
+function buildEditModal(poll, errorMsg = null) {
+  return {
+    type: 'modal',
+    callback_id: 'poll_edit_submit',
+    title: { type: 'plain_text', text: 'Edit Poll' },
+    submit: { type: 'plain_text', text: 'Save Changes' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    private_metadata: JSON.stringify({ pollId: poll.id }),
+    blocks: [
+      ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
+      {
+        type: 'input', block_id: 'edit_title',
+        label: { type: 'plain_text', text: 'Poll title' },
+        element: {
+          type: 'plain_text_input', action_id: 'value',
+          initial_value: poll.title
+        }
+      },
+      {
+        type: 'input', block_id: 'edit_description',
+        label: { type: 'plain_text', text: 'Description' },
+        optional: true,
+        element: {
+          type: 'plain_text_input', action_id: 'value', multiline: true,
+          placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
+          ...(poll.description ? { initial_value: poll.description } : {})
+        }
+      },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: '_Questions cannot be edited after votes have been cast._' }]
+      }
+    ]
+  };
+}
+
 function savedQuestionsBlocks(savedQuestions) {
   if (!savedQuestions.length) return [];
   return [
@@ -448,17 +566,17 @@ function savedQuestionsBlocks(savedQuestions) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${i + 1}.* ${q.text}\n_${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${q.type !== 'open_ended' && q.options.length ? '  —  ' + q.options.slice(0, 4).join(', ') + (q.options.length > 4 ? '…' : '') : ''}_`
+        text: `*${i + 1}.* ${q.text}\n_${getTypeIcon(q.type)} ${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${q.type !== 'open_ended' && q.options.length ? '  —  ' + q.options.slice(0, 4).join(', ') + (q.options.length > 4 ? '…' : '') : ''}_`
       },
       accessory: {
         type: 'overflow',
         action_id: 'question_action',
         options: [
-          { text: { type: 'plain_text', text: '✏️  Edit' },           value: `edit:${i}` },
-          { text: { type: 'plain_text', text: '⧉  Duplicate' },       value: `duplicate:${i}` },
-          { text: { type: 'plain_text', text: '↑  Move Up' },         value: `move_up:${i}` },
-          { text: { type: 'plain_text', text: '↓  Move Down' },       value: `move_down:${i}` },
-          { text: { type: 'plain_text', text: '🗑️  Delete' },        value: `delete:${i}` }
+          { text: { type: 'plain_text', text: '✏️  Edit' },     value: `edit:${i}` },
+          { text: { type: 'plain_text', text: '⧉  Duplicate' }, value: `duplicate:${i}` },
+          { text: { type: 'plain_text', text: '↑  Move Up' },   value: `move_up:${i}` },
+          { text: { type: 'plain_text', text: '↓  Move Down' }, value: `move_down:${i}` },
+          { text: { type: 'plain_text', text: '🗑️  Delete' },  value: `delete:${i}` }
         ]
       }
     })),
@@ -467,17 +585,20 @@ function savedQuestionsBlocks(savedQuestions) {
 }
 
 function buildPreviewModal(meta) {
-  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [] } = meta;
+  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt } = meta;
   const tags = [];
   if (pollSettings.includes('anonymous'))    tags.push('🔒 Anonymous');
   if (pollSettings.includes('allow_revote')) tags.push('🔄 Vote changes allowed');
+  if (showResults === 'on_close')            tags.push('👁 Results after close');
+  if (showResults === 'creator_only')        tags.push('👁 Results for creator only');
+  if (closeAt)                               tags.push(`⏰ Closes ${new Date(closeAt).toLocaleString()}`);
 
   const questionBlocks = savedQuestions.flatMap((q, i) => [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${i + 1}. ${q.text}*\n_${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}_`
+        text: `*${i + 1}. ${q.text}*\n_${getTypeIcon(q.type)} ${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}_`
       }
     },
     ...(q.type === 'open_ended'
@@ -493,9 +614,9 @@ function buildPreviewModal(meta) {
   return {
     type: 'modal',
     callback_id: 'poll_preview_submit',
-    title: { type: 'plain_text', text: 'Preview Poll' },
-    submit: { type: 'plain_text', text: '✓  Create Poll' },
-    close: { type: 'plain_text', text: 'Cancel' },
+    title: { type: 'plain_text', text: 'Preview & Confirm' },
+    submit: { type: 'plain_text', text: '🚀  Post Poll' },
+    close: { type: 'plain_text', text: '← Back' },
     private_metadata: JSON.stringify(meta),
     blocks: [
       { type: 'header', text: { type: 'plain_text', text: pollTitle || 'Untitled Poll' } },
@@ -505,13 +626,14 @@ function buildPreviewModal(meta) {
       ...questionBlocks,
       {
         type: 'context',
-        elements: [{ type: 'mrkdwn', text: `${savedQuestions.length} ${savedQuestions.length === 1 ? 'question' : 'questions'} — review above then click *✓ Create Poll*` }]
+        elements: [{ type: 'mrkdwn', text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Click *🚀 Post Poll* to publish` }]
       }
     ]
   };
 }
 
 function buildVoteModal(poll, previousVotes = {}) {
+  const hasVoted = Object.keys(previousVotes).length > 0;
   const questionBlocks = poll.questions.flatMap((q, qi) => {
     const prev = previousVotes[qi] || [];
     const label = `${getTypeIcon(q.type)}  ${qi + 1}. ${q.text}`;
@@ -599,19 +721,43 @@ function buildVoteModal(poll, previousVotes = {}) {
     }];
   });
 
+  const notifyOpt = [{ text: { type: 'mrkdwn', text: '*Notify me when this poll closes*' }, value: 'notify' }];
+
   return {
     type: 'modal',
     callback_id: 'vote_submit',
-    title: { type: 'plain_text', text: 'Cast Your Vote' },
-    submit: { type: 'plain_text', text: 'Submit Vote' },
+    title: { type: 'plain_text', text: hasVoted ? 'Change Your Vote' : 'Cast Your Vote' },
+    submit: { type: 'plain_text', text: hasVoted ? 'Update Vote' : 'Submit Vote' },
     close: { type: 'plain_text', text: 'Cancel' },
     private_metadata: JSON.stringify({ pollId: poll.id }),
     blocks: [
       { type: 'header', text: { type: 'plain_text', text: poll.title } },
       ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-      { type: 'context', elements: [{ type: 'mrkdwn', text: `${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}${poll.anonymous ? '  ·  🔒 Anonymous' : ''}${poll.closeAt ? `  ·  ⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : ''}` }] },
+      {
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: [
+            `${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}`,
+            poll.anonymous ? '🔒 Anonymous' : null,
+            poll.closeAt ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
+          ].filter(Boolean).join('  ·  ')
+        }]
+      },
       { type: 'divider' },
-      ...questionBlocks
+      ...questionBlocks,
+      { type: 'divider' },
+      {
+        type: 'input',
+        block_id: 'vote_notify',
+        label: { type: 'plain_text', text: 'Notifications' },
+        optional: true,
+        element: {
+          type: 'checkboxes',
+          action_id: 'value',
+          options: notifyOpt
+        }
+      }
     ]
   };
 }
@@ -627,7 +773,6 @@ function pollProgressBar(count, total, width = 16) {
 function buildQuestionResultBlock(q, qi, poll) {
   const qVotes = poll.votes[qi] || {};
 
-  // ── Open-ended ──────────────────────────────────────────────────────────────
   if (q.type === 'open_ended') {
     const responses = Object.entries(qVotes);
     const count = responses.length;
@@ -648,7 +793,6 @@ function buildQuestionResultBlock(q, qi, poll) {
     ];
   }
 
-  // ── Likert ──────────────────────────────────────────────────────────────────
   if (q.type === 'likert') {
     const stmtBlocks = q.options.flatMap((stmt, si) => {
       const ratings = qVotes[si] || {};
@@ -665,13 +809,12 @@ function buildQuestionResultBlock(q, qi, poll) {
       }];
     });
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_Likert matrix_` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*` } },
       ...stmtBlocks,
       { type: 'divider' }
     ];
   }
 
-  // ── Ranking ─────────────────────────────────────────────────────────────────
   if (q.type === 'ranking') {
     const allRankings = Object.values(qVotes);
     const avgRanks = q.options.map((_, oi) => {
@@ -691,28 +834,26 @@ function buildQuestionResultBlock(q, qi, poll) {
       }
     }));
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_Ranking  ·  ${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
       ...optBlocks,
       { type: 'divider' }
     ];
   }
 
-  // ── Show-results gate ──────────────────────────────────────────────────────
   const isClosed = poll.status === 'closed';
   if (poll.showResults === 'on_close' && !isClosed) {
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n_Results will be visible after the poll closes_` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n_Results visible after poll closes_` } },
       { type: 'divider' }
     ];
   }
   if (poll.showResults === 'creator_only' && !isClosed) {
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n_Results are private — visible only to the poll creator_` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n_Results visible only to the creator_` } },
       { type: 'divider' }
     ];
   }
 
-  // ── Choice question ──────────────────────────────────────────────────────────
   const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
   const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
   const typeHint   = `${getTypeIcon(q.type)} _${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}_`;
@@ -758,22 +899,35 @@ function buildPollBlocks(poll) {
 
   const statusParts = [
     isClosed ? '🔒 *Closed*' : '🟢 *Active*',
-    poll.anonymous   ? '👁 Anonymous'            : null,
+    poll.anonymous   ? '🔒 Anonymous'            : null,
     poll.allowRevote ? '🔄 Vote changes allowed'  : null,
     participants > 0 ? `*${participants}* participant${participants !== 1 ? 's' : ''}` : '_No responses yet_',
     poll.closeAt && !isClosed ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
   ].filter(Boolean);
 
-  const hasAnyVotes = getAllVoters(poll).size > 0;
-  const voteLabel = isClosed ? '🔒  Voting Closed' : (poll.allowRevote && hasAnyVotes) ? '🔄  Change Vote' : '🗳️  Vote';
+  const hasAnyVotes = participants > 0;
+
+  const voteLabel = hasAnyVotes && poll.allowRevote
+    ? '🔄  Change Vote'
+    : participants > 0
+      ? `🗳️  Vote  ·  ${participants} voted`
+      : '🗳️  Vote';
+
+  // Closed poll: view results + share; Active poll: vote + share
   const actionButtons = isClosed
     ? [
-        { type: 'button', text: { type: 'plain_text', text: voteLabel,           emoji: true }, action_id: 'open_vote_modal', value: poll.id },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results', emoji: true }, action_id: 'share_poll',      value: poll.id }
+        { type: 'button', text: { type: 'plain_text', text: '📊  View Results', emoji: true }, style: 'primary', action_id: 'view_results_modal', value: poll.id },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results', emoji: true }, action_id: 'share_poll', value: poll.id }
       ]
     : [
-        { type: 'button', text: { type: 'plain_text', text: voteLabel,    emoji: true }, style: 'primary', action_id: 'open_vote_modal', value: poll.id },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share',  emoji: true },                  action_id: 'share_poll',       value: poll.id }
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: voteLabel, emoji: true },
+          style: 'primary',
+          action_id: 'open_vote_modal',
+          value: poll.id
+        },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share', emoji: true }, action_id: 'share_poll', value: poll.id }
       ];
 
   return [
@@ -787,13 +941,12 @@ function buildPollBlocks(poll) {
       type: 'context',
       elements: [{
         type: 'mrkdwn',
-        text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`  ·  \`/poll-share ${poll.id}\` to repost  ·  \`/poll-export ${poll.id}\` to download`
+        text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`  ·  \`/poll-share ${poll.id}\`  ·  \`/poll-export ${poll.id}\``
       }]
     }
   ];
 }
 
-// Share-poll modal — lets user pick a channel to repost the poll
 function buildShareModal(poll) {
   const totalParticipants = getAllVoters(poll).size;
 
@@ -809,7 +962,7 @@ function buildShareModal(poll) {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*${poll.title}*\n_${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}  ·  ${totalParticipants} participant${totalParticipants !== 1 ? 's' : ''} so far_`
+          text: `*${poll.title}*\n_${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}  ·  ${totalParticipants} participant${totalParticipants !== 1 ? 's' : ''}_`
         }
       },
       { type: 'divider' },
@@ -828,7 +981,7 @@ function buildShareModal(poll) {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: `The poll and its *Vote* button will be posted there. Votes cast from any channel all count toward the same poll.\nPoll ID: \`${poll.id}\``
+          text: 'Votes cast from any channel count toward the same poll.'
         }]
       }
     ]
@@ -841,7 +994,7 @@ function buildResultsBlocks(poll, heading) {
     { type: 'header', text: { type: 'plain_text', text: heading } },
     { type: 'section', text: { type: 'mrkdwn', text: `📊 *${poll.title}*` } },
     ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* ${participants === 1 ? 'participant' : 'participants'}  ·  Created by <@${poll.creator}>${poll.anonymous ? '  ·  🔒 Anonymous' : ''}` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* participant${participants === 1 ? '' : 's'}  ·  Created by <@${poll.creator}>${poll.anonymous ? '  ·  🔒 Anonymous' : ''}` }] },
     { type: 'divider' },
     ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll))
   ];
@@ -903,6 +1056,8 @@ async function createAndPostPoll(client, meta) {
     showResults,
     orderByVotes,
     voteTimestamps: {},
+    notifyOnClose: [],
+    coCreators: [],
     status: 'active'
   };
 
@@ -999,23 +1154,18 @@ app.command('/polls-list', async ({ ack, body, client }) => {
   try {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
-    const polls = await getAllPolls();
-    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now.' });
+    const polls = await getAllPolls('active');
+    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now. Use `/polls-archive` to see closed polls.' });
     const listBlocks = [
       { type: 'header', text: { type: 'plain_text', text: 'Active Polls' } },
       ...polls.map((p, i) => {
-        const participants = new Set(
-          Object.values(p.votes).flatMap(qv => {
-            const vals = Object.values(qv);
-            if (!vals.length) return [];
-            return Array.isArray(vals[0]) ? vals.flat() : Object.keys(qv);
-          })
-        ).size;
+        const participants = getAllVoters(p).size;
         const tags = [
           `${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}`,
           `${participants} participant${participants !== 1 ? 's' : ''}`,
           ...(p.anonymous   ? ['🔒 Anonymous'] : []),
-          ...(p.allowRevote ? ['🔄 Revote on'] : [])
+          ...(p.allowRevote ? ['🔄 Revote on'] : []),
+          ...(p.closeAt     ? [`⏰ Closes ${new Date(p.closeAt).toLocaleString()}`] : [])
         ];
         return {
           type: 'section',
@@ -1023,10 +1173,38 @@ app.command('/polls-list', async ({ ack, body, client }) => {
         };
       })
     ];
-    await client.chat.postMessage({ channel, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+    await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
   } catch (err) {
     console.error('/polls-list error:', err);
     await notifyError(client, body.user_id, `❌ /polls-list failed: ${err.message}`);
+  }
+});
+
+app.command('/polls-archive', async ({ ack, body, client }) => {
+  await ack();
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const polls = await getAllPolls('closed');
+    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls yet.' });
+    const listBlocks = [
+      { type: 'header', text: { type: 'plain_text', text: 'Closed Polls' } },
+      ...polls.slice(0, 20).map((p, i) => {
+        const participants = getAllVoters(p).size;
+        return {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${participants} participant${participants !== 1 ? 's' : ''}  ·  ${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}  ·  Created by <@${p.creator}>`
+          }
+        };
+      }),
+      { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results POLL_ID\` to view full results` }] }
+    ];
+    await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+  } catch (err) {
+    console.error('/polls-archive error:', err);
+    await notifyError(client, body.user_id, `❌ /polls-archive failed: ${err.message}`);
   }
 });
 
@@ -1039,18 +1217,127 @@ app.command('/poll-close', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (poll.creator !== userId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
+    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
+    if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: '⚠️ This poll is already closed.' });
+
+    const participants = getAllVoters(poll).size;
+    // Require confirmation when votes exist (error prevention)
+    if (participants > 0) {
+      return client.views.open({
+        trigger_id: body.trigger_id,
+        view: {
+          type: 'modal',
+          callback_id: 'poll_close_confirm',
+          title: { type: 'plain_text', text: 'Close Poll?' },
+          submit: { type: 'plain_text', text: '🔒  Close Poll' },
+          close: { type: 'plain_text', text: 'Cancel' },
+          private_metadata: JSON.stringify({ pollId, channelId: channel }),
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: `Are you sure you want to close *${poll.title}*?\n\n*${participants}* participant${participants !== 1 ? 's have' : ' has'} voted. This cannot be undone.`
+              }
+            },
+            { type: 'context', elements: [{ type: 'mrkdwn', text: 'Closing the poll will notify opted-in participants and post final results.' }] }
+          ]
+        }
+      });
+    }
+
     await closePoll(pollId);
-    await client.chat.postMessage({ channel, text: `🔒 Poll closed: ${poll.title}`, blocks: buildResultsBlocks({ ...poll, status: 'closed' }, '🔒 Final Results') });
+    const closedPoll = { ...poll, status: 'closed' };
+    await updatePollMessage(client, closedPoll);
+    await client.chat.postMessage({ channel, text: `🔒 Poll closed: ${poll.title}`, blocks: buildResultsBlocks(closedPoll, '🔒 Final Results') });
+    await sendCloseNotifications(client, closedPoll);
   } catch (err) {
     console.error('/poll-close error:', err);
     await notifyError(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
   }
 });
 
+app.command('/poll-edit', async ({ ack, body, client }) => {
+  await ack();
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const pollId = body.text.trim().replace(/`/g, '');
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-edit POLL_ID`' });
+    const poll = await getPoll(pollId);
+    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
+    await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
+  } catch (err) {
+    console.error('/poll-edit error:', err);
+    await notifyError(client, body.user_id, `❌ /poll-edit failed: ${err.message}`);
+  }
+});
+
+app.command('/poll-export', async ({ ack, body, client }) => {
+  await ack();
+  try {
+    const userId = body.user_id;
+    const channel = await resolveChannel(client, body.channel_id, userId);
+    const pollId = body.text.trim().replace(/`/g, '');
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
+    const poll = await getPoll(pollId);
+    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+
+    const esc = v => `"${String(v).replace(/"/g, '""')}"`;
+    const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
+
+    poll.questions.forEach((q, qi) => {
+      const qVotes = poll.votes[qi] || {};
+      if (q.type === 'open_ended') {
+        Object.entries(qVotes).forEach(([uid, text]) => {
+          const ts = poll.voteTimestamps?.[uid] || '';
+          rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
+        });
+        if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
+      } else if (q.type === 'ranking') {
+        const allRankings = Object.values(qVotes);
+        q.options.forEach((opt, oi) => {
+          const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
+          const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
+          rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
+        });
+      } else if (q.type === 'likert') {
+        q.options.forEach((stmt, si) => {
+          const ratings = qVotes[si] || {};
+          const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
+          LIKERT_SCALE.forEach(({ label, value }) => {
+            const cnt = (ratings[value] || []).length;
+            const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
+            rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
+          });
+        });
+      } else {
+        const total = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
+        q.options.forEach((opt, oi) => {
+          const voters = qVotes[oi] || [];
+          const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
+          rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
+        });
+      }
+    });
+
+    const csv = rows.map(r => r.map(esc).join(',')).join('\n');
+    await client.files.uploadV2({
+      channel_id: channel,
+      filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
+      content: csv,
+      title: `Results: ${poll.title}`,
+      initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
+    });
+  } catch (err) {
+    console.error('/poll-export error:', err);
+    await notifyError(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
+  }
+});
+
 // ==================== MAIN MODAL ACTIONS ====================
 
-// Overflow menu on saved questions (on question page): edit / duplicate / move / delete
 app.action('question_action', async ({ ack, body, client }) => {
   await ack();
   const meta = JSON.parse(body.view.private_metadata);
@@ -1061,7 +1348,6 @@ app.action('question_action', async ({ ack, body, client }) => {
   if (action === 'edit') {
     const q = qs[idx];
     qs.splice(idx, 1);
-    // Store current question page view_id so edit submit can update it
     const editMeta = { ...meta, savedQuestions: qs, editingIndex: idx, questionPageViewId: body.view.id };
     try {
       await client.views.push({
@@ -1085,13 +1371,11 @@ app.action('question_action', async ({ ack, body, client }) => {
 
   const updatedMeta = { ...meta, savedQuestions: qs };
   await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  // Sync metadata to root settings modal
   try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (_) {}
 });
 
 // ==================== QUESTION MODAL ACTIONS ====================
 
-// Dynamic show/hide of options field when type changes inside the pushed question modal
 app.action('question_type_changed', async ({ ack, body, client }) => {
   await ack();
   const meta = JSON.parse(body.view.private_metadata);
@@ -1108,7 +1392,6 @@ app.action('question_type_changed', async ({ ack, body, client }) => {
   });
 });
 
-// "＋ Add Question" button on question page — validates, saves, resets form
 app.action('add_another_question', async ({ ack, body, client }) => {
   await ack();
   const meta = JSON.parse(body.view.private_metadata);
@@ -1136,13 +1419,11 @@ app.action('add_another_question', async ({ ack, body, client }) => {
   };
 
   await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  // Sync metadata to root settings modal
   try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (_) {}
 });
 
 // ==================== VIEW SUBMISSIONS ====================
 
-// Settings modal submitted — "＋ Add Question" clicked → push question page
 app.view('poll_submit', async ({ ack, body, view }) => {
   const meta = JSON.parse(view.private_metadata);
   const values = view.state.values;
@@ -1155,9 +1436,6 @@ app.view('poll_submit', async ({ ack, body, view }) => {
   });
 });
 
-// Question page submitted — "Done" clicked
-// If editing: update question list and pop back to question page
-// If new: push preview modal
 app.view('question_submit', async ({ ack, body, view, client }) => {
   const meta = JSON.parse(view.private_metadata);
   const values = view.state.values;
@@ -1165,14 +1443,10 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
   const isEditing = meta.editingIndex !== undefined && meta.editingIndex !== null;
   const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
 
-  // When editing, the form might be blank if the user just wants to update order/settings.
-  // Allow submit with no text only in edit mode if there are saved questions.
   if (!text && !isEditing) {
-    // Allow Done with no form content if there are existing saved questions
     if (!meta.savedQuestions?.length) {
       return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please enter a question.' } });
     }
-    // Push preview with only saved questions
     return await ack({ response_action: 'push', view: buildPreviewModal(meta) });
   }
 
@@ -1197,7 +1471,6 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
   const updatedMeta = { ...meta, savedQuestions: updatedQuestions, editingIndex: null };
 
   if (isEditing) {
-    // Close edit modal and update the question page beneath it
     await ack();
     const questionPageViewId = meta.questionPageViewId;
     if (questionPageViewId) {
@@ -1205,12 +1478,10 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
     }
     try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (_) {}
   } else {
-    // Push preview modal
     await ack({ response_action: 'push', view: buildPreviewModal(updatedMeta) });
   }
 });
 
-// Preview modal — "✓ Create Poll" clicked → create poll, show success
 app.view('poll_preview_submit', async ({ ack, body, view, client }) => {
   const meta = JSON.parse(view.private_metadata);
   try {
@@ -1224,7 +1495,34 @@ app.view('poll_preview_submit', async ({ ack, body, view, client }) => {
   }
 });
 
-// "📤 Share" button on poll message — opens channel picker modal
+app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
+  const { pollId } = JSON.parse(view.private_metadata);
+  const values = view.state.values;
+  const newTitle = (values.edit_title?.value?.value || '').trim();
+  const newDesc  = (values.edit_description?.value?.value || '').trim();
+
+  if (!newTitle) {
+    return await ack({ response_action: 'errors', errors: { edit_title: 'Title is required.' } });
+  }
+
+  try {
+    const poll = await getPoll(pollId);
+    if (!poll) { await ack(); return; }
+    const updated = { ...poll, title: newTitle, description: newDesc };
+    await savePoll(updated);
+    await updatePollMessage(client, updated);
+    await ack({ response_action: 'update', view: {
+      type: 'modal',
+      title: { type: 'plain_text', text: 'Poll Updated' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${newTitle}* has been updated.` } }]
+    }});
+  } catch (err) {
+    console.error('poll_edit_submit error:', err);
+    await ack();
+  }
+});
+
 app.action('share_poll', async ({ ack, body, client, action }) => {
   await ack();
   try {
@@ -1236,7 +1534,6 @@ app.action('share_poll', async ({ ack, body, client, action }) => {
   }
 });
 
-// Share modal submitted — post poll to chosen channel and track the new message ref
 app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   await ack();
   const { pollId } = JSON.parse(view.private_metadata);
@@ -1251,7 +1548,6 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
       text: `📊 ${poll.title}`,
       blocks: buildPollBlocks(poll)
     });
-    // Register this shared copy so future vote updates propagate to it
     const updatedRefs = [...(poll.messageRefs || []), { channelId, messageTs: result.ts }];
     await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(updatedRefs), pollId]);
   } catch (err) {
@@ -1260,7 +1556,6 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   }
 });
 
-// Vote button on poll message
 app.action('open_vote_modal', async ({ ack, body, client, action }) => {
   await ack();
   const poll = await getPoll(action.value);
@@ -1273,7 +1568,10 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
         type: 'modal',
         title: { type: 'plain_text', text: 'Poll Closed' },
         close: { type: 'plain_text', text: 'Close' },
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } }]
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results ${poll.id}\` to view the final results.` }] }
+        ]
       }
     });
   }
@@ -1285,7 +1583,6 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
     if (q.type === 'open_ended') {
       if (qv[userId]) previousVotes[qi] = [qv[userId]];
     } else if (q.type === 'ranking' || q.type === 'likert') {
-      // no pre-fill for these types — just detect participation
       if (qv[userId] || Object.values(qv).some(r => typeof r === 'object' && Object.values(r).some(v => v.includes && v.includes(userId)))) {
         previousVotes[qi] = true;
       }
@@ -1307,7 +1604,10 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
         type: 'modal',
         title: { type: 'plain_text', text: 'Already Voted' },
         close: { type: 'plain_text', text: 'Close' },
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '⚠️ You have already voted in this poll.' } }]
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: '✅ You have already submitted your vote for this poll.' } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Vote changes are not allowed for this poll.' }] }
+        ]
       }
     });
   }
@@ -1318,11 +1618,11 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
   });
 });
 
-// Vote modal submitted — uses DB transaction to prevent race conditions on concurrent votes
 app.view('vote_submit', async ({ ack, body, view, client }) => {
   const { pollId } = JSON.parse(view.private_metadata);
   const userId = body.user.id;
   const values = view.state.values;
+  const wantsNotify = (values.vote_notify?.value?.selected_options || []).some(o => o.value === 'notify');
 
   const dbClient = await pool.connect();
   let finalPoll = null;
@@ -1338,12 +1638,12 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
 
     const poll = rowToPoll(rows[0]);
 
-    // Lazy auto-close
     if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
       await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
       await dbClient.query('COMMIT');
       await ack();
       await updatePollMessage(client, { ...poll, status: 'closed' });
+      await sendCloseNotifications(client, { ...poll, status: 'closed' });
       return;
     }
 
@@ -1419,9 +1719,15 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
       }
     });
 
+    // Update notification preference
+    const notifyList = new Set(poll.notifyOnClose || []);
+    if (wantsNotify) notifyList.add(userId);
+    else notifyList.delete(userId);
+    poll.notifyOnClose = [...notifyList];
+
     await dbClient.query(
-      'UPDATE polls SET votes=$1, vote_timestamps=$2 WHERE id=$3',
-      [JSON.stringify(poll.votes), JSON.stringify(voteTimestamps), pollId]
+      'UPDATE polls SET votes=$1, vote_timestamps=$2, notify_on_close=$3 WHERE id=$4',
+      [JSON.stringify(poll.votes), JSON.stringify(voteTimestamps), JSON.stringify(poll.notifyOnClose), pollId]
     );
     await dbClient.query('COMMIT');
     poll.voteTimestamps = voteTimestamps;
@@ -1435,71 +1741,52 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
     dbClient.release();
   }
 
-  // Show results to voter immediately after voting
   await ack({ response_action: 'update', view: buildPostVoteModal(finalPoll) });
-  // Update all shared copies of the poll message
   await updatePollMessage(client, finalPoll);
 });
 
-app.command('/poll-export', async ({ ack, body, client }) => {
+// "📊 View Results" button on closed poll message
+app.action('view_results_modal', async ({ ack, body, client, action }) => {
   await ack();
   try {
-    const userId = body.user_id;
-    const channel = await resolveChannel(client, body.channel_id, userId);
-    const pollId = body.text.trim().replace(/`/g, '');
-    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
-    const poll = await getPoll(pollId);
-    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-
-    const esc = v => `"${String(v).replace(/"/g, '""')}"`;
-    const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
-
-    poll.questions.forEach((q, qi) => {
-      const qVotes = poll.votes[qi] || {};
-      if (q.type === 'open_ended') {
-        Object.entries(qVotes).forEach(([uid, text]) => {
-          const ts = poll.voteTimestamps?.[uid] || '';
-          rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
-        });
-        if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
-      } else if (q.type === 'ranking') {
-        const allRankings = Object.values(qVotes);
-        q.options.forEach((opt, oi) => {
-          const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
-          const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
-          rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
-        });
-      } else if (q.type === 'likert') {
-        q.options.forEach((stmt, si) => {
-          const ratings = qVotes[si] || {};
-          const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
-          LIKERT_SCALE.forEach(({ label, value }) => {
-            const cnt = (ratings[value] || []).length;
-            const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
-            rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
-          });
-        });
-      } else {
-        const total = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-        q.options.forEach((opt, oi) => {
-          const voters = qVotes[oi] || [];
-          const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
-          rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
-        });
+    const poll = await getPoll(action.value);
+    if (!poll) return;
+    const participants = getAllVoters(poll).size;
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        title: { type: 'plain_text', text: 'Poll Results' },
+        close: { type: 'plain_text', text: 'Close' },
+        blocks: [
+          { type: 'header', text: { type: 'plain_text', text: poll.title } },
+          ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `🔒 Closed  ·  *${participants}* participant${participants !== 1 ? 's' : ''}  ·  Created by <@${poll.creator}>` }] },
+          { type: 'divider' },
+          ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll))
+        ]
       }
     });
-
-    const csv = rows.map(r => r.map(esc).join(',')).join('\n');
-    await client.files.uploadV2({
-      channel_id: channel,
-      filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
-      content: csv,
-      title: `Results: ${poll.title}`,
-      initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
-    });
   } catch (err) {
-    console.error('/poll-export error:', err);
-    await notifyError(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
+    console.error('view_results_modal error:', err);
+  }
+});
+
+// Confirmation modal for /poll-close when votes exist
+app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
+  await ack();
+  const { pollId, channelId } = JSON.parse(view.private_metadata);
+  try {
+    const poll = await getPoll(pollId);
+    if (!poll || poll.status === 'closed') return;
+    await closePoll(pollId);
+    const closedPoll = { ...poll, status: 'closed' };
+    await updatePollMessage(client, closedPoll);
+    await client.chat.postMessage({ channel: channelId, text: `🔒 Poll closed: ${poll.title}`, blocks: buildResultsBlocks(closedPoll, '🔒 Final Results') });
+    await sendCloseNotifications(client, closedPoll);
+  } catch (err) {
+    console.error('poll_close_confirm error:', err);
+    await notifyError(client, body.user.id, `❌ Failed to close poll: ${err.message}`);
   }
 });
 
@@ -1513,16 +1800,13 @@ receiver.router.get('/health', (req, res) => res.json({ status: 'ok', uptime: pr
 (async () => {
   const port = process.env.PORT || 3000;
 
-  // Bind the port FIRST — Render will kill the process if no port is open within ~60s
   await app.start(port);
   console.log(`⚡️ Server listening on port ${port}`);
 
-  // Init DB after port is bound so Render sees the service as healthy
   try {
     await initDb();
     console.log('💾 Database ready');
   } catch (err) {
-    // Log the error but don't crash — health check still passes, DB ops will surface errors per-request
     console.error('⚠️  DB init error (will retry on next request):', err.message);
   }
 })();
