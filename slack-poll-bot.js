@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 2000,
   idleTimeoutMillis: 30000,
   max: 5
 });
@@ -246,16 +246,22 @@ const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_
 const app = new App({
   receiver,
   authorize: async ({ teamId, enterpriseId }) => {
-    const id = teamId || enterpriseId;
-    const { rows } = await pool.query(
-      'SELECT data FROM slack_installations WHERE team_id = $1', [id]
-    );
-    if (rows.length) {
-      const d = JSON.parse(rows[0].data);
-      return { botToken: d.access_token, botUserId: d.bot_user_id };
-    }
+    // Fast path: skip DB entirely when static token is configured
     if (process.env.SLACK_BOT_TOKEN) {
       return { botToken: process.env.SLACK_BOT_TOKEN };
+    }
+    // OAuth multi-workspace path
+    const id = teamId || enterpriseId;
+    try {
+      const { rows } = await pool.query(
+        'SELECT data FROM slack_installations WHERE team_id = $1', [id]
+      );
+      if (rows.length) {
+        const d = JSON.parse(rows[0].data);
+        return { botToken: d.access_token, botUserId: d.bot_user_id };
+      }
+    } catch (err) {
+      console.error('authorize DB error:', err.message);
     }
     throw new Error('No installation found. Please install the bot first.');
   }
@@ -1224,7 +1230,7 @@ function buildQuestion(text, type, optionsRaw, allowMultiple) {
 
 // ==================== COMMANDS ====================
 
-app.command('/newpoll', async ({ ack, body, client }) => {
+async function handleNewPoll({ ack, body, client }) {
   await ack();
   try {
     await client.views.open({
@@ -1234,6 +1240,21 @@ app.command('/newpoll', async ({ ack, body, client }) => {
   } catch (err) {
     console.error('/newpoll error:', err);
     await notifyError(client, body.user_id, `❌ Could not open poll creator: ${err.message}`);
+  }
+}
+
+app.command('/newpoll', handleNewPoll);
+app.command('/poll', handleNewPoll);
+
+app.shortcut('create_poll', async ({ ack, shortcut, client }) => {
+  await ack();
+  try {
+    await client.views.open({
+      trigger_id: shortcut.trigger_id,
+      view: buildCreationModal({ channelId: shortcut.channel?.id || shortcut.user.id, userId: shortcut.user.id, savedQuestions: [] })
+    });
+  } catch (err) {
+    console.error('create_poll shortcut error:', err);
   }
 });
 

@@ -29,6 +29,8 @@ Go to **OAuth & Permissions → Bot Token Scopes** and add:
 - `chat:write`
 - `chat:write.public`
 - `commands`
+- `im:write` — required for polls created in DMs
+- `im:history` — required to read DM channel info
 
 Click **Install to Workspace** and copy your **Bot Token** (`xoxb-...`)
 
@@ -63,10 +65,14 @@ In your Slack app, go to **Slash Commands** and create each one with this Reques
 
 | Command          | Description             | Hint                          |
 |-----------------|-------------------------|-------------------------------|
-| `/poll`          | Create a new poll       | `Question \| Option 1 \| Option 2` |
+| `/newpoll`       | Create a new poll       | Opens interactive modal       |
 | `/poll-results`  | View results            | `POLL_ID`                     |
+| `/poll-share`    | Share poll to channel   | `POLL_ID`                     |
 | `/polls-list`    | List all active polls   |                               |
+| `/polls-archive` | List closed polls       |                               |
 | `/poll-close`    | Close a poll            | `POLL_ID`                     |
+| `/poll-edit`     | Edit poll title/desc    | `POLL_ID`                     |
+| `/poll-export`   | Export results as CSV   | `POLL_ID`                     |
 
 ### 7. Enable Interactivity
 
@@ -78,9 +84,9 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ## Usage
 
 ```
-/poll Best language? | Python | JavaScript | Go
+/newpoll
 ```
-→ A poll appears with Vote buttons. Votes update in real time.
+→ Opens an interactive modal. Add a title, questions (multiple choice, yes/no, rating scales, open-ended, and more), set options like anonymous voting or auto-close time, then post.
 
 ```
 /poll-results poll_1706234567_abc12345
@@ -91,6 +97,16 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 /polls-list
 ```
 → Lists all open polls.
+
+```
+/poll-share poll_1706234567_abc12345
+```
+→ Re-posts the poll to another channel.
+
+```
+/poll-export poll_1706234567_abc12345
+```
+→ Exports results as a CSV file.
 
 ```
 /poll-close poll_1706234567_abc12345
@@ -133,3 +149,4 @@ Polls are stored in `polls.db` (SQLite file in the project directory). No setup 
 | Votes not working | Confirm Interactivity is enabled with the correct URL |
 | ngrok URL changed | Update Request URLs in Slack app settings |
 | Polls lost after restart | Make sure `polls.db` file is persisted on your host |
+| Can't create polls in DMs | Add `im:write` and `im:history` scopes, then reinstall the app |
