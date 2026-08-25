@@ -382,6 +382,18 @@ function toMessageRefs(posted) {
   return posted.map(({ channelId, messageTs }) => ({ channelId, messageTs }));
 }
 
+// Whether the poll landed somewhere its creator can read and vote in.
+//
+// A channel they picked counts - the picker only offers conversations they can
+// open. Their own DM counts, whether they picked themselves or fell back to it.
+// A poll sent only to other people does not: the creator would have a receipt
+// and no ballot.
+function reachesCreator(posted, destUsers, creatorId, usedFallback) {
+  if (usedFallback) return true;
+  if ((destUsers || []).includes(creatorId)) return true;
+  return posted.some(p => /^[CG]/.test(p.channelId));
+}
+
 // Slack returns these when the app cannot post somewhere the picker was willing
 // to offer, and the fix is always the same one sentence.
 function describeFailures(failures) {
@@ -742,7 +754,7 @@ function buildCreationModal(meta, errorMsg = null) {
         type: 'input', block_id: 'poll_dest_users',
         label: { type: 'plain_text', text: 'People' },
         optional: true,
-        hint: { type: 'plain_text', text: 'Each person gets the poll in their own DM with me' },
+        hint: { type: 'plain_text', text: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.' },
         element: {
           type: 'multi_users_select', action_id: 'value',
           placeholder: { type: 'plain_text', text: 'Pick people...' },
@@ -1416,6 +1428,26 @@ async function createAndPostPoll(client, meta, teamId = null) {
   // the poll stands and the creator is told which ones missed.
   if (!posted.length) throw new Error(describeFailures(allFailures));
 
+  // A poll its own creator cannot vote in is broken, not a preference. Sending
+  // it only to other people left them with nothing to click - the confirmation
+  // is a receipt, not a poll - so they get their own copy. Based on what
+  // actually posted, so a private channel that refused the app counts as no
+  // copy at all.
+  if (!reachesCreator(posted, destUsers, userId, usedFallback)) {
+    try {
+      const own = await client.conversations.open({ users: userId });
+      if (!posted.some(p => p.channelId === own.channel.id)) {
+        const r = await client.chat.postMessage({
+          channel: own.channel.id, text: `📊 ${poll.title}`, blocks: buildPollBlocks(poll)
+        });
+        posted.push({ channelId: own.channel.id, messageTs: r.ts, label: 'you (so you can vote)' });
+      }
+    } catch (e) {
+      // Not fatal: the poll is posted where it was asked to go. Say so instead.
+      allFailures.push({ label: 'your own DM', reason: e.data?.error || e.message });
+    }
+  }
+
   poll.messageRefs = toMessageRefs(posted);
   poll.channelId = posted[0].channelId;
   poll.messageTs = posted[0].messageTs;
@@ -1561,7 +1593,13 @@ app.command('/polls-list', async ({ ack, body, client }) => {
         ];
         return {
           type: 'section',
-          text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` }
+          text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` },
+          accessory: {
+            type: 'button',
+            text: { type: 'plain_text', text: '📤  Send', emoji: true },
+            action_id: 'share_poll',
+            value: p.id
+          }
         };
       }),
       ...truncationNote(polls.length, shown.length)

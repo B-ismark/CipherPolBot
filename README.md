@@ -120,6 +120,13 @@ The channel you ran it in is prefilled, so posting where you are stays one click
 Votes cast anywhere the poll appears count toward the same poll, and every copy
 of the message updates on every vote.
 
+**You always get a ballot.** Pick only people and you get your own copy of the
+poll too, so you can vote in it and watch the results come in - a poll its
+creator cannot vote in is broken, not a preference. Pick a channel and you do
+not, because you can read it there. Pick yourself under **People** and you get
+one copy, not two. If the only channel you picked turns the bot away, that
+counts as no copy and you get a DM copy instead, with a note to invite the bot.
+
 **Running `/newpoll` in a DM with another person.** Slack does not let an app
 post into a DM between two people - it has no membership there and cannot be
 given one, and it is never told who the other person is. So pick them under
@@ -141,7 +148,9 @@ set when the poll was created still closes it on its own.
 ```
 /polls-list
 ```
-→ Lists all open polls.
+→ Lists all open polls, each with a **📤 Send** button. That button is the way
+back to a poll you cannot see - one sent only to somebody else, say: send it to
+yourself and you can vote in it and follow the results.
 
 ```
 /poll-share poll_1706234567_abc12345
