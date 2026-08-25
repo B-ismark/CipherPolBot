@@ -241,6 +241,9 @@ const {
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
+const {
+  MAX_DESTINATIONS, normalizeDestinations, assertDestinationLimit, dedupeTargets
+} = require('./lib/destinations');
 
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
@@ -308,11 +311,96 @@ async function resolveChannel(client, channelId, userId) {
   return channel;
 }
 
+// Turns the channels and people someone picked into channels this app can
+// actually post in. A person becomes the app's own DM with them - see
+// lib/destinations.js for why that is the only way to reach an individual.
+//
+// Returns a label per target so the confirmation can name where the poll went
+// without a second round of API calls, and the failures separately: one
+// unreachable destination must not stop the others.
+async function resolveDestinations(client, { channelIds, userIds }, fallbackChannelId, actorId) {
+  const { channels, users, usedFallback } = normalizeDestinations({ channelIds, userIds, fallbackChannelId });
+  assertDestinationLimit({ channels, users });
+
+  const targets = [];
+  const failures = [];
+  let redirected = false;
+
+  for (const id of channels) {
+    // Only the fallback can be a DM between two people, because the picker does
+    // not offer those. That one needs substituting; a picked channel does not.
+    if (usedFallback) {
+      const info = await resolveChannelInfo(client, id, actorId);
+      redirected = info.redirected;
+      targets.push({ channel: info.channel, label: info.redirected ? 'our DM' : `<#${info.channel}>` });
+    } else {
+      targets.push({ channel: id, label: `<#${id}>` });
+    }
+  }
+
+  for (const uid of users) {
+    // Anyone in the workspace can share a poll, so this is also what stops one
+    // person being sent a stream of them. The budget is shared with close
+    // notifications, on purpose: it is a cap on DMs this app sends them.
+    if (!await checkNotificationRateLimit(uid)) {
+      failures.push({ label: `<@${uid}>`, reason: 'already had several poll DMs from me this hour' });
+      continue;
+    }
+    try {
+      const r = await client.conversations.open({ users: uid });
+      targets.push({ channel: r.channel.id, label: `<@${uid}>` });
+    } catch (e) {
+      failures.push({ label: `<@${uid}>`, reason: e.data?.error || e.message });
+    }
+  }
+
+  return { targets: dedupeTargets(targets), failures, redirected, usedFallback };
+}
+
+// Posts the poll into every target, keeping the ones that worked. Slack fails a
+// single destination for its own reasons - a private channel the app was never
+// invited to, a deactivated account - and that must not lose the others.
+async function postPollTo(client, poll, targets) {
+  const blocks = buildPollBlocks(poll);
+  const results = await Promise.allSettled(targets.map(t =>
+    client.chat.postMessage({ channel: t.channel, text: `📊 ${poll.title}`, blocks })
+      .then(r => ({ channelId: t.channel, messageTs: r.ts }))
+  ));
+
+  const posted = [];
+  const failures = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') posted.push({ ...r.value, label: targets[i].label });
+    else failures.push({ label: targets[i].label, reason: r.reason?.data?.error || r.reason?.message });
+  });
+  return { posted, failures };
+}
+
+// message_refs is stored, so it keeps only what a later chat.update needs - a
+// label would be a copy of a channel name that goes stale on the first rename.
+function toMessageRefs(posted) {
+  return posted.map(({ channelId, messageTs }) => ({ channelId, messageTs }));
+}
+
+// Slack returns these when the app cannot post somewhere the picker was willing
+// to offer, and the fix is always the same one sentence.
+function describeFailures(failures) {
+  const list = failures.map(f => `${f.label} (${f.reason})`).join(', ');
+  const needsInvite = failures.some(f => /not_in_channel|channel_not_found/.test(`${f.reason}`));
+  return `Could not post to ${list}.${needsInvite ? ' For a private channel, invite me to it first (\`/invite @Cipher Pol\`).' : ''}`;
+}
+
 async function notifyError(client, userId, text) {
   try {
     const r = await client.conversations.open({ users: userId });
     await client.chat.postMessage({ channel: r.channel.id, text });
   } catch (e) { console.error('notifyError failed:', e.message); }
+}
+
+// Same delivery as notifyError - a DM to one person - for messages that are not
+// errors.
+async function dmUser(client, userId, text) {
+  return notifyError(client, userId, text);
 }
 
 function buildNoticeModal(title, text) {
@@ -574,6 +662,14 @@ function buildCreationModal(meta, errorMsg = null) {
     closeAt, showResults = 'creator_only', orderByVotes = false
   } = meta;
 
+  // First open: post where the command was run. A DM cannot be prefilled -
+  // Slack never tells an app who the other person in one is, and the picker
+  // cannot offer a conversation the app is not in - so it is left empty and the
+  // fallback in resolveDestinations sends the poll to our own DM instead.
+  // ?? not ||, so a creator who clears the picker stays cleared.
+  const destChannels = meta.destChannels ?? (/^[CG]/.test(meta.channelId || '') ? [meta.channelId] : []);
+  const destUsers    = meta.destUsers ?? [];
+
   const settingsOptions = [
     { text: { type: 'mrkdwn', text: '*Anonymous* — hide who voted for what' }, value: 'anonymous' },
     { text: { type: 'mrkdwn', text: '*Allow vote changes* — voters can update their choice' }, value: 'allow_revote' }
@@ -624,6 +720,40 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(pollDescription ? { initial_value: pollDescription } : {})
         }
       },
+      // ── Where to post ─────────────────────────────────
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
+      {
+        type: 'input', block_id: 'poll_dest_channels',
+        label: { type: 'plain_text', text: 'Channels' },
+        optional: true,
+        element: {
+          type: 'multi_conversations_select', action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Pick channels...' },
+          max_selected_items: MAX_DESTINATIONS,
+          // Channels only: an app cannot post into a DM between two people, so
+          // offering one here would just be a choice that fails. People are
+          // picked below and reached through their own DM with the app.
+          filter: { include: ['public', 'private'] },
+          ...(destChannels.length ? { initial_conversations: destChannels } : {})
+        }
+      },
+      {
+        type: 'input', block_id: 'poll_dest_users',
+        label: { type: 'plain_text', text: 'People' },
+        optional: true,
+        hint: { type: 'plain_text', text: 'Each person gets the poll in their own DM with me' },
+        element: {
+          type: 'multi_users_select', action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Pick people...' },
+          max_selected_items: MAX_DESTINATIONS,
+          ...(destUsers.length ? { initial_users: destUsers } : {})
+        }
+      },
+      ...(destChannels.length || destUsers.length ? [] : [{
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: 'Leave both empty and the poll goes to the conversation you ran the command from.' }]
+      }]),
       // ── Privacy & Voting ──────────────────────────────
       { type: 'divider' },
       { type: 'section', text: { type: 'mrkdwn', text: '*Privacy & Voting*' } },
@@ -740,7 +870,8 @@ function savedQuestionsBlocks(savedQuestions) {
 }
 
 function buildPreviewModal(meta) {
-  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt } = meta;
+  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt, destChannels = [], destUsers = [] } = meta;
+  const destinations = [...destChannels.map(c => `<#${c}>`), ...destUsers.map(u => `<@${u}>`)];
   const tags = [];
   if (pollSettings.includes('anonymous'))    tags.push('🔒 Anonymous');
   if (pollSettings.includes('allow_revote')) tags.push('🔄 Vote changes allowed');
@@ -781,7 +912,12 @@ function buildPreviewModal(meta) {
       ...questionBlocks,
       {
         type: 'context',
-        elements: [{ type: 'mrkdwn', text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Click *🚀 Post Poll* to publish` }]
+        elements: [{
+          type: 'mrkdwn',
+          text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Posting to ` +
+            (destinations.length ? destinations.join(', ') : 'this conversation') +
+            ' · Click *🚀 Post Poll* to publish'
+        }]
       }
     ]
   };
@@ -1048,9 +1184,9 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null) {
 
 // Shown only to the creator: the id, and the commands that need it.
 function pollAdminHint(poll) {
+  // No /poll-close here: the poll message carries a Close button now.
   return [
     `ID: \`${poll.id}\``,
-    `\`/poll-close ${poll.id}\``,
     `\`/poll-export ${poll.id}\``
   ].join('  ·  ');
 }
@@ -1092,7 +1228,12 @@ function buildPollBlocks(poll) {
           action_id: 'open_vote_modal',
           value: poll.id
         },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share', emoji: true }, action_id: 'share_poll', value: poll.id }
+        { type: 'button', text: { type: 'plain_text', text: '📤  Share', emoji: true }, action_id: 'share_poll', value: poll.id },
+        // Everyone sees this button - Slack cannot show one person a different
+        // version of a message - so the handler turns away anyone who is not
+        // running the poll. Without it, closing a poll that was created without
+        // an auto-close time meant finding its id and typing a slash command.
+        { type: 'button', text: { type: 'plain_text', text: '🔒  Close', emoji: true }, action_id: 'close_poll', value: poll.id }
       ];
 
   return [
@@ -1119,7 +1260,7 @@ function buildShareModal(poll) {
     type: 'modal',
     callback_id: 'share_poll_submit',
     title: { type: 'plain_text', text: 'Share Poll' },
-    submit: { type: 'plain_text', text: '📤  Post to Channel' },
+    submit: { type: 'plain_text', text: '📤  Send Poll' },
     close: { type: 'plain_text', text: 'Cancel' },
     private_metadata: JSON.stringify({ pollId: poll.id }),
     blocks: [
@@ -1133,23 +1274,39 @@ function buildShareModal(poll) {
       { type: 'divider' },
       {
         type: 'input',
-        block_id: 'share_channel',
-        label: { type: 'plain_text', text: 'Post to channel' },
+        block_id: 'share_channels',
+        label: { type: 'plain_text', text: 'Channels' },
+        optional: true,
         element: {
-          type: 'conversations_select',
+          type: 'multi_conversations_select',
           action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Choose a channel...' },
-          // Channels only. An app cannot post into a DM between two people, nor
+          placeholder: { type: 'plain_text', text: 'Pick channels...' },
+          max_selected_items: MAX_DESTINATIONS,
+          // Channels only: an app cannot post into a DM between two people, nor
           // into a group DM it was never added to, so offering either here would
-          // just be a choice that fails.
-          filter: { include: ['public', 'private'], exclude_bot_users: true }
+          // just be a choice that fails. People are picked below and reached
+          // through their own DM with the app instead.
+          filter: { include: ['public', 'private'] }
+        }
+      },
+      {
+        type: 'input',
+        block_id: 'share_users',
+        label: { type: 'plain_text', text: 'People' },
+        optional: true,
+        hint: { type: 'plain_text', text: 'Each person gets the poll in their own DM with me' },
+        element: {
+          type: 'multi_users_select',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Pick people...' },
+          max_selected_items: MAX_DESTINATIONS
         }
       },
       {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: 'Votes cast from any channel count toward the same poll. For a private channel, invite me to it first.'
+          text: 'Votes cast anywhere it is posted count toward the same poll. For a private channel, invite me to it first.'
         }]
       }
     ]
@@ -1196,7 +1353,7 @@ function buildPostVoteModal(poll, viewerId = null) {
 // ==================== POLL CREATION HELPER ====================
 
 async function createAndPostPoll(client, meta, teamId = null) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false } = meta;
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false, destChannels = [], destUsers = [] } = meta;
 
   // The submission has already been acked, so nothing here is racing Slack's
   // 3-second deadline and this wait costs nothing once the bot is up.
@@ -1245,17 +1402,25 @@ async function createAndPostPoll(client, meta, teamId = null) {
   };
 
   await savePoll(poll);
-  const { channel, redirected } = await resolveChannelInfo(client, channelId, userId);
-  const result = await client.chat.postMessage({
-    channel,
-    text: `📊 ${poll.title}`,
-    blocks: buildPollBlocks(poll)
-  });
-  poll.messageTs = result.ts;
-  poll.channelId = channel;
-  poll.messageRefs = [{ channelId: channel, messageTs: result.ts }];
+
+  const { targets, failures, redirected, usedFallback } = await resolveDestinations(
+    client, { channelIds: destChannels, userIds: destUsers }, channelId, userId
+  );
+  if (!targets.length) {
+    throw new Error(failures.length ? describeFailures(failures) : 'There was nowhere to post this poll.');
+  }
+
+  const { posted, failures: postFailures } = await postPollTo(client, poll, targets);
+  const allFailures = [...failures, ...postFailures];
+  // Every destination failing is a failed poll; some of them failing is not, so
+  // the poll stands and the creator is told which ones missed.
+  if (!posted.length) throw new Error(describeFailures(allFailures));
+
+  poll.messageRefs = toMessageRefs(posted);
+  poll.channelId = posted[0].channelId;
+  poll.messageTs = posted[0].messageTs;
   await savePoll(poll);
-  return { poll, channel, redirected };
+  return { poll, channel: posted[0].channelId, posted, failures: allFailures, redirected, usedFallback };
 }
 
 // ==================== HELPERS ====================
@@ -1277,7 +1442,11 @@ function readMainModalSettings(values, meta) {
     pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
     closeAt:         closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : (meta.closeAt || null),
     showResults:     values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? 'creator_only',
-    orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false)
+    orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false),
+    // Only the main modal carries these blocks; every other submission has to
+    // keep what was already picked.
+    destChannels:    values.poll_dest_channels?.value?.selected_conversations ?? meta.destChannels ?? [],
+    destUsers:       values.poll_dest_users?.value?.selected_users ?? meta.destUsers ?? []
   };
 }
 
@@ -1434,6 +1603,47 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
   }
 });
 
+// Losing votes by accident cannot be undone, so closing a poll that has any is
+// confirmed first. channelId travels in private_metadata because the final
+// results are posted where the close was asked for, which the view submission
+// does not otherwise know.
+function buildCloseConfirmModal(poll, channelId, participants) {
+  return {
+    type: 'modal',
+    callback_id: 'poll_close_confirm',
+    title: { type: 'plain_text', text: 'Close Poll?' },
+    submit: { type: 'plain_text', text: '🔒  Close Poll' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    private_metadata: JSON.stringify({ pollId: poll.id, channelId }),
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `Are you sure you want to close *${poll.title}*?\n\n*${participants}* participant${participants !== 1 ? 's have' : ' has'} voted. This cannot be undone.`
+        }
+      },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Closing the poll will notify opted-in participants and post final results.' }] }
+    ]
+  };
+}
+
+// Closing is the same three steps wherever it was triggered from: every copy of
+// the poll message has to stop offering a vote, the final results have to be
+// posted, and everyone who asked to be told has to be told.
+async function finalizePollClose(client, poll, channel) {
+  await closePoll(poll.id);
+  const closed = { ...poll, status: 'closed' };
+  await updatePollMessage(client, closed);
+  await client.chat.postMessage({
+    channel,
+    text: `🔒 Poll closed: ${poll.title}`,
+    blocks: buildResultsBlocks(closed, '🔒 Final Results')
+  });
+  await sendCloseNotifications(client, closed);
+  return closed;
+}
+
 app.command('/poll-close', async ({ ack, body, client }) => {
   await ack();
   try {
@@ -1451,32 +1661,11 @@ app.command('/poll-close', async ({ ack, body, client }) => {
     if (participants > 0) {
       return client.views.open({
         trigger_id: body.trigger_id,
-        view: {
-          type: 'modal',
-          callback_id: 'poll_close_confirm',
-          title: { type: 'plain_text', text: 'Close Poll?' },
-          submit: { type: 'plain_text', text: '🔒  Close Poll' },
-          close: { type: 'plain_text', text: 'Cancel' },
-          private_metadata: JSON.stringify({ pollId, channelId: channel }),
-          blocks: [
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `Are you sure you want to close *${poll.title}*?\n\n*${participants}* participant${participants !== 1 ? 's have' : ' has'} voted. This cannot be undone.`
-              }
-            },
-            { type: 'context', elements: [{ type: 'mrkdwn', text: 'Closing the poll will notify opted-in participants and post final results.' }] }
-          ]
-        }
+        view: buildCloseConfirmModal(poll, channel, participants)
       });
     }
 
-    await closePoll(pollId);
-    const closedPoll = { ...poll, status: 'closed' };
-    await updatePollMessage(client, closedPoll);
-    await client.chat.postMessage({ channel, text: `🔒 Poll closed: ${poll.title}`, blocks: buildResultsBlocks(closedPoll, '🔒 Final Results') });
-    await sendCloseNotifications(client, closedPoll);
+    await finalizePollClose(client, poll, channel);
   } catch (err) {
     console.error('/poll-close error:', err);
     await notifyError(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
@@ -1734,48 +1923,40 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       enterpriseId: context.enterpriseId ?? body.enterprise?.id,
       teamId: context.teamId ?? body.team?.id ?? view.team_id
     });
-    const { poll, channel, redirected } = await createAndPostPoll(client, meta, teamId);
+    const { poll, posted, failures, redirected, usedFallback } = await createAndPostPoll(client, meta, teamId);
 
-    if (!redirected) {
-      await client.chat.postEphemeral({
-        channel,
-        user: meta.userId,
-        text: `✅ *${poll.title}* has been posted!`,
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: `✅ *${poll.title}* has been posted!` } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: pollAdminHint(poll) }] }
-        ]
-      });
-      return;
+    const lines = [`✅ *${poll.title}* was posted to ${posted.map(p => p.label).join(', ')}.`];
+
+    // Only the fallback can land the poll somewhere the creator did not choose,
+    // and only when the command came from a DM between two people.
+    const explainRedirect = usedFallback && redirected;
+    if (explainRedirect) {
+      lines.push('Slack does not let an app post into a DM between two people, so it could not go into the conversation you ran the command from. Send it on with the button below, or pick the people you want under *Where to post* next time.');
     }
+    if (failures.length) lines.push(`⚠️ ${describeFailures(failures)}`);
+    if (posted.length > 1) lines.push('Votes cast in any of them count toward this one poll.');
 
-    // A real message rather than an ephemeral one: the button has to survive a
-    // reload, and opening the share modal here instead would race Slack's
-    // 3-second trigger_id, which the poll we just posted has already spent.
-    await client.chat.postMessage({
-      channel,
-      text: `✅ ${poll.title} was posted here - Slack does not let apps post into a DM between two people.`,
-      blocks: [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `✅ *${poll.title}* was posted here, just above.\n\nSlack does not let an app post into a DM between two people, so it could not go into the conversation you ran the command from. Send it wherever you need it:`
-          }
-        },
-        {
-          type: 'actions',
-          elements: [
-            { type: 'button', text: { type: 'plain_text', text: '📤  Post to a channel', emoji: true }, style: 'primary', action_id: 'share_poll', value: poll.id }
-          ]
-        },
-        {
-          type: 'context',
-          elements: [{ type: 'mrkdwn', text: 'Votes cast from anywhere you post it all count toward this one poll.' }]
-        },
-        { type: 'context', elements: [{ type: 'mrkdwn', text: pollAdminHint(poll) }] }
-      ]
-    });
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n\n') } },
+      ...(explainRedirect ? [{
+        type: 'actions',
+        elements: [{ type: 'button', text: { type: 'plain_text', text: '📤  Send it on', emoji: true }, style: 'primary', action_id: 'share_poll', value: poll.id }]
+      }] : []),
+      { type: 'context', elements: [{ type: 'mrkdwn', text: pollAdminHint(poll) }] }
+    ];
+    const text = `✅ ${poll.title} has been posted!`;
+
+    // Confirm where the command was run - somewhere the creator can certainly
+    // read. A DM between two people is not, so that becomes our own DM.
+    const confirmChannel = await resolveChannel(client, meta.channelId, meta.userId);
+    if (explainRedirect) {
+      // A real message rather than an ephemeral one: the button has to survive a
+      // reload, and opening the share modal here instead would race Slack's
+      // 3-second trigger_id, which the poll we just posted has already spent.
+      await client.chat.postMessage({ channel: confirmChannel, text, blocks });
+    } else {
+      await client.chat.postEphemeral({ channel: confirmChannel, user: meta.userId, text, blocks });
+    }
   } catch (err) {
     console.error('poll_preview_submit error:', err);
     // The modal is already gone, so the only way left to report this is a DM.
@@ -1831,26 +2012,43 @@ app.action('share_poll', async ({ ack, body, client, action }) => {
 app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   await ack();
   const { pollId } = JSON.parse(view.private_metadata);
-  const channelId = view.state.values.share_channel?.value?.selected_conversation;
-  if (!channelId) return;
+  const channelIds = view.state.values.share_channels?.value?.selected_conversations || [];
+  const userIds    = view.state.values.share_users?.value?.selected_users || [];
+  const actor = body.user.id;
 
   try {
     const poll = await getPoll(pollId);
     if (!poll) return;
-    const result = await client.chat.postMessage({
-      channel: channelId,
-      text: `📊 ${poll.title}`,
-      blocks: buildPollBlocks(poll)
-    });
-    const updatedRefs = [...(poll.messageRefs || []), { channelId, messageTs: result.ts }];
-    await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(updatedRefs), pollId]);
+
+    // No fallback here: an empty picker means nothing was picked, not that the
+    // poll should be posted a second time where it already is.
+    const { targets, failures } = await resolveDestinations(client, { channelIds, userIds }, null, actor);
+
+    // One poll with two messages in the same place is two things to keep in
+    // step on every vote, and reads as a duplicate to everyone there.
+    const already = new Set((poll.messageRefs || []).map(r => r.channelId));
+    const fresh = targets.filter(t => !already.has(t.channel));
+
+    if (!fresh.length && !failures.length) {
+      return await dmUser(client, actor, targets.length
+        ? `⚠️ *${poll.title}* is already posted in ${targets.map(t => t.label).join(', ')}.`
+        : '⚠️ Pick at least one channel or person to send the poll to.');
+    }
+
+    const { posted, failures: postFailures } = await postPollTo(client, poll, fresh);
+    if (posted.length) {
+      const refs = [...(poll.messageRefs || []), ...toMessageRefs(posted)];
+      await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(refs), pollId]);
+    }
+
+    const parts = [];
+    if (posted.length) parts.push(`✅ *${poll.title}* sent to ${posted.map(p => p.label).join(', ')}.`);
+    const allFailures = [...failures, ...postFailures];
+    if (allFailures.length) parts.push(`⚠️ ${describeFailures(allFailures)}`);
+    await dmUser(client, actor, parts.join('\n\n'));
   } catch (err) {
     console.error('share_poll_submit error:', err);
-    const code = err.data?.error || err.message;
-    const cannotPost = `${code}`.includes('channel_not_found') || `${code}`.includes('not_in_channel');
-    await notifyError(client, body.user.id, cannotPost
-      ? '❌ I could not post there. If it is a private channel, invite me to it first (`/invite @Cipher Pol`) and try again.'
-      : `❌ Failed to share poll: ${err.message}`);
+    await notifyError(client, actor, `❌ Failed to share poll: ${err.message}`);
   }
 });
 
@@ -2093,21 +2291,58 @@ app.action('view_results_modal', async ({ ack, body, client, action }) => {
   }
 });
 
-// Confirmation modal for /poll-close when votes exist
+// The Close button on the poll message. It is visible to the whole channel, so
+// this is where the poll's own permissions are enforced.
+app.action('close_poll', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
+
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) return await deny('❌ That poll no longer exists.');
+    if (!isCreatorOrCoCreator(poll, userId)) {
+      return await deny(`❌ Only <@${poll.creator}> can close this poll.`);
+    }
+    if (poll.status === 'closed') return await deny('⚠️ This poll is already closed.');
+
+    // Final results belong where the poll was being read, not necessarily where
+    // it was first posted - the same poll can be in several channels.
+    const channel = body.channel?.id || poll.channelId;
+    const participants = getAllVoters(poll).size;
+    if (participants > 0) {
+      return await client.views.open({
+        trigger_id: body.trigger_id,
+        view: buildCloseConfirmModal(poll, channel, participants)
+      });
+    }
+    await finalizePollClose(client, poll, channel);
+  } catch (err) {
+    console.error('close_poll error:', err);
+    await notifyError(client, userId, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not close poll: ${err.message}`);
+  }
+});
+
+// Confirmation modal shown by the Close button and by /poll-close when the poll
+// already has votes.
 app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
   await ack();
   const { pollId, channelId } = JSON.parse(view.private_metadata);
+  const userId = body.user.id;
   try {
     const poll = await getPoll(pollId);
     if (!poll || poll.status === 'closed') return;
-    await closePoll(pollId);
-    const closedPoll = { ...poll, status: 'closed' };
-    await updatePollMessage(client, closedPoll);
-    await client.chat.postMessage({ channel: channelId, text: `🔒 Poll closed: ${poll.title}`, blocks: buildResultsBlocks(closedPoll, '🔒 Final Results') });
-    await sendCloseNotifications(client, closedPoll);
+    // Checked again here, not only where the modal was opened: co-creators can
+    // be removed, and this is the step that actually ends the poll.
+    if (!isCreatorOrCoCreator(poll, userId)) {
+      return await notifyError(client, userId, `❌ Only <@${poll.creator}> can close this poll.`);
+    }
+    await finalizePollClose(client, poll, channelId);
   } catch (err) {
     console.error('poll_close_confirm error:', err);
-    await notifyError(client, body.user.id, `❌ Failed to close poll: ${err.message}`);
+    await notifyError(client, userId, `❌ Failed to close poll: ${err.message}`);
   }
 });
 

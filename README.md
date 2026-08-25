@@ -107,6 +107,32 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ```
 → Opens an interactive modal. Add a title, questions (multiple choice, yes/no, rating scales, open-ended, and more), set options like anonymous voting or auto-close time, then post.
 
+**Where to post.** The modal has a *Where to post* section with two pickers:
+
+| Picker | What it reaches |
+|--------|-----------------|
+| **Channels** | Public channels (the bot does not need to be a member), and private channels it has been invited to. Up to 10. |
+| **People** | Each person gets the poll in their own DM with the bot. Up to 10. |
+
+Leave both empty and the poll goes to the conversation you ran the command from.
+The channel you ran it in is prefilled, so posting where you are stays one click.
+
+Votes cast anywhere the poll appears count toward the same poll, and every copy
+of the message updates on every vote.
+
+**Running `/newpoll` in a DM with another person.** Slack does not let an app
+post into a DM between two people - it has no membership there and cannot be
+given one, and it is never told who the other person is. So pick them under
+**People** and they get the poll directly. If you pick nothing, the poll lands
+in your own DM with the bot with a **Send it on** button.
+
+**Closing a poll.** Active polls carry a **🔒 Close** button next to Vote and
+Share. The button is visible to everyone - Slack cannot show one person a
+different version of a message - but only the creator and co-creators can use
+it; anyone else is told so privately. A poll that already has votes asks for
+confirmation first. `/poll-close POLL_ID` still works, and an auto-close time
+set when the poll was created still closes it on its own.
+
 ```
 /poll-results poll_1706234567_abc12345
 ```
@@ -130,7 +156,8 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ```
 /poll-close poll_1706234567_abc12345
 ```
-→ Closes the poll (creator only).
+→ Closes the poll (creator only). Usually unnecessary: use the **🔒 Close**
+button on the poll itself.
 
 ---
 
