@@ -840,11 +840,14 @@ function buildVoteModal(poll, previousVotes = {}) {
     }
 
     if (q.allowMultiple) {
+      // Some Slack clients draw checkboxes as circles, which reads as a radio
+      // group, so the label carries the affordance too - it is bold and above
+      // the options, where the hint is grey and below them.
       return [{
         type: 'input',
         block_id: `vote_q${qi}`,
-        label: { type: 'plain_text', text: label },
-        hint: { type: 'plain_text', text: 'Select all that apply' },
+        label: { type: 'plain_text', text: `${label}  (choose one or more)` },
+        hint: { type: 'plain_text', text: 'Select all that apply - more than one answer is allowed' },
         element: {
           type: 'checkboxes',
           action_id: 'selected',
