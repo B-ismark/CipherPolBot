@@ -18,6 +18,7 @@ const {
 } = require('./lib/validation');
 
 const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
+const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 
 const q = (text = 'Q1', options = ['A', 'B']) => ({ text, options });
 
@@ -115,4 +116,24 @@ test('poll management is limited to the creator and co-creators', () => {
   assert.strictEqual(isCreatorOrCoCreator(poll('realtime'), 'U_CREATOR'), true);
   assert.strictEqual(isCreatorOrCoCreator(poll('realtime', 'active', ['U_CO']), 'U_CO'), true);
   assert.strictEqual(isCreatorOrCoCreator(poll('realtime'), 'U_STRANGER'), false);
+});
+
+test('a workspace install is keyed by its workspace id', () => {
+  assert.strictEqual(installationKey({ teamId: 'T1' }), 'T1');
+  assert.strictEqual(installationKey({ teamId: 'T1', enterpriseId: 'E1' }), 'T1');
+});
+
+test('an org-wide install is keyed by its enterprise id', () => {
+  assert.strictEqual(installationKey({ isEnterpriseInstall: true, enterpriseId: 'E1', teamId: 'T1' }), 'E1');
+});
+
+test('installationKey returns null when Slack sends neither id', () => {
+  assert.strictEqual(installationKey({}), null);
+  assert.strictEqual(installationKey(), null);
+});
+
+test('an oauth response maps to the same key, with team null for org-wide', () => {
+  assert.strictEqual(installationKeyFromOAuth({ team: { id: 'T1' } }), 'T1');
+  assert.strictEqual(installationKeyFromOAuth({ is_enterprise_install: true, enterprise: { id: 'E1' }, team: null }), 'E1');
+  assert.strictEqual(installationKeyFromOAuth({}), null);
 });

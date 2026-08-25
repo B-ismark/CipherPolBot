@@ -147,7 +147,9 @@ Use `sslmode=verify-full` for any hosted database, so the certificate is verifie
 
 ### Multi-workspace (OAuth)
 
-A single workspace only needs `SLACK_BOT_TOKEN`. To let other workspaces install the bot, set `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` and point the Slack app redirect URL at `/slack/oauth_redirect`; installations are stored in the `slack_installations` table. Each poll records its workspace, so scheduled auto-closes update the right channel and notify the right people in every installed workspace.
+A single workspace only needs `SLACK_BOT_TOKEN`. To let other workspaces install the bot, set `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` and point the Slack app redirect URL at `/slack/oauth_redirect`; installations are stored in the `slack_installations` table. Each poll records the installation it belongs to, so scheduled auto-closes update the right channel and notify the right people in every installed workspace.
+
+Org-wide (Enterprise Grid) installs work too: one installation covers the org, keyed by enterprise id rather than workspace id (`lib/install.js` decides, and the same rule is used when storing the installation, when authorizing a request, and when recording a poll).
 
 ---
 

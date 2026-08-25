@@ -141,15 +141,19 @@ All constants are easily tunable if different limits are needed.
 - **Fix**: polls record a `team_id`, and `clientForPoll()` resolves that workspace token from `slack_installations` (or `SLACK_BOT_TOKEN` for single-workspace deployments). Polls predating the column resolve when exactly one workspace has installed the bot, and are otherwise closed in the database with a warning naming the poll
 - **Note**: `savePoll` writes `team_id` with `COALESCE(EXCLUDED.team_id, polls.team_id)`, so a later write that does not carry the team cannot erase it
 
-### 12. Database TLS is verified
+### 12. Org-wide (Enterprise Grid) installs
+- **Issue**: the OAuth callback stored `result.team.id`, which is null for an org-wide install, so installing across a Grid org threw a TypeError and failed. `authorize()` also preferred `teamId` over `enterpriseId`, which would have missed the row even if one existed, and a poll would have recorded a workspace id no installation was keyed by
+- **Fix**: `lib/install.js` owns one rule - enterprise id for an org-wide install, workspace id otherwise - and it is applied in all three places: storing the installation, authorizing a request, and recording `team_id` on a poll. Covered by `npm test`
+
+### 13. Database TLS is verified
 - **Issue**: `ssl: { rejectUnauthorized: false }` disabled certificate verification, so a MITM on the Postgres connection could read the credentials and every vote
 - **Fix**: removed; TLS comes from `sslmode` in `DATABASE_URL` (use `verify-full`). Connect timeout raised to 10s for cold starts, and a pool `error` listener keeps an idle-client error from killing the process
 
-### 13. CSV export cannot inject formulas
+### 14. CSV export cannot inject formulas
 - **Issue**: open-ended answers starting with `=`, `+`, `-` or `@` execute as formulas in Excel and Sheets
 - **Fix**: such cells are prefixed with an apostrophe
 
-### 14. Operational
+### 15. Operational
 - `/polls-list` capped at 20 like `/polls-archive`, both saying how many were hidden (an unbounded list exceeded Slack message limits)
 - Boot binds the port first (Render kills a service that opens no port within ~60s, see bdeeb05), then retries the schema five times and exits if it never succeeds, instead of logging "will retry on next request" and never retrying
 - SIGTERM/SIGINT close the server and pool before exit

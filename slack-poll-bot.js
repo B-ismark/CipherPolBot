@@ -47,8 +47,10 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS message_refs TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS notify_on_close TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS co_creators TEXT NOT NULL DEFAULT '[]'`);
-  // Needed to pick the right bot token for polls the bot acts on by itself
-  // (the auto-close sweeper). Null on polls created before this column existed.
+  // Holds the installation key (see lib/install.js): the enterprise id for an
+  // org-wide install, the workspace id otherwise. Needed to pick the right bot
+  // token for polls the bot acts on by itself (the auto-close sweeper). Null on
+  // polls created before this column existed.
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS team_id TEXT`);
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
@@ -156,8 +158,8 @@ async function clientForPoll(poll) {
 
   let teamId = poll.teamId;
   if (!teamId) {
-    // Polls created before team_id existed: unambiguous if only one workspace
-    // ever installed the bot.
+    // Polls created before team_id existed: unambiguous if only one
+    // installation has ever been recorded.
     const { rows } = await pool.query('SELECT team_id FROM slack_installations LIMIT 2');
     if (rows.length !== 1) return null;
     teamId = rows[0].team_id;
@@ -211,6 +213,7 @@ const {
   checkNotificationRateLimit
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
+const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
@@ -238,13 +241,13 @@ const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_
 
 const app = new App({
   receiver,
-  authorize: async ({ teamId, enterpriseId }) => {
+  authorize: async ({ teamId, enterpriseId, isEnterpriseInstall }) => {
     // Fast path: skip DB entirely when static token is configured
     if (process.env.SLACK_BOT_TOKEN) {
       return { botToken: process.env.SLACK_BOT_TOKEN };
     }
     // OAuth multi-workspace path
-    const id = teamId || enterpriseId;
+    const id = installationKey({ isEnterpriseInstall, enterpriseId, teamId });
     try {
       const { rows } = await pool.query(
         'SELECT data FROM slack_installations WHERE team_id = $1', [id]
@@ -1653,10 +1656,17 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
   }
 });
 
-app.view('poll_preview_submit', async ({ ack, body, view, client }) => {
+app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
   const meta = JSON.parse(view.private_metadata);
   try {
-    await createAndPostPoll(client, meta, body.team?.id || body.enterprise?.id || view.team_id || null);
+    // Same key authorize() resolved this request with, so the auto-close
+    // sweeper can find the token again later.
+    const teamId = installationKey({
+      isEnterpriseInstall: context.isEnterpriseInstall ?? body.is_enterprise_install,
+      enterpriseId: context.enterpriseId ?? body.enterprise?.id,
+      teamId: context.teamId ?? body.team?.id ?? view.team_id
+    });
+    await createAndPostPoll(client, meta, teamId);
     const title = meta.pollTitle || meta.savedQuestions[0]?.text || 'Poll';
     await ack({ response_action: 'update', view: buildSuccessModal(title) });
   } catch (err) {
@@ -1995,12 +2005,15 @@ receiver.router.get('/slack/oauth_redirect', async (req, res) => {
       client_secret: process.env.SLACK_CLIENT_SECRET,
       code
     });
+    const key = installationKeyFromOAuth(result);
+    if (!key) throw new Error('Slack returned an installation with no team or enterprise id.');
     await pool.query(
       `INSERT INTO slack_installations (team_id, data, updated_at)
        VALUES ($1, $2, NOW())
        ON CONFLICT (team_id) DO UPDATE SET data = $2, updated_at = NOW()`,
-      [result.team.id, JSON.stringify(result)]
+      [key, JSON.stringify(result)]
     );
+    console.log(`✅ Installed for ${key}${result.is_enterprise_install ? ' (org-wide)' : ''}`);
     res.send('<h2>✅ CipherPol Bot installed!</h2><p>You can close this window and return to Slack.</p>');
   } catch (e) {
     console.error('OAuth redirect error:', e.message);
