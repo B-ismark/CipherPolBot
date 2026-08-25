@@ -527,17 +527,6 @@ function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {},
   };
 }
 
-function buildSuccessModal(pollTitle) {
-  return {
-    type: 'modal',
-    title: { type: 'plain_text', text: 'Poll Created!' },
-    close: { type: 'plain_text', text: 'Done' },
-    blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: `✅ *${pollTitle || 'Your poll'}* has been posted to the channel.` } },
-      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Head back to the chat to see it and start collecting votes.' }] }
-    ]
-  };
-}
 
 const SHOW_RESULTS_OPTIONS = [
   { text: { type: 'plain_text', text: 'In real-time' },       value: 'realtime' },
@@ -1682,8 +1671,15 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       teamId: context.teamId ?? body.team?.id ?? view.team_id
     });
     await createAndPostPoll(client, meta, teamId);
-    const title = meta.pollTitle || meta.savedQuestions[0]?.text || 'Poll';
-    await ack({ response_action: 'update', view: buildSuccessModal(title) });
+    // Clear entire modal stack so no stale data is visible when user closes
+    await ack({ response_action: 'clear' });
+    // Ephemeral success confirmation in the channel
+    const channel = await resolveChannel(client, meta.channelId, meta.userId);
+    await client.chat.postEphemeral({
+      channel,
+      user: meta.userId,
+      text: `✅ *${meta.pollTitle || 'Your poll'}* has been posted!`
+    });
   } catch (err) {
     console.error('poll_preview_submit error:', err);
     await ack();
