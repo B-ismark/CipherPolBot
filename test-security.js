@@ -20,6 +20,7 @@ const {
 const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 const { sslOptionFor } = require('./lib/db');
+const { healthStatus, DB_UNHEALTHY_GRACE_MS } = require('./lib/health');
 
 const q = (text = 'Q1', options = ['A', 'B']) => ({ text, options });
 
@@ -154,4 +155,25 @@ test('a local database is left alone, as is a missing or unparseable url', () =>
   assert.strictEqual(sslOptionFor('postgresql://u:p@127.0.0.1/app'), undefined);
   assert.strictEqual(sslOptionFor(undefined), undefined);
   assert.strictEqual(sslOptionFor('not a url'), undefined);
+});
+
+test('a healthy instance reports ok', () => {
+  assert.deepStrictEqual(healthStatus({ schemaReady: true, dbOk: true }), { httpStatus: 200, status: 'ok' });
+});
+
+test('a brief database blip is degraded but does not trigger a restart', () => {
+  assert.deepStrictEqual(
+    healthStatus({ schemaReady: true, dbOk: false, dbFailingForMs: DB_UNHEALTHY_GRACE_MS - 1 }),
+    { httpStatus: 200, status: 'degraded' });
+});
+
+test('a sustained outage fails the check so the instance is recycled', () => {
+  assert.deepStrictEqual(
+    healthStatus({ schemaReady: true, dbOk: false, dbFailingForMs: DB_UNHEALTHY_GRACE_MS }),
+    { httpStatus: 503, status: 'degraded' });
+});
+
+test('an instance still creating its schema is never reported ready', () => {
+  assert.deepStrictEqual(healthStatus({ schemaReady: false, dbOk: true }), { httpStatus: 503, status: 'degraded' });
+  assert.deepStrictEqual(healthStatus({ schemaReady: false, dbOk: false }), { httpStatus: 503, status: 'degraded' });
 });

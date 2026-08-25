@@ -2,6 +2,7 @@ require('dotenv').config();
 const { App, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const { sslOptionFor } = require('./lib/db');
+const { healthStatus } = require('./lib/health');
 const { Pool } = require('pg');
 
 // ==================== DATABASE ====================
@@ -2019,6 +2020,7 @@ let schemaReady = false;
 
 const HEALTH_CACHE_MS = 15000;
 let lastDbCheck = { at: 0, ok: false, latencyMs: null };
+let dbFailingSince = null;
 
 async function checkDatabase() {
   // Cached so a monitor on a short interval - or several - cannot turn the
@@ -2027,11 +2029,13 @@ async function checkDatabase() {
   const started = Date.now();
   try {
     await pool.query('SELECT 1');
+    dbFailingSince = null;
     lastDbCheck = { at: Date.now(), ok: true, latencyMs: Date.now() - started };
   } catch (err) {
     // Logged, not returned: a pg error can name the database host and user,
     // and this endpoint is public.
     console.warn('health check: database unreachable:', err.message);
+    if (dbFailingSince === null) dbFailingSince = Date.now();
     lastDbCheck = { at: Date.now(), ok: false, latencyMs: null };
   }
   return lastDbCheck;
@@ -2039,13 +2043,15 @@ async function checkDatabase() {
 
 receiver.router.get('/health', async (req, res) => {
   const db = await checkDatabase();
-  const ok = schemaReady && db.ok;
-  res.status(ok ? 200 : 503).json({
-    status: ok ? 'ok' : 'degraded',
+  const dbFailingForMs = dbFailingSince === null ? 0 : Date.now() - dbFailingSince;
+  const { httpStatus, status } = healthStatus({ schemaReady, dbOk: db.ok, dbFailingForMs });
+  res.status(httpStatus).json({
+    status,
     uptime: Math.round(process.uptime()),
     schema: schemaReady ? 'ready' : 'initialising',
     database: db.ok ? 'ok' : 'unreachable',
-    ...(db.latencyMs === null ? {} : { databaseLatencyMs: db.latencyMs })
+    ...(db.latencyMs === null ? {} : { databaseLatencyMs: db.latencyMs }),
+    ...(dbFailingForMs ? { databaseFailingForMs: dbFailingForMs } : {})
   });
 });
 

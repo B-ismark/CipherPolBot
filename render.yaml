@@ -4,6 +4,10 @@ services:
     runtime: node
     buildCommand: npm install
     startCommand: npm start
+    # Render restarts an instance that fails this. /health tolerates a short
+    # database blip before failing, so a cold start does not cost a restart -
+    # see lib/health.js and README (Staying awake).
+    healthCheckPath: /health
     envVars:
       - key: SLACK_BOT_TOKEN
         sync: false

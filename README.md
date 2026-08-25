@@ -163,10 +163,31 @@ database probe is cached for 15 seconds, so a short monitor interval cannot turn
 endpoint into load, and the response deliberately never echoes the driver error —
 those can name the database host and user, and this endpoint is public.
 
-If you want Render to restart an unhealthy instance by itself, set
-`healthCheckPath: /health` in `render.yaml`. Weigh it first: a slow cold start on the
-database would then look like a failure and cost you a restart, so it is left off by
-default.
+### Automatic restart
+
+`render.yaml` sets `healthCheckPath: /health`, so Render recycles an instance that
+fails the check instead of leaving it up and broken.
+
+That makes the endpoint a trigger, not just a report, so it is deliberately slow to
+fail. The database gets a **90-second grace window** (`lib/health.js`): a Neon cold
+start or a brief hiccup rides through, a real outage crosses it and the instance is
+recycled. The body stays honest the whole time — `status` reads `degraded` from the
+first failed probe, even while the HTTP code is still `200`.
+
+So the two consumers want different things:
+
+| Watching | Reacts to | Because |
+|----------|-----------|---------|
+| Render (HTTP code) | `503` only | A restart should cost more than one bad probe |
+| Your monitor (body) | `"status":"degraded"` | You want to know about the blip Render is ignoring |
+
+Point cron-job.org or UptimeRobot at the response body containing `"status":"ok"`
+rather than only the status code, and you see both.
+
+Expect a `503` for the first ~10 seconds of every boot: the schema is created before
+the endpoint reports ready, and a cold database connection takes a few seconds. Render
+retries during a deploy, so this costs nothing — but it is why `/` and `/health`
+disagree right after a restart.
 
 **2. `KEEPALIVE_URL` — belt and braces.** Set it to that same `/health` URL and the
 bot pings itself every 10 minutes, no third-party account needed. Leave it unset
