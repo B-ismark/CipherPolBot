@@ -1,5 +1,10 @@
 # Security Fixes Applied
 
+> Line numbers below are historical - the file has moved on since they were
+> written. Search for the function name instead. Validation and rate limiting
+> now live in `lib/validation.js`, results visibility in `lib/policy.js`, and
+> both are covered by `npm test`.
+
 ## Completed Fixes
 
 ### 1. ✅ Rate Limiting on Poll Creation
@@ -103,3 +108,43 @@ All constants are easily tunable if different limits are needed.
 - Add admin command to reset user rate limits if needed
 - Consider webhook for audit logging of validation rejections
 - Add configuration for rate limit constants via environment variables
+
+---
+
+## Round 2 - results disclosure, vote loss, operational hardening
+
+### 6. Result visibility applied to every question type
+- **Issue**: the `show_results` gate only ran on the fallthrough path of `buildQuestionResultBlock()`, so `open_ended`, `likert` and `ranking` questions rendered full results (including voter names) on `creator_only` and `on_close` polls while they were still open
+- **Fix**: the gate runs once at the top of the function for every type, via `canViewResults()` in `lib/policy.js`
+- **Also**: the function now takes a `viewerId`, so the creator and co-creators can see their own `creator_only` results. A null `viewerId` means a shared surface (the in-channel poll message), which never shows restricted results
+
+### 7. Authorization on the commands that read poll data
+- **Issue**: `/poll-results`, `/poll-share` and `/poll-export` looked polls up by id with no permission check, and poll ids are listed to everyone by `/polls-list`. `/poll-results` and `/poll-share` used `chat.postMessage`, so any member could also broadcast another creator poll results into a channel
+- **Fix**: `/poll-results` is gate-aware and ephemeral; `/poll-share` (public) and `/poll-export` (raw per-voter CSV) are limited to the creator and co-creators
+
+### 8. Post-vote confirmation no longer overrides the setting
+- **Issue**: `buildPostVoteModal()` passed `showResults: 'realtime'`, showing every voter the full results regardless of the poll setting
+- **Fix**: it renders for the actual viewer
+
+### 9. Votes are never dropped silently
+- **Issue**: four paths in `vote_submit` acked with no `response_action`, so the modal closed with no feedback and the voter believed the vote counted: poll already closed, poll past `close_at`, revote with changes disabled, and transaction error
+- **Fix**: each returns an explanatory view
+
+### 10. Overdue polls close on schedule
+- **Issue**: `close_at` was only honoured when someone tried to vote after it passed, so a quiet poll stayed "Active" for ever and never notified subscribers
+- **Fix**: `sweepOverduePolls()` runs at boot and every 60s. The UPDATE is atomic so a concurrent vote cannot double-close. OAuth multi-workspace installs close the poll in the database only, since polls do not record their team
+
+### 11. Database TLS is verified
+- **Issue**: `ssl: { rejectUnauthorized: false }` disabled certificate verification, so a MITM on the Postgres connection could read the credentials and every vote
+- **Fix**: removed; TLS comes from `sslmode` in `DATABASE_URL` (use `verify-full`). Connect timeout raised to 10s for cold starts, and a pool `error` listener keeps an idle-client error from killing the process
+
+### 12. CSV export cannot inject formulas
+- **Issue**: open-ended answers starting with `=`, `+`, `-` or `@` execute as formulas in Excel and Sheets
+- **Fix**: such cells are prefixed with an apostrophe
+
+### 13. Operational
+- `/polls-list` capped at 20 like `/polls-archive`, both saying how many were hidden (an unbounded list exceeded Slack message limits)
+- Boot retries the schema five times then exits, instead of logging "will retry on next request" and never retrying
+- SIGTERM/SIGINT close the server and pool before exit
+- Modal-refresh failures warn instead of being swallowed by `catch (_) {}`
+- `isCreatorOrAdmin` renamed `isCreatorOrCoCreator`: there is no workspace-admin override, and the old name implied one

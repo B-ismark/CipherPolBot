@@ -5,7 +5,8 @@
   "main": "slack-poll-bot.js",
   "scripts": {
     "start": "node slack-poll-bot.js",
-    "dev": "nodemon slack-poll-bot.js"
+    "dev": "nodemon slack-poll-bot.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@slack/bolt": "^3.18.0",

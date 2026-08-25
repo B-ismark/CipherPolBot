@@ -1,222 +1,112 @@
-// Test script to verify security functions
-// Run with: node test-security.js
+// Security tests for the shared validation and results-visibility logic.
+// Run with: npm test   (node --test)
+//
+// These import the same modules the bot requires — do not copy logic in here,
+// or the tests will keep passing after the real rules change.
 
-const assert = require('assert');
+const { test } = require('node:test');
+const assert = require('node:assert');
 
-// Copy the validation and rate limiting logic from the main bot
-const MAX_POLL_TITLE_LENGTH = 200;
-const MAX_POLL_DESCRIPTION_LENGTH = 1000;
-const MAX_QUESTION_TEXT_LENGTH = 500;
-const MAX_OPTION_TEXT_LENGTH = 200;
-const MAX_QUESTIONS_PER_POLL = 50;
-const MAX_OPTIONS_PER_QUESTION = 10;
-const MAX_POLLS_PER_USER_PER_DAY = 10;
-const MAX_NOTIFY_SUBSCRIBERS_PER_POLL = 20;
-const MAX_NOTIFICATIONS_PER_USER_PER_HOUR = 5;
+const {
+  MAX_OPTIONS_PER_QUESTION,
+  MAX_QUESTIONS_PER_POLL,
+  MAX_POLLS_PER_USER_PER_DAY,
+  MAX_NOTIFICATIONS_PER_USER_PER_HOUR,
+  validatePollInputs,
+  checkPollCreationRateLimit,
+  checkNotificationRateLimit
+} = require('./lib/validation');
 
-const pollCreationTracker = {};
-const notificationTracker = {};
+const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
 
-function validatePollInputs(title, description, questions) {
-  if (!title || title.trim().length === 0) {
-    throw new Error('Poll title is required.');
+const q = (text = 'Q1', options = ['A', 'B']) => ({ text, options });
+
+test('rejects a title over the limit', () => {
+  assert.throws(() => validatePollInputs('x'.repeat(201), '', [q()]), /exceeds maximum length/);
+});
+
+test('rejects a description over the limit', () => {
+  assert.throws(() => validatePollInputs('Title', 'x'.repeat(1001), [q()]), /exceeds maximum length/);
+});
+
+test('rejects question text over the limit', () => {
+  assert.throws(() => validatePollInputs('Title', '', [q('x'.repeat(501))]), /exceeds maximum length/);
+});
+
+test('rejects option text over the limit', () => {
+  assert.throws(() => validatePollInputs('Title', '', [q('Q1', ['A', 'x'.repeat(201)])]), /exceeds maximum length/);
+});
+
+test('rejects too many options in one question', () => {
+  const options = Array.from({ length: MAX_OPTIONS_PER_QUESTION + 1 }, (_, i) => `Option ${i + 1}`);
+  assert.throws(() => validatePollInputs('Title', '', [q('Q1', options)]), /exceeds maximum number of options/);
+});
+
+test('rejects too many questions in one poll', () => {
+  const questions = Array.from({ length: MAX_QUESTIONS_PER_POLL + 1 }, (_, i) => q(`Q${i + 1}`));
+  assert.throws(() => validatePollInputs('Title', '', questions), /exceeds maximum number of questions/);
+});
+
+test('rejects a missing title and an empty question list', () => {
+  assert.throws(() => validatePollInputs('', '', [q()]), /title is required/);
+  assert.throws(() => validatePollInputs('Title', '', []), /at least one question/);
+});
+
+test('accepts a valid poll', () => {
+  validatePollInputs('Good Poll Title', 'A good description', [
+    q('Question 1?', ['Yes', 'No']),
+    q('Question 2?', ['Agree', 'Disagree', 'Neutral'])
+  ]);
+});
+
+test('poll creation rate limit blocks the request after the daily quota', async () => {
+  const userId = 'rate-limit-user';
+  for (let i = 0; i < MAX_POLLS_PER_USER_PER_DAY; i++) {
+    await checkPollCreationRateLimit(userId);
   }
-  if (title.length > MAX_POLL_TITLE_LENGTH) {
-    throw new Error(`Poll title exceeds maximum length of ${MAX_POLL_TITLE_LENGTH} characters.`);
+  await assert.rejects(() => checkPollCreationRateLimit(userId), /Rate limit/);
+});
+
+test('notification rate limit stops allowing sends after the hourly quota', async () => {
+  const userId = 'notify-rate-limit-user';
+  for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR; i++) {
+    assert.strictEqual(await checkNotificationRateLimit(userId), true);
   }
-  if (description && description.length > MAX_POLL_DESCRIPTION_LENGTH) {
-    throw new Error(`Poll description exceeds maximum length of ${MAX_POLL_DESCRIPTION_LENGTH} characters.`);
-  }
-  if (!Array.isArray(questions) || questions.length === 0) {
-    throw new Error('Poll must have at least one question.');
-  }
-  if (questions.length > MAX_QUESTIONS_PER_POLL) {
-    throw new Error(`Poll exceeds maximum number of questions (${MAX_QUESTIONS_PER_POLL}).`);
-  }
-  questions.forEach((q, idx) => {
-    if (!q.text || q.text.trim().length === 0) {
-      throw new Error(`Question ${idx + 1}: text is required.`);
-    }
-    if (q.text.length > MAX_QUESTION_TEXT_LENGTH) {
-      throw new Error(`Question ${idx + 1}: exceeds maximum length of ${MAX_QUESTION_TEXT_LENGTH} characters.`);
-    }
-    if (q.options && Array.isArray(q.options)) {
-      if (q.options.length > MAX_OPTIONS_PER_QUESTION) {
-        throw new Error(`Question ${idx + 1}: exceeds maximum number of options (${MAX_OPTIONS_PER_QUESTION}).`);
-      }
-      q.options.forEach((opt, oidx) => {
-        if (opt.length > MAX_OPTION_TEXT_LENGTH) {
-          throw new Error(`Question ${idx + 1}, Option ${oidx + 1}: exceeds maximum length of ${MAX_OPTION_TEXT_LENGTH} characters.`);
-        }
-      });
-    }
-  });
-}
+  assert.strictEqual(await checkNotificationRateLimit(userId), false);
+});
 
-async function checkPollCreationRateLimit(userId) {
-  const now = Date.now();
-  const dayAgo = now - 24 * 60 * 60 * 1000;
+const poll = (showResults, status = 'active', coCreators = []) =>
+  ({ showResults, status, creator: 'U_CREATOR', coCreators });
 
-  if (!pollCreationTracker[userId]) {
-    pollCreationTracker[userId] = [];
-  }
+test('realtime results are visible to everyone', () => {
+  assert.strictEqual(canViewResults(poll('realtime'), 'U_STRANGER'), true);
+});
 
-  pollCreationTracker[userId] = pollCreationTracker[userId].filter(entry => entry.timestamp > dayAgo);
+test('creator_only hides live results from other members', () => {
+  assert.strictEqual(canViewResults(poll('creator_only'), 'U_STRANGER'), false);
+});
 
-  if (pollCreationTracker[userId].length >= MAX_POLLS_PER_USER_PER_DAY) {
-    throw new Error(`Rate limit: You can create a maximum of ${MAX_POLLS_PER_USER_PER_DAY} polls per day.`);
-  }
+test('creator_only shows live results to the creator and co-creators', () => {
+  assert.strictEqual(canViewResults(poll('creator_only'), 'U_CREATOR'), true);
+  assert.strictEqual(canViewResults(poll('creator_only', 'active', ['U_CO']), 'U_CO'), true);
+});
 
-  pollCreationTracker[userId].push({ timestamp: now });
-}
+test('creator_only hides live results on shared surfaces (no viewer)', () => {
+  assert.strictEqual(canViewResults(poll('creator_only'), null), false);
+});
 
-async function checkNotificationRateLimit(userId) {
-  const now = Date.now();
-  const hourAgo = now - 60 * 60 * 1000;
+test('on_close hides live results from everyone, creator included', () => {
+  assert.strictEqual(canViewResults(poll('on_close'), 'U_CREATOR'), false);
+  assert.strictEqual(canViewResults(poll('on_close'), 'U_STRANGER'), false);
+});
 
-  if (!notificationTracker[userId]) {
-    notificationTracker[userId] = [];
-  }
+test('closing a poll makes results visible to everyone', () => {
+  assert.strictEqual(canViewResults(poll('creator_only', 'closed'), 'U_STRANGER'), true);
+  assert.strictEqual(canViewResults(poll('on_close', 'closed'), 'U_STRANGER'), true);
+});
 
-  notificationTracker[userId] = notificationTracker[userId].filter(entry => entry.timestamp > hourAgo);
-
-  if (notificationTracker[userId].length >= MAX_NOTIFICATIONS_PER_USER_PER_HOUR) {
-    return false;
-  }
-
-  notificationTracker[userId].push({ timestamp: now });
-  return true;
-}
-
-// Test Suite
-console.log('🧪 Running Security Tests...\n');
-
-// Test 1: Poll Title Validation
-console.log('Test 1: Poll Title Length Validation');
-try {
-  const longTitle = 'x'.repeat(201);
-  validatePollInputs(longTitle, '', [{ text: 'Q1', options: ['A', 'B'] }]);
-  assert.fail('Should have thrown error for long title');
-} catch (e) {
-  assert(e.message.includes('exceeds maximum length'));
-  console.log('✓ Correctly rejects title >200 chars\n');
-}
-
-// Test 2: Poll Description Validation
-console.log('Test 2: Poll Description Length Validation');
-try {
-  const longDesc = 'x'.repeat(1001);
-  validatePollInputs('Title', longDesc, [{ text: 'Q1', options: ['A', 'B'] }]);
-  assert.fail('Should have thrown error for long description');
-} catch (e) {
-  assert(e.message.includes('exceeds maximum length'));
-  console.log('✓ Correctly rejects description >1000 chars\n');
-}
-
-// Test 3: Question Text Validation
-console.log('Test 3: Question Text Length Validation');
-try {
-  const longQuestion = 'x'.repeat(501);
-  validatePollInputs('Title', '', [{ text: longQuestion, options: ['A', 'B'] }]);
-  assert.fail('Should have thrown error for long question');
-} catch (e) {
-  assert(e.message.includes('exceeds maximum length'));
-  console.log('✓ Correctly rejects question >500 chars\n');
-}
-
-// Test 4: Option Text Validation
-console.log('Test 4: Option Text Length Validation');
-try {
-  const longOption = 'x'.repeat(201);
-  validatePollInputs('Title', '', [{ text: 'Q1', options: ['A', longOption] }]);
-  assert.fail('Should have thrown error for long option');
-} catch (e) {
-  assert(e.message.includes('exceeds maximum length'));
-  console.log('✓ Correctly rejects option >200 chars\n');
-}
-
-// Test 5: Max Options Per Question
-console.log('Test 5: Max Options Per Question Validation');
-try {
-  const tooManyOptions = Array.from({ length: 11 }, (_, i) => `Option ${i + 1}`);
-  validatePollInputs('Title', '', [{ text: 'Q1', options: tooManyOptions }]);
-  assert.fail('Should have thrown error for too many options');
-} catch (e) {
-  assert(e.message.includes('exceeds maximum number of options'));
-  console.log('✓ Correctly rejects >10 options per question\n');
-}
-
-// Test 6: Max Questions Per Poll
-console.log('Test 6: Max Questions Per Poll Validation');
-try {
-  const tooManyQuestions = Array.from({ length: 51 }, (_, i) => ({ text: `Q${i + 1}`, options: ['A', 'B'] }));
-  validatePollInputs('Title', '', tooManyQuestions);
-  assert.fail('Should have thrown error for too many questions');
-} catch (e) {
-  assert(e.message.includes('exceeds maximum number of questions'));
-  console.log('✓ Correctly rejects >50 questions per poll\n');
-}
-
-// Test 7: Poll Creation Rate Limiting
-console.log('Test 7: Poll Creation Rate Limiting');
-(async () => {
-  try {
-    const userId = 'test-user-123';
-
-    // Create 10 polls
-    for (let i = 0; i < 10; i++) {
-      await checkPollCreationRateLimit(userId);
-    }
-    console.log('✓ Created 10 polls successfully');
-
-    // 11th poll should fail
-    try {
-      await checkPollCreationRateLimit(userId);
-      assert.fail('Should have thrown rate limit error');
-    } catch (e) {
-      assert(e.message.includes('Rate limit'));
-      console.log('✓ Correctly blocks 11th poll creation\n');
-    }
-  } catch (e) {
-    console.error('Test 7 failed:', e.message);
-  }
-
-  // Test 8: Notification Rate Limiting
-  console.log('Test 8: Notification Rate Limiting');
-  try {
-    const userId = 'notif-user-456';
-
-    // Receive 5 notifications
-    for (let i = 0; i < 5; i++) {
-      const allowed = await checkNotificationRateLimit(userId);
-      assert(allowed === true);
-    }
-    console.log('✓ Received 5 notifications successfully');
-
-    // 6th notification should be blocked
-    const blocked = await checkNotificationRateLimit(userId);
-    assert(blocked === false);
-    console.log('✓ Correctly blocks 6th notification\n');
-  } catch (e) {
-    console.error('Test 8 failed:', e.message);
-  }
-
-  // Test 9: Valid Poll Data
-  console.log('Test 9: Valid Poll Data Acceptance');
-  try {
-    const validPoll = {
-      title: 'Good Poll Title',
-      description: 'A good description',
-      questions: [
-        { text: 'Question 1?', options: ['Yes', 'No'] },
-        { text: 'Question 2?', options: ['Agree', 'Disagree', 'Neutral'] }
-      ]
-    };
-    validatePollInputs(validPoll.title, validPoll.description, validPoll.questions);
-    console.log('✓ Accepts valid poll data\n');
-  } catch (e) {
-    console.error('Test 9 failed:', e.message);
-  }
-
-  console.log('✅ All security tests passed!');
-})();
+test('poll management is limited to the creator and co-creators', () => {
+  assert.strictEqual(isCreatorOrCoCreator(poll('realtime'), 'U_CREATOR'), true);
+  assert.strictEqual(isCreatorOrCoCreator(poll('realtime', 'active', ['U_CO']), 'U_CO'), true);
+  assert.strictEqual(isCreatorOrCoCreator(poll('realtime'), 'U_STRANGER'), false);
+});

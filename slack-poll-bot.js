@@ -4,13 +4,18 @@ const { Pool } = require('pg');
 
 // ==================== DATABASE ====================
 
+// TLS is driven by sslmode in DATABASE_URL (use sslmode=verify-full for hosted
+// Postgres). Do not add ssl: { rejectUnauthorized: false } - it would let a MITM
+// read the connection credentials and every vote.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
   max: 5
 });
+
+// Without this an error on an idle client takes the process down.
+pool.on('error', err => console.error('pg pool error:', err.message));
 
 async function initDb() {
   await pool.query(`
@@ -36,7 +41,7 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS allow_revote BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS close_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS vote_timestamps TEXT NOT NULL DEFAULT '{}'`);
-  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS show_results TEXT NOT NULL DEFAULT 'realtime'`);
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS show_results TEXT NOT NULL DEFAULT 'creator_only'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS order_by_votes BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS message_refs TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS notify_on_close TEXT NOT NULL DEFAULT '[]'`);
@@ -133,91 +138,42 @@ async function closePoll(pollId) {
   await pool.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
 }
 
+const AUTO_CLOSE_SWEEP_MS = 60 * 1000;
+
+// close_at used to be honoured only when someone tried to vote after it passed,
+// so a quiet poll stayed "Active" for ever. The UPDATE is atomic, so a vote
+// holding the row lock cannot be closed twice.
+async function sweepOverduePolls(client) {
+  const { rows } = await pool.query(
+    "UPDATE polls SET status='closed' WHERE status='active' AND close_at IS NOT NULL AND close_at <= NOW() RETURNING *"
+  );
+  if (!rows.length) return 0;
+  console.log(`⏰ Auto-closed ${rows.length} overdue poll(s)`);
+  if (!client) return rows.length;
+  for (const row of rows) {
+    const poll = rowToPoll(row);
+    try {
+      await updatePollMessage(client, poll);
+      await sendCloseNotifications(client, poll);
+    } catch (err) {
+      console.warn(`auto-close follow-up failed for ${poll.id}:`, err.message);
+    }
+  }
+  return rows.length;
+}
+
 // ==================== SECURITY: RATE LIMITING & VALIDATION ====================
-
-const MAX_POLL_TITLE_LENGTH = 200;
-const MAX_POLL_DESCRIPTION_LENGTH = 1000;
-const MAX_QUESTION_TEXT_LENGTH = 500;
-const MAX_OPTION_TEXT_LENGTH = 200;
-const MAX_QUESTIONS_PER_POLL = 50;
-const MAX_OPTIONS_PER_QUESTION = 10;
-const MAX_POLLS_PER_USER_PER_DAY = 10;
-const MAX_NOTIFY_SUBSCRIBERS_PER_POLL = 20;
-const MAX_NOTIFICATIONS_PER_USER_PER_HOUR = 5;
-
-const pollCreationTracker = {}; // { userId: [{ timestamp }] }
-const notificationTracker = {}; // { userId: [{ timestamp }] }
-
-function validatePollInputs(title, description, questions) {
-  if (!title || title.trim().length === 0) {
-    throw new Error('Poll title is required.');
-  }
-  if (title.length > MAX_POLL_TITLE_LENGTH) {
-    throw new Error(`Poll title exceeds maximum length of ${MAX_POLL_TITLE_LENGTH} characters.`);
-  }
-  if (description && description.length > MAX_POLL_DESCRIPTION_LENGTH) {
-    throw new Error(`Poll description exceeds maximum length of ${MAX_POLL_DESCRIPTION_LENGTH} characters.`);
-  }
-  if (!Array.isArray(questions) || questions.length === 0) {
-    throw new Error('Poll must have at least one question.');
-  }
-  if (questions.length > MAX_QUESTIONS_PER_POLL) {
-    throw new Error(`Poll exceeds maximum number of questions (${MAX_QUESTIONS_PER_POLL}).`);
-  }
-  questions.forEach((q, idx) => {
-    if (!q.text || q.text.trim().length === 0) {
-      throw new Error(`Question ${idx + 1}: text is required.`);
-    }
-    if (q.text.length > MAX_QUESTION_TEXT_LENGTH) {
-      throw new Error(`Question ${idx + 1}: exceeds maximum length of ${MAX_QUESTION_TEXT_LENGTH} characters.`);
-    }
-    if (q.options && Array.isArray(q.options)) {
-      if (q.options.length > MAX_OPTIONS_PER_QUESTION) {
-        throw new Error(`Question ${idx + 1}: exceeds maximum number of options (${MAX_OPTIONS_PER_QUESTION}).`);
-      }
-      q.options.forEach((opt, oidx) => {
-        if (opt.length > MAX_OPTION_TEXT_LENGTH) {
-          throw new Error(`Question ${idx + 1}, Option ${oidx + 1}: exceeds maximum length of ${MAX_OPTION_TEXT_LENGTH} characters.`);
-        }
-      });
-    }
-  });
-}
-
-async function checkPollCreationRateLimit(userId) {
-  const now = Date.now();
-  const dayAgo = now - 24 * 60 * 60 * 1000;
-
-  if (!pollCreationTracker[userId]) {
-    pollCreationTracker[userId] = [];
-  }
-
-  pollCreationTracker[userId] = pollCreationTracker[userId].filter(entry => entry.timestamp > dayAgo);
-
-  if (pollCreationTracker[userId].length >= MAX_POLLS_PER_USER_PER_DAY) {
-    throw new Error(`Rate limit: You can create a maximum of ${MAX_POLLS_PER_USER_PER_DAY} polls per day.`);
-  }
-
-  pollCreationTracker[userId].push({ timestamp: now });
-}
-
-async function checkNotificationRateLimit(userId) {
-  const now = Date.now();
-  const hourAgo = now - 60 * 60 * 1000;
-
-  if (!notificationTracker[userId]) {
-    notificationTracker[userId] = [];
-  }
-
-  notificationTracker[userId] = notificationTracker[userId].filter(entry => entry.timestamp > hourAgo);
-
-  if (notificationTracker[userId].length >= MAX_NOTIFICATIONS_PER_USER_PER_HOUR) {
-    return false; // User has hit limit for this hour
-  }
-
-  notificationTracker[userId].push({ timestamp: now });
-  return true;
-}
+// Limits, validation and rate limiting live in ./lib/validation.js so
+// test-security.js exercises the same code the bot runs.
+const {
+  MAX_POLL_TITLE_LENGTH,
+  MAX_POLL_DESCRIPTION_LENGTH,
+  MAX_NOTIFY_SUBSCRIBERS_PER_POLL,
+  validatePollInputs,
+  checkPollCreationRateLimit,
+  checkNotificationRateLimit
+} = require('./lib/validation');
+const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
 
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
@@ -284,26 +240,6 @@ async function notifyError(client, userId, text) {
   } catch (e) { console.error('notifyError failed:', e.message); }
 }
 
-function isCreatorOrAdmin(poll, userId) {
-  return poll.creator === userId || (poll.coCreators || []).includes(userId);
-}
-
-// Whether viewerId may see live results. viewerId is null on shared surfaces
-// (the in-channel poll message), which everyone sees - those never get
-// creator-only results.
-function canViewResults(poll, viewerId) {
-  if (poll.status === 'closed') return true;
-  if (poll.showResults === 'on_close') return false;
-  if (poll.showResults === 'creator_only') return !!viewerId && isCreatorOrAdmin(poll, viewerId);
-  return true;
-}
-
-function resultsHiddenReason(poll) {
-  return poll.showResults === 'on_close'
-    ? 'Results visible after poll closes'
-    : 'Results visible only to the poll creator';
-}
-
 function buildNoticeModal(title, text) {
   return {
     type: 'modal',
@@ -314,6 +250,17 @@ function buildNoticeModal(title, text) {
 }
 
 // ==================== CONSTANTS ====================
+
+// Slack rejects oversized messages, so long lists are capped and say so.
+const POLL_LIST_PAGE_SIZE = 20;
+
+function truncationNote(total, shownCount) {
+  if (total <= shownCount) return [];
+  return [{
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: `Showing ${shownCount} of ${total} - close old polls to shorten this list.` }]
+  }];
+}
 
 const OPTION_EMOJIS = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
 
@@ -1305,7 +1252,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
+    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
     await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
     console.error('/poll-share error:', err);
@@ -1320,9 +1267,10 @@ app.command('/polls-list', async ({ ack, body, client }) => {
     const channel = await resolveChannel(client, body.channel_id, userId);
     const polls = await getAllPolls('active');
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now. Use `/polls-archive` to see closed polls.' });
+    const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
     const listBlocks = [
       { type: 'header', text: { type: 'plain_text', text: 'Active Polls' } },
-      ...polls.map((p, i) => {
+      ...shown.map((p, i) => {
         const participants = getAllVoters(p).size;
         const tags = [
           `${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}`,
@@ -1335,7 +1283,8 @@ app.command('/polls-list', async ({ ack, body, client }) => {
           type: 'section',
           text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` }
         };
-      })
+      }),
+      ...truncationNote(polls.length, shown.length)
     ];
     await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
   } catch (err) {
@@ -1353,7 +1302,7 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls yet.' });
     const listBlocks = [
       { type: 'header', text: { type: 'plain_text', text: 'Closed Polls' } },
-      ...polls.slice(0, 20).map((p, i) => {
+      ...polls.slice(0, POLL_LIST_PAGE_SIZE).map((p, i) => {
         const participants = getAllVoters(p).size;
         return {
           type: 'section',
@@ -1363,6 +1312,7 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
           }
         };
       }),
+      ...truncationNote(polls.length, Math.min(polls.length, POLL_LIST_PAGE_SIZE)),
       { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results POLL_ID\` to view full results` }] }
     ];
     await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
@@ -1381,7 +1331,7 @@ app.command('/poll-close', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
+    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
     if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: '⚠️ This poll is already closed.' });
 
     const participants = getAllVoters(poll).size;
@@ -1430,7 +1380,7 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-edit POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
+    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
     await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
   } catch (err) {
     console.error('/poll-edit error:', err);
@@ -1448,9 +1398,16 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
 
-    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
+    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
 
-    const esc = v => `"${String(v).replace(/"/g, '""')}"`;
+    // A cell starting with any of these is executed as a formula by Excel and
+    // Sheets, so prefix it with an apostrophe before quoting.
+    const FORMULA_PREFIXES = ['=', '+', '-', '@', String.fromCharCode(9), String.fromCharCode(13)];
+    const esc = v => {
+      const raw = String(v == null ? '' : v);
+      const safe = FORMULA_PREFIXES.includes(raw[0]) ? "'" + raw : raw;
+      return '"' + safe.split('"').join('""') + '"';
+    };
     const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
 
     poll.questions.forEach((q, qi) => {
@@ -1537,7 +1494,7 @@ app.action('question_action', async ({ ack, body, client }) => {
 
   const updatedMeta = { ...meta, savedQuestions: qs };
   await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (_) {}
+  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
 });
 
 // ==================== QUESTION MODAL ACTIONS ====================
@@ -1585,7 +1542,7 @@ app.action('add_another_question', async ({ ack, body, client }) => {
   };
 
   await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (_) {}
+  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
 });
 
 // ==================== VIEW SUBMISSIONS ====================
@@ -1640,9 +1597,9 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
     await ack();
     const questionPageViewId = meta.questionPageViewId;
     if (questionPageViewId) {
-      try { await client.views.update({ view_id: questionPageViewId, view: buildQuestionModal(updatedMeta) }); } catch (_) {}
+      try { await client.views.update({ view_id: questionPageViewId, view: buildQuestionModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
     }
-    try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (_) {}
+    try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
   } else {
     await ack({ response_action: 'push', view: buildPreviewModal(updatedMeta) });
   }
@@ -2005,16 +1962,54 @@ receiver.router.get('/slack/oauth_redirect', async (req, res) => {
 
 // ==================== START ====================
 
+async function initDbWithRetry(attempts = 5) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await initDb();
+      return;
+    } catch (err) {
+      console.error(`DB init attempt ${attempt}/${attempts} failed:`, err.message);
+      if (attempt === attempts) throw err;
+      await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** (attempt - 1), 15000)));
+    }
+  }
+}
+
 (async () => {
   const port = process.env.PORT || 3000;
+
+  // Nothing works without the schema, so fail the boot rather than serving
+  // requests that all throw "relation does not exist".
+  await initDbWithRetry();
+  console.log('💾 Database ready');
 
   await app.start(port);
   console.log(`⚡️ Server listening on port ${port}`);
 
-  try {
-    await initDb();
-    console.log('💾 Database ready');
-  } catch (err) {
-    console.error('⚠️  DB init error (will retry on next request):', err.message);
-  }
-})();
+  // Multi-workspace OAuth installs have no single bot token, and polls do not
+  // record their team, so those deployments close overdue polls in the database
+  // without updating the Slack message.
+  const sweepClient = process.env.SLACK_BOT_TOKEN ? app.client : null;
+  if (!sweepClient) console.warn('⚠️  No SLACK_BOT_TOKEN: overdue polls will close silently');
+  await sweepOverduePolls(sweepClient).catch(err => console.warn('startup sweep failed:', err.message));
+  const sweepTimer = setInterval(
+    () => sweepOverduePolls(sweepClient).catch(err => console.warn('auto-close sweep failed:', err.message)),
+    AUTO_CLOSE_SWEEP_MS
+  );
+
+  let shuttingDown = false;
+  const shutdown = async signal => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received - shutting down`);
+    clearInterval(sweepTimer);
+    try { await app.stop(); } catch (err) { console.warn('server close failed:', err.message); }
+    try { await pool.end(); } catch (err) { console.warn('pool close failed:', err.message); }
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+})().catch(err => {
+  console.error('Fatal startup error:', err.message);
+  process.exit(1);
+});
