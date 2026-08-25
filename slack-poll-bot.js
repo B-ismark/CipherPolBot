@@ -2010,8 +2010,44 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
 
 // ==================== HEALTH CHECK ====================
 
+// / is liveness: the process is answering. /health is readiness: it also
+// reaches the database, so a monitor pointed at it catches an instance that is
+// up but useless, not just one that is asleep.
 receiver.router.get('/', (req, res) => res.send('Slack Poll Bot is running ✓'));
-receiver.router.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+let schemaReady = false;
+
+const HEALTH_CACHE_MS = 15000;
+let lastDbCheck = { at: 0, ok: false, latencyMs: null };
+
+async function checkDatabase() {
+  // Cached so a monitor on a short interval - or several - cannot turn the
+  // health endpoint into load of its own.
+  if (Date.now() - lastDbCheck.at < HEALTH_CACHE_MS) return lastDbCheck;
+  const started = Date.now();
+  try {
+    await pool.query('SELECT 1');
+    lastDbCheck = { at: Date.now(), ok: true, latencyMs: Date.now() - started };
+  } catch (err) {
+    // Logged, not returned: a pg error can name the database host and user,
+    // and this endpoint is public.
+    console.warn('health check: database unreachable:', err.message);
+    lastDbCheck = { at: Date.now(), ok: false, latencyMs: null };
+  }
+  return lastDbCheck;
+}
+
+receiver.router.get('/health', async (req, res) => {
+  const db = await checkDatabase();
+  const ok = schemaReady && db.ok;
+  res.status(ok ? 200 : 503).json({
+    status: ok ? 'ok' : 'degraded',
+    uptime: Math.round(process.uptime()),
+    schema: schemaReady ? 'ready' : 'initialising',
+    database: db.ok ? 'ok' : 'unreachable',
+    ...(db.latencyMs === null ? {} : { databaseLatencyMs: db.latencyMs })
+  });
+});
 
 receiver.router.get('/slack/oauth_redirect', async (req, res) => {
   const { code, error } = req.query;
@@ -2088,6 +2124,7 @@ async function initDbWithRetry(attempts = 5) {
   // host sees a clean crash and restarts us.
   try {
     await initDbWithRetry();
+    schemaReady = true;
     console.log('💾 Database ready');
   } catch (err) {
     console.error('Fatal: database unavailable after retries:', err.message);

@@ -148,7 +148,25 @@ Two layers, and you want both:
 can wake a sleeping instance. Point [cron-job.org](https://cron-job.org) or
 [UptimeRobot](https://uptimerobot.com) at `https://<your-service>.onrender.com/health`
 every **10 minutes** — under the 15-minute limit, with room for one missed run.
-`/health` touches no database, so the ping costs almost nothing.
+
+Use `/health`, not `/`. The two answer different questions:
+
+| Path | Answers | Fails when |
+|------|---------|-----------|
+| `/` | Is the process alive? | Only if the container is down |
+| `/health` | Can it actually serve a poll? | Also if the database is unreachable or the schema is still being created |
+
+`/health` returns `200` with `{"status":"ok","schema":"ready","database":"ok","databaseLatencyMs":…}`,
+or `503` with `"status":"degraded"` and which part is wrong. So a monitor on `/health`
+alerts on an instance that is up but useless, where `/` would report it as fine. The
+database probe is cached for 15 seconds, so a short monitor interval cannot turn the
+endpoint into load, and the response deliberately never echoes the driver error —
+those can name the database host and user, and this endpoint is public.
+
+If you want Render to restart an unhealthy instance by itself, set
+`healthCheckPath: /health` in `render.yaml`. Weigh it first: a slow cold start on the
+database would then look like a failure and cost you a restart, so it is left off by
+default.
 
 **2. `KEEPALIVE_URL` — belt and braces.** Set it to that same `/health` URL and the
 bot pings itself every 10 minutes, no third-party account needed. Leave it unset
@@ -185,6 +203,8 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 |--------|-----|
 | Bot not responding | Check `.env` tokens are correct |
 | First command fails, retry works | The host had gone to sleep — see **Staying awake** |
+| Monitor says up, bot still broken | Point the monitor at `/health`, not `/` — see **Staying awake** |
+| `/health` returns 503 | Read `database` and `schema` in the body; the instance is running but cannot serve polls |
 | Commands not found | Verify Slash Commands have the right Request URL |
 | Votes not working | Confirm Interactivity is enabled with the correct URL |
 | ngrok URL changed | Update Request URLs in Slack app settings |
