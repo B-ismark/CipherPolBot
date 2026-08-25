@@ -189,6 +189,19 @@ the endpoint reports ready, and a cold database connection takes a few seconds. 
 retries during a deploy, so this costs nothing — but it is why `/` and `/health`
 disagree right after a restart.
 
+### What happens to a poll created during those 10 seconds
+
+Nothing bad, and nothing is lost. The port is bound before the migrations run, so the
+bot really is answering Slack while its schema work finishes. Existing tables are
+already there, so reads and votes are unaffected — but the first boot after a deploy
+that adds a column would hit that column before the `ALTER` had run.
+
+So work that writes polls waits for the migrations instead of failing on them. Poll
+creation is already acked by then, so it can wait up to 20 seconds — the poll appears a
+moment later than usual and that is the whole of it. A vote gets a 2-second wait,
+because its results view has to be part of the ack, and is told to retry if the bot is
+still coming up. Once the bot is up, both waits cost nothing measurable.
+
 **2. `KEEPALIVE_URL` — belt and braces.** Set it to that same `/health` URL and the
 bot pings itself every 10 minutes, no third-party account needed. Leave it unset
 locally. It stops a *running* instance from falling asleep, but it cannot wake one

@@ -150,6 +150,28 @@ async function closePoll(pollId) {
   await pool.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
 }
 
+// The port is bound before the schema is created (Render kills a service that
+// opens no port within ~60s), so for the first few seconds of a boot the bot is
+// answering Slack while its migrations are still running. Reads and writes of
+// existing columns are fine - the tables are already there - but the first boot
+// after a deploy that ADDs a column would fail on it. Rather than surface
+// "column does not exist" to whoever happened to create a poll in that window,
+// work that writes polls waits for the migrations to finish.
+let schemaReady = false;
+let markSchemaReady;
+const schemaReadyPromise = new Promise(resolve => { markSchemaReady = resolve; });
+
+async function awaitSchema(timeoutMs) {
+  if (schemaReady) return true;
+  let timer;
+  const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); });
+  try {
+    return await Promise.race([schemaReadyPromise.then(() => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const AUTO_CLOSE_SWEEP_MS = 60 * 1000;
 const KEEPALIVE_MS = 10 * 60 * 1000;
 
@@ -1153,6 +1175,12 @@ function buildPostVoteModal(poll, viewerId = null) {
 async function createAndPostPoll(client, meta, teamId = null) {
   const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false } = meta;
 
+  // The submission has already been acked, so nothing here is racing Slack's
+  // 3-second deadline and this wait costs nothing once the bot is up.
+  if (!await awaitSchema(20000)) {
+    throw new Error('The bot is still starting up. Please try again in a few seconds.');
+  }
+
   // Rate limiting check
   await checkPollCreationRateLimit(userId);
 
@@ -1831,6 +1859,17 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
   const values = view.state.values;
   const wantsNotify = (values.vote_notify?.value?.selected_options || []).some(o => o.value === 'notify');
 
+  // Unlike poll creation, this handler still has to ack within Slack's 3
+  // seconds (its results view has to be part of the ack), so the wait is short.
+  // It costs nothing once the bot is up, and a vote cast during a boot is told
+  // to retry rather than hitting a half-migrated schema.
+  if (!await awaitSchema(2000)) {
+    return ack({
+      response_action: 'update',
+      view: buildNoticeModal('Starting Up', '⏳ The bot is still starting up and did not record your vote. Try again in a few seconds.')
+    });
+  }
+
   const dbClient = await pool.connect();
   let finalPoll = null;
   try {
@@ -2016,8 +2055,6 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
 // up but useless, not just one that is asleep.
 receiver.router.get('/', (req, res) => res.send('Slack Poll Bot is running ✓'));
 
-let schemaReady = false;
-
 const HEALTH_CACHE_MS = 15000;
 let lastDbCheck = { at: 0, ok: false, latencyMs: null };
 let dbFailingSince = null;
@@ -2131,6 +2168,7 @@ async function initDbWithRetry(attempts = 5) {
   try {
     await initDbWithRetry();
     schemaReady = true;
+    markSchemaReady();
     console.log('💾 Database ready');
   } catch (err) {
     console.error('Fatal: database unavailable after retries:', err.message);
