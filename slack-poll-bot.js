@@ -288,6 +288,31 @@ function isCreatorOrAdmin(poll, userId) {
   return poll.creator === userId || (poll.coCreators || []).includes(userId);
 }
 
+// Whether viewerId may see live results. viewerId is null on shared surfaces
+// (the in-channel poll message), which everyone sees - those never get
+// creator-only results.
+function canViewResults(poll, viewerId) {
+  if (poll.status === 'closed') return true;
+  if (poll.showResults === 'on_close') return false;
+  if (poll.showResults === 'creator_only') return !!viewerId && isCreatorOrAdmin(poll, viewerId);
+  return true;
+}
+
+function resultsHiddenReason(poll) {
+  return poll.showResults === 'on_close'
+    ? 'Results visible after poll closes'
+    : 'Results visible only to the poll creator';
+}
+
+function buildNoticeModal(title, text) {
+  return {
+    type: 'modal',
+    title: { type: 'plain_text', text: title },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }]
+  };
+}
+
 // ==================== CONSTANTS ====================
 
 const OPTION_EMOJIS = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
@@ -888,8 +913,18 @@ function pollProgressBar(count, total, width = 16) {
   return '█'.repeat(filled) + '░'.repeat(width - filled);
 }
 
-function buildQuestionResultBlock(q, qi, poll) {
+function buildQuestionResultBlock(q, qi, poll, viewerId = null) {
   const qVotes = poll.votes[qi] || {};
+
+  if (!canViewResults(poll, viewerId)) {
+    return [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${resultsHiddenReason(poll)}_` }
+      },
+      { type: 'divider' }
+    ];
+  }
 
   if (q.type === 'open_ended') {
     const responses = Object.entries(qVotes);
@@ -954,20 +989,6 @@ function buildQuestionResultBlock(q, qi, poll) {
     return [
       { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
       ...optBlocks,
-      { type: 'divider' }
-    ];
-  }
-
-  const isClosed = poll.status === 'closed';
-  if (poll.showResults === 'on_close' && !isClosed) {
-    return [
-      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n_Results visible after poll closes_` } },
-      { type: 'divider' }
-    ];
-  }
-  if (poll.showResults === 'creator_only' && !isClosed) {
-    return [
-      { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n_Results visible only to the creator_` } },
       { type: 'divider' }
     ];
   }
@@ -1106,7 +1127,7 @@ function buildShareModal(poll) {
   };
 }
 
-function buildResultsBlocks(poll, heading) {
+function buildResultsBlocks(poll, heading, viewerId = null) {
   const participants = getAllVoters(poll).size;
   return [
     { type: 'header', text: { type: 'plain_text', text: heading } },
@@ -1114,7 +1135,7 @@ function buildResultsBlocks(poll, heading) {
     ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
     { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* participant${participants === 1 ? '' : 's'}  ·  Created by <@${poll.creator}>${poll.anonymous ? '  ·  🔒 Anonymous' : ''}` }] },
     { type: 'divider' },
-    ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll))
+    ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, viewerId))
   ];
 }
 
@@ -1128,7 +1149,7 @@ async function updatePollMessage(client, poll) {
   ));
 }
 
-function buildPostVoteModal(poll) {
+function buildPostVoteModal(poll, viewerId = null) {
   const participants = getAllVoters(poll).size;
   return {
     type: 'modal',
@@ -1138,7 +1159,7 @@ function buildPostVoteModal(poll) {
       { type: 'section', text: { type: 'mrkdwn', text: `Your vote has been recorded for *${poll.title}*!` } },
       { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* participant${participants !== 1 ? 's' : ''} so far` }] },
       { type: 'divider' },
-      ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, { ...poll, showResults: 'realtime' }))
+      ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, viewerId))
     ]
   };
 }
@@ -1267,7 +1288,8 @@ app.command('/poll-results', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-results POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    await client.chat.postMessage({ channel, text: `📊 Results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Poll Results') });
+    if (!canViewResults(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: `🔒 ${resultsHiddenReason(poll)}.` });
+    await client.chat.postEphemeral({ channel, user: userId, text: `📊 Results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Poll Results', userId) });
   } catch (err) {
     console.error('/poll-results error:', err);
     await notifyError(client, body.user_id, `❌ /poll-results failed: ${err.message}`);
@@ -1283,7 +1305,8 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results') });
+    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
+    await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
     console.error('/poll-share error:', err);
     await notifyError(client, body.user_id, `❌ /poll-share failed: ${err.message}`);
@@ -1424,6 +1447,8 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
+
+    if (!isCreatorOrAdmin(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
 
     const esc = v => `"${String(v).replace(/"/g, '""')}"`;
     const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
@@ -1780,7 +1805,10 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
 
     if (!rows.length || rows[0].status === 'closed') {
       await dbClient.query('ROLLBACK');
-      await ack();
+      await ack({
+        response_action: 'update',
+        view: buildNoticeModal('Poll Closed', '🔒 This poll is closed - your vote was *not* recorded.')
+      });
       return;
     }
 
@@ -1789,7 +1817,10 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
     if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
       await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
       await dbClient.query('COMMIT');
-      await ack();
+      await ack({
+        response_action: 'update',
+        view: buildNoticeModal('Poll Closed', '⏰ This poll reached its close time - your vote was *not* recorded.')
+      });
       await updatePollMessage(client, { ...poll, status: 'closed' });
       await sendCloseNotifications(client, { ...poll, status: 'closed' });
       return;
@@ -1804,7 +1835,10 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
 
     if (hasVoted && !poll.allowRevote) {
       await dbClient.query('ROLLBACK');
-      await ack();
+      await ack({
+        response_action: 'update',
+        view: buildNoticeModal('Already Voted', 'You have already voted in this poll, and the creator turned off vote changes.')
+      });
       return;
     }
 
@@ -1883,13 +1917,16 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
   } catch (err) {
     await dbClient.query('ROLLBACK');
     console.error('vote_submit transaction error:', err.message);
-    await ack();
+    await ack({
+      response_action: 'update',
+      view: buildNoticeModal('Vote Not Saved', '⚠️ Something went wrong recording your vote. Nothing was saved - please try again.')
+    });
     return;
   } finally {
     dbClient.release();
   }
 
-  await ack({ response_action: 'update', view: buildPostVoteModal(finalPoll) });
+  await ack({ response_action: 'update', view: buildPostVoteModal(finalPoll, userId) });
   await updatePollMessage(client, finalPoll);
 });
 
@@ -1911,7 +1948,7 @@ app.action('view_results_modal', async ({ ack, body, client, action }) => {
           ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
           { type: 'context', elements: [{ type: 'mrkdwn', text: `🔒 Closed  ·  *${participants}* participant${participants !== 1 ? 's' : ''}  ·  Created by <@${poll.creator}>` }] },
           { type: 'divider' },
-          ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll))
+          ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, body.user.id))
         ]
       }
     });
