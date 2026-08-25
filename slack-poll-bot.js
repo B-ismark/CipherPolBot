@@ -729,7 +729,7 @@ function buildCreationModal(meta, errorMsg = null) {
     { text: { type: 'mrkdwn', text: '*Allow vote changes* — voters can update their choice' }, value: 'allow_revote' }
   ];
   const activeSettings = pollSettings.filter(v => settingsOptions.some(o => o.value === v));
-  const orderOpt = [{ text: { type: 'mrkdwn', text: '*Yes* — sort options by vote count' }, value: 'yes' }];
+  const orderOpt = [{ text: { type: 'mrkdwn', text: '*Sort by vote count* — most-voted option first' }, value: 'yes' }];
 
   return {
     type: 'modal',
@@ -774,12 +774,10 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(pollDescription ? { initial_value: pollDescription } : {})
         }
       },
-      // ── Privacy & Voting ──────────────────────────────
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*Privacy & Voting*' } },
       {
         type: 'input', block_id: 'poll_settings',
-        label: { type: 'plain_text', text: 'Options' },
+        label: { type: 'plain_text', text: 'Voting' },
         optional: true,
         element: {
           type: 'checkboxes', action_id: 'value',
@@ -787,9 +785,6 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(activeSettings.length ? { initial_options: activeSettings.map(v => settingsOptions.find(o => o.value === v)) } : {})
         }
       },
-      // ── Results ───────────────────────────────────────
-      { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*Results*' } },
       {
         type: 'input', block_id: 'poll_show_results',
         label: { type: 'plain_text', text: 'Show results' },
@@ -801,7 +796,7 @@ function buildCreationModal(meta, errorMsg = null) {
       },
       {
         type: 'input', block_id: 'poll_order_by_votes',
-        label: { type: 'plain_text', text: 'Sort by most votes' },
+        label: { type: 'plain_text', text: 'Result order' },
         optional: true,
         element: {
           type: 'checkboxes', action_id: 'value',
@@ -809,9 +804,7 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(orderByVotes ? { initial_options: orderOpt } : {})
         }
       },
-      // ── Schedule ──────────────────────────────────────
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*Schedule*' } },
       {
         type: 'input', block_id: 'poll_close_at',
         label: { type: 'plain_text', text: 'Auto-close date & time' },
