@@ -1241,6 +1241,15 @@ function buildQuestion(text, type, optionsRaw, allowMultiple) {
 
 // ==================== COMMANDS ====================
 
+// Slack invalidates a trigger_id after 3 seconds. On a host that sleeps when
+// idle, the first command after a wake-up always loses that race, so say what
+// happened instead of surfacing the raw API error (or nothing at all).
+const WAKE_UP_MESSAGE = '⏳ The bot was waking up and missed the 3-second window Slack allows. Run the command again - it will open straight away.';
+
+function isExpiredTrigger(err) {
+  return `${err.data?.error || err.message}`.includes('expired_trigger_id');
+}
+
 async function handleNewPoll({ ack, body, client }) {
   await ack();
   try {
@@ -1250,7 +1259,9 @@ async function handleNewPoll({ ack, body, client }) {
     });
   } catch (err) {
     console.error('/newpoll error:', err);
-    await notifyError(client, body.user_id, `❌ Could not open poll creator: ${err.message}`);
+    await notifyError(client, body.user_id, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open poll creator: ${err.message}`);
   }
 }
 
@@ -1266,6 +1277,9 @@ app.shortcut('create_poll', async ({ ack, shortcut, client }) => {
     });
   } catch (err) {
     console.error('create_poll shortcut error:', err);
+    await notifyError(client, shortcut.user.id, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open poll creator: ${err.message}`);
   }
 });
 
@@ -2058,7 +2072,6 @@ async function initDbWithRetry(attempts = 5) {
 
   // The sweeper resolves a bot token per poll, so it works for OAuth installs
   // too - see clientForPoll.
-  await sweepOverduePolls().catch(err => console.warn('startup sweep failed:', err.message));
   const sweepTimer = setInterval(
     () => sweepOverduePolls().catch(err => console.warn('auto-close sweep failed:', err.message)),
     AUTO_CLOSE_SWEEP_MS
@@ -2076,6 +2089,10 @@ async function initDbWithRetry(attempts = 5) {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Not awaited: catching up on polls that expired while we were down must not
+  // delay the shutdown handlers above, and nothing below depends on it.
+  sweepOverduePolls().catch(err => console.warn('startup sweep failed:', err.message));
 })().catch(err => {
   console.error('Fatal startup error:', err.message);
   process.exit(1);
