@@ -116,11 +116,13 @@ All constants are easily tunable if different limits are needed.
 ### 6. Result visibility applied to every question type
 - **Issue**: the `show_results` gate only ran on the fallthrough path of `buildQuestionResultBlock()`, so `open_ended`, `likert` and `ranking` questions rendered full results (including voter names) on `creator_only` and `on_close` polls while they were still open
 - **Fix**: the gate runs once at the top of the function for every type, via `canViewResults()` in `lib/policy.js`
-- **Also**: the function now takes a `viewerId`, so the creator and co-creators can see their own `creator_only` results. A null `viewerId` means a shared surface (the in-channel poll message), which never shows restricted results
+- **Also**: the function now takes a `viewerId`. The creator and co-creators always see their own live results, whatever `show_results` says - the setting governs who *else* sees them, and when. A null `viewerId` means a shared surface (the in-channel poll message, or a results digest posted to a channel), which only ever shows results the whole workspace may see
 
 ### 7. Authorization on the commands that read poll data
 - **Issue**: `/poll-results`, `/poll-share` and `/poll-export` looked polls up by id with no permission check, and poll ids are listed to everyone by `/polls-list`. `/poll-results` and `/poll-share` used `chat.postMessage`, so any member could also broadcast another creator poll results into a channel
 - **Fix**: `/poll-results` is gate-aware and ephemeral; `/poll-share` (public) and `/poll-export` (raw per-voter CSV) are limited to the creator and co-creators
+- **Also**: `/poll-share` refuses to post restricted results while the poll is open, even for the creator. Voters were told the results were private; releasing them means closing the poll or changing the setting, not one command that contradicts it
+- **Not gated**: the `📤 Post to Channel` button on the poll message, which any member may use. It posts the poll itself with a null viewer, so restricted results stay hidden, and re-posting a poll to gather votes is the point of the button. It was labelled "Share Results" on closed polls, which misdescribed it
 
 ### 8. Post-vote confirmation no longer overrides the setting
 - **Issue**: `buildPostVoteModal()` passed `showResults: 'realtime'`, showing every voter the full results regardless of the poll setting
@@ -144,7 +146,7 @@ All constants are easily tunable if different limits are needed.
 
 ### 13. Operational
 - `/polls-list` capped at 20 like `/polls-archive`, both saying how many were hidden (an unbounded list exceeded Slack message limits)
-- Boot retries the schema five times then exits, instead of logging "will retry on next request" and never retrying
+- Boot binds the port first (Render kills a service that opens no port within ~60s, see bdeeb05), then retries the schema five times and exits if it never succeeds, instead of logging "will retry on next request" and never retrying
 - SIGTERM/SIGINT close the server and pool before exit
 - Modal-refresh failures warn instead of being swallowed by `catch (_) {}`
 - `isCreatorOrAdmin` renamed `isCreatorOrCoCreator`: there is no workspace-admin override, and the old name implied one

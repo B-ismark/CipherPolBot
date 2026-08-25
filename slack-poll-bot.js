@@ -1003,7 +1003,9 @@ function buildPollBlocks(poll) {
   const actionButtons = isClosed
     ? [
         { type: 'button', text: { type: 'plain_text', text: '📊  View Results', emoji: true }, style: 'primary', action_id: 'view_results_modal', value: poll.id },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share Results', emoji: true }, action_id: 'share_poll', value: poll.id }
+        // Posts the poll message (results included once closed) into another
+        // channel - deliberately open to any member, unlike /poll-share.
+        { type: 'button', text: { type: 'plain_text', text: '📤  Post to Channel', emoji: true }, action_id: 'share_poll', value: poll.id }
       ]
     : [
         {
@@ -1253,6 +1255,13 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
+    // Voters were told these results were restricted, so do not let one command
+    // publish them to a channel while the poll is still open.
+    if (!canViewResults(poll, null)) return client.chat.postEphemeral({
+      channel,
+      user: userId,
+      text: `🔒 Results for this poll are restricted (${resultsHiddenReason(poll).toLowerCase()}), so they cannot be posted to a channel yet. Close the poll with \`/poll-close ${poll.id}\`, or change the setting with \`/poll-edit ${poll.id}\`.`
+    });
     await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
     console.error('/poll-share error:', err);
@@ -1300,9 +1309,10 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     const channel = await resolveChannel(client, body.channel_id, userId);
     const polls = await getAllPolls('closed');
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls yet.' });
+    const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
     const listBlocks = [
       { type: 'header', text: { type: 'plain_text', text: 'Closed Polls' } },
-      ...polls.slice(0, POLL_LIST_PAGE_SIZE).map((p, i) => {
+      ...shown.map((p, i) => {
         const participants = getAllVoters(p).size;
         return {
           type: 'section',
@@ -1312,7 +1322,7 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
           }
         };
       }),
-      ...truncationNote(polls.length, Math.min(polls.length, POLL_LIST_PAGE_SIZE)),
+      ...truncationNote(polls.length, shown.length),
       { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results POLL_ID\` to view full results` }] }
     ];
     await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
@@ -1978,13 +1988,22 @@ async function initDbWithRetry(attempts = 5) {
 (async () => {
   const port = process.env.PORT || 3000;
 
-  // Nothing works without the schema, so fail the boot rather than serving
-  // requests that all throw "relation does not exist".
-  await initDbWithRetry();
-  console.log('💾 Database ready');
-
+  // Bind the port first: Render kills a web service that opens no port within
+  // ~60s, and a cold Neon connection plus migrations can take longer than that
+  // (see bdeeb05). Only then set up the schema.
   await app.start(port);
   console.log(`⚡️ Server listening on port ${port}`);
+
+  // Nothing works without the schema, so exit rather than serve requests that
+  // all throw "relation does not exist" - the port is already bound, so the
+  // host sees a clean crash and restarts us.
+  try {
+    await initDbWithRetry();
+    console.log('💾 Database ready');
+  } catch (err) {
+    console.error('Fatal: database unavailable after retries:', err.message);
+    process.exit(1);
+  }
 
   // Multi-workspace OAuth installs have no single bot token, and polls do not
   // record their team, so those deployments close overdue polls in the database

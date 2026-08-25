@@ -95,9 +95,15 @@ test('creator_only hides live results on shared surfaces (no viewer)', () => {
   assert.strictEqual(canViewResults(poll('creator_only'), null), false);
 });
 
-test('on_close hides live results from everyone, creator included', () => {
-  assert.strictEqual(canViewResults(poll('on_close'), 'U_CREATOR'), false);
+test('on_close hides live results from other members', () => {
   assert.strictEqual(canViewResults(poll('on_close'), 'U_STRANGER'), false);
+  assert.strictEqual(canViewResults(poll('on_close'), null), false);
+});
+
+test('the creator and co-creators always see their own live results', () => {
+  assert.strictEqual(canViewResults(poll('on_close'), 'U_CREATOR'), true);
+  assert.strictEqual(canViewResults(poll('on_close', 'active', ['U_CO']), 'U_CO'), true);
+  assert.strictEqual(canViewResults(poll('creator_only'), 'U_CREATOR'), true);
 });
 
 test('closing a poll makes results visible to everyone', () => {

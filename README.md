@@ -92,7 +92,7 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ```
 /poll-results poll_1706234567_abc12345
 ```
-→ Shows a breakdown with visual progress bars, visible only to you. Results the poll owner restricted ("only me", or "after the poll closes") stay hidden until they are released.
+→ Shows a breakdown with visual progress bars, visible only to you. Results the poll owner restricted ("only me", or "after the poll closes") stay hidden from everyone else until the poll closes; the owner and co-creators always see their own.
 
 ```
 /polls-list
@@ -102,7 +102,7 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ```
 /poll-share poll_1706234567_abc12345
 ```
-→ Posts current results into the channel. Creator and co-creators only, since everyone there can read them.
+→ Posts current results into the channel. Creator and co-creators only, since everyone there can read them - and refused while the poll still restricts its results, because the voters were told they were private. Close the poll or change the setting first.
 
 ```
 /poll-export poll_1706234567_abc12345
