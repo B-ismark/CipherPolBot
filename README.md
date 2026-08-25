@@ -25,12 +25,30 @@ Create and manage polls in Slack with real-time vote tracking. Polls are stored 
 
 ### 2. Add Bot Token Scopes
 
-Go to **OAuth & Permissions → Bot Token Scopes** and add:
-- `chat:write`
-- `chat:write.public`
-- `commands`
-- `im:write` — required for polls created in DMs
-- `im:history` — required to read DM channel info
+Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these five:
+
+| Scope | Needed for |
+|-------|-----------|
+| `commands` | The slash commands themselves |
+| `chat:write` | Posting polls, results and every ephemeral reply |
+| `chat:write.public` | Posting to a public channel without being invited to it first |
+| `im:write` | Opening a DM — polls created in DMs, close notifications, error reports |
+| `files:write` | The CSV from `/poll-export` |
+
+That is the complete set: those are the only Slack methods the bot calls
+(`chat.postMessage`, `chat.postEphemeral`, `chat.update`, `conversations.open`,
+`files.uploadV2`, and the `views.*` methods, which need no scope at all).
+
+Nothing else is required. In particular `im:history`, `channels:join`, `groups:write`,
+`mpim:write` and `conversations.connect:read` are **not** used — the bot never reads
+message history, never joins a channel by itself, and never opens a group DM. If your
+app already has them, they are harmless, but a fresh install does not need them.
+
+**Private channels are the one gap.** `chat:write.public` covers public channels only,
+so to post a poll into a private channel the bot must be invited to it
+(`/invite @Cipher Pol`). `groups:write` does not substitute for membership. The same
+applies to `/poll-export`: file uploads do not honour `chat:write.public`, so run it
+in a DM or in a channel the bot belongs to.
 
 Click **Install to Workspace** and copy your **Bot Token** (`xoxb-...`)
 
