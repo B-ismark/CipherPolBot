@@ -107,15 +107,23 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ```
 → Opens an interactive modal. Add a title, questions (multiple choice, yes/no, rating scales, open-ended, and more), set options like anonymous voting or auto-close time, then post.
 
-**Where to post.** The modal has a *Where to post* section with two pickers:
+**Where to post.** The last screen, *Preview & Confirm*, shows the poll as it
+will look and then asks where it goes - two pickers, right above **🚀 Post
+Poll**:
 
 | Picker | What it reaches |
 |--------|-----------------|
 | **Channels** | Public channels (the bot does not need to be a member), and private channels it has been invited to. Up to 10. |
 | **People** | Each person gets the poll in their own DM with the bot. Up to 10. |
 
-Leave both empty and the poll goes to the conversation you ran the command from.
-The channel you ran it in is prefilled, so posting where you are stays one click.
+Fill in both if you like: unlike most poll apps this is not a choice between a
+channel and people, and there is no radio button to flip. Leave both empty and
+the poll goes to the conversation you ran the command from; the channel you ran
+it in is prefilled, so posting where you are stays one click.
+
+Going **← Back** from this screen to edit a question resets the pickers to that
+default - Slack discards the state of a view it pops, and the picks are only sent
+when the poll is posted.
 
 Votes cast anywhere the poll appears count toward the same poll, and every copy
 of the message updates on every vote.

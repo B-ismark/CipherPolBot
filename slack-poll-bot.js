@@ -382,6 +382,55 @@ function toMessageRefs(posted) {
   return posted.map(({ channelId, messageTs }) => ({ channelId, messageTs }));
 }
 
+// The two pickers, shared by the last step of poll creation and the Share modal.
+// Kept together because the pair only makes sense as a pair: an app cannot post
+// into a DM between two people, so a person is not a conversation to choose -
+// they are a user id to open a DM with.
+function destinationBlocks({ channels = [], users = [], channelsLabel = 'Channels', peopleHint } = {}) {
+  return [
+    {
+      type: 'input', block_id: 'poll_dest_channels',
+      label: { type: 'plain_text', text: channelsLabel },
+      optional: true,
+      element: {
+        type: 'multi_conversations_select', action_id: 'value',
+        placeholder: { type: 'plain_text', text: 'Pick channels...' },
+        max_selected_items: MAX_DESTINATIONS,
+        filter: { include: ['public', 'private'] },
+        ...(channels.length ? { initial_conversations: channels } : {})
+      }
+    },
+    {
+      type: 'input', block_id: 'poll_dest_users',
+      label: { type: 'plain_text', text: 'People' },
+      optional: true,
+      hint: { type: 'plain_text', text: peopleHint || 'Each person gets the poll in their own DM with me' },
+      element: {
+        type: 'multi_users_select', action_id: 'value',
+        placeholder: { type: 'plain_text', text: 'Pick people...' },
+        max_selected_items: MAX_DESTINATIONS,
+        ...(users.length ? { initial_users: users } : {})
+      }
+    }
+  ];
+}
+
+// What the pickers came back with. Both blocks are optional, so both can be
+// absent from the submission entirely.
+function readDestinations(values) {
+  return {
+    destChannels: values?.poll_dest_channels?.value?.selected_conversations || [],
+    destUsers:    values?.poll_dest_users?.value?.selected_users || []
+  };
+}
+
+// The conversation a command was run in, if it is one the app could post a poll
+// into. A DM is not: the picker cannot offer it and the app cannot post there,
+// so it is left unset and the fallback in resolveDestinations handles it.
+function prefillableChannel(channelId) {
+  return /^[CG]/.test(channelId || '') ? [channelId] : [];
+}
+
 // Whether the poll landed somewhere its creator can read and vote in.
 //
 // A channel they picked counts - the picker only offers conversations they can
@@ -674,14 +723,6 @@ function buildCreationModal(meta, errorMsg = null) {
     closeAt, showResults = 'creator_only', orderByVotes = false
   } = meta;
 
-  // First open: post where the command was run. A DM cannot be prefilled -
-  // Slack never tells an app who the other person in one is, and the picker
-  // cannot offer a conversation the app is not in - so it is left empty and the
-  // fallback in resolveDestinations sends the poll to our own DM instead.
-  // ?? not ||, so a creator who clears the picker stays cleared.
-  const destChannels = meta.destChannels ?? (/^[CG]/.test(meta.channelId || '') ? [meta.channelId] : []);
-  const destUsers    = meta.destUsers ?? [];
-
   const settingsOptions = [
     { text: { type: 'mrkdwn', text: '*Anonymous* — hide who voted for what' }, value: 'anonymous' },
     { text: { type: 'mrkdwn', text: '*Allow vote changes* — voters can update their choice' }, value: 'allow_revote' }
@@ -732,40 +773,6 @@ function buildCreationModal(meta, errorMsg = null) {
           ...(pollDescription ? { initial_value: pollDescription } : {})
         }
       },
-      // ── Where to post ─────────────────────────────────
-      { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
-      {
-        type: 'input', block_id: 'poll_dest_channels',
-        label: { type: 'plain_text', text: 'Channels' },
-        optional: true,
-        element: {
-          type: 'multi_conversations_select', action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Pick channels...' },
-          max_selected_items: MAX_DESTINATIONS,
-          // Channels only: an app cannot post into a DM between two people, so
-          // offering one here would just be a choice that fails. People are
-          // picked below and reached through their own DM with the app.
-          filter: { include: ['public', 'private'] },
-          ...(destChannels.length ? { initial_conversations: destChannels } : {})
-        }
-      },
-      {
-        type: 'input', block_id: 'poll_dest_users',
-        label: { type: 'plain_text', text: 'People' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.' },
-        element: {
-          type: 'multi_users_select', action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Pick people...' },
-          max_selected_items: MAX_DESTINATIONS,
-          ...(destUsers.length ? { initial_users: destUsers } : {})
-        }
-      },
-      ...(destChannels.length || destUsers.length ? [] : [{
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: 'Leave both empty and the poll goes to the conversation you ran the command from.' }]
-      }]),
       // ── Privacy & Voting ──────────────────────────────
       { type: 'divider' },
       { type: 'section', text: { type: 'mrkdwn', text: '*Privacy & Voting*' } },
@@ -882,8 +889,10 @@ function savedQuestionsBlocks(savedQuestions) {
 }
 
 function buildPreviewModal(meta) {
-  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt, destChannels = [], destUsers = [] } = meta;
-  const destinations = [...destChannels.map(c => `<#${c}>`), ...destUsers.map(u => `<@${u}>`)];
+  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt } = meta;
+  // ?? not ||, so a creator who clears the channel picker stays cleared.
+  const destChannels = meta.destChannels ?? prefillableChannel(meta.channelId);
+  const destUsers    = meta.destUsers ?? [];
   const tags = [];
   if (pollSettings.includes('anonymous'))    tags.push('🔒 Anonymous');
   if (pollSettings.includes('allow_revote')) tags.push('🔄 Vote changes allowed');
@@ -921,18 +930,40 @@ function buildPreviewModal(meta) {
       ...(pollDescription ? [{ type: 'section', text: { type: 'mrkdwn', text: pollDescription } }] : []),
       ...(tags.length ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: tags.join('  ·  ') }] }] : []),
       { type: 'divider' },
-      ...questionBlocks,
+      // A long poll can run past Slack's limit of 100 blocks in a view, and the
+      // pickers below are the point of this screen - so the preview is what
+      // gives way, not the thing you came here to do.
+      ...capBlocks(questionBlocks, 100 - FIXED_PREVIEW_BLOCKS),
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
+      ...destinationBlocks({
+        channels: destChannels,
+        users: destUsers,
+        peopleHint: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.'
+      }),
       {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Posting to ` +
-            (destinations.length ? destinations.join(', ') : 'this conversation') +
-            ' · Click *🚀 Post Poll* to publish'
+          text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Leave both pickers empty to post in the conversation you started from`
         }]
       }
     ]
   };
+}
+
+// Header, description, tags, three dividers, the Where to post heading, two
+// pickers and the footer - what the preview modal spends before any question.
+const FIXED_PREVIEW_BLOCKS = 10;
+
+// Slack rejects a whole view over the block limit, so an over-long preview is
+// trimmed with a line saying so rather than failing to open at all.
+function capBlocks(blocks, limit) {
+  if (blocks.length <= limit) return blocks;
+  return [
+    ...blocks.slice(0, limit - 1),
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `_…preview trimmed. All ${blocks.length} blocks of this poll will be posted._` }] }
+  ];
 }
 
 function buildVoteModal(poll, previousVotes = {}) {
@@ -1284,36 +1315,7 @@ function buildShareModal(poll) {
         }
       },
       { type: 'divider' },
-      {
-        type: 'input',
-        block_id: 'share_channels',
-        label: { type: 'plain_text', text: 'Channels' },
-        optional: true,
-        element: {
-          type: 'multi_conversations_select',
-          action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Pick channels...' },
-          max_selected_items: MAX_DESTINATIONS,
-          // Channels only: an app cannot post into a DM between two people, nor
-          // into a group DM it was never added to, so offering either here would
-          // just be a choice that fails. People are picked below and reached
-          // through their own DM with the app instead.
-          filter: { include: ['public', 'private'] }
-        }
-      },
-      {
-        type: 'input',
-        block_id: 'share_users',
-        label: { type: 'plain_text', text: 'People' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Each person gets the poll in their own DM with me' },
-        element: {
-          type: 'multi_users_select',
-          action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Pick people...' },
-          max_selected_items: MAX_DESTINATIONS
-        }
-      },
+      ...destinationBlocks({ peopleHint: 'Each person gets the poll in their own DM with me. Pick yourself to get a copy you can vote in.' }),
       {
         type: 'context',
         elements: [{
@@ -1474,11 +1476,7 @@ function readMainModalSettings(values, meta) {
     pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
     closeAt:         closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : (meta.closeAt || null),
     showResults:     values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? 'creator_only',
-    orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false),
-    // Only the main modal carries these blocks; every other submission has to
-    // keep what was already picked.
-    destChannels:    values.poll_dest_channels?.value?.selected_conversations ?? meta.destChannels ?? [],
-    destUsers:       values.poll_dest_users?.value?.selected_users ?? meta.destUsers ?? []
+    orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false)
   };
 }
 
@@ -1945,7 +1943,9 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
 });
 
 app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
-  const meta = JSON.parse(view.private_metadata);
+  // The destinations are picked on this modal, so they arrive in the submission
+  // rather than in the metadata that has been carried since the first screen.
+  const meta = { ...JSON.parse(view.private_metadata), ...readDestinations(view.state?.values) };
 
   // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll
   // is several database and API round trips, and on a cold host that overran
@@ -2050,8 +2050,7 @@ app.action('share_poll', async ({ ack, body, client, action }) => {
 app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   await ack();
   const { pollId } = JSON.parse(view.private_metadata);
-  const channelIds = view.state.values.share_channels?.value?.selected_conversations || [];
-  const userIds    = view.state.values.share_users?.value?.selected_users || [];
+  const { destChannels: channelIds, destUsers: userIds } = readDestinations(view.state?.values);
   const actor = body.user.id;
 
   try {
