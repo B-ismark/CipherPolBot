@@ -147,6 +147,7 @@ async function closePoll(pollId) {
 }
 
 const AUTO_CLOSE_SWEEP_MS = 60 * 1000;
+const KEEPALIVE_MS = 10 * 60 * 1000;
 
 // Clients the sweeper builds for itself, keyed by team. Request handlers get
 // their client from Bolt and never come through here.
@@ -2037,6 +2038,26 @@ receiver.router.get('/slack/oauth_redirect', async (req, res) => {
 
 // ==================== START ====================
 
+// Hosts that sleep when idle (Render's free tier after 15 minutes) make the
+// first slash command after the nap fail: waking up takes longer than the 3
+// seconds Slack allows. Pinging ourselves keeps the clock from ever reaching
+// 15 minutes. It cannot WAKE a sleeping instance - only an outside request
+// does that - so pair it with an external monitor for real coverage.
+function startKeepalive() {
+  const url = process.env.KEEPALIVE_URL;
+  if (!url) return null;
+  const timer = setInterval(async () => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) console.warn(`keepalive ping returned ${res.status}`);
+    } catch (err) {
+      console.warn('keepalive ping failed:', err.message);
+    }
+  }, KEEPALIVE_MS);
+  console.log(`💓 Keepalive: pinging ${url} every ${KEEPALIVE_MS / 60000} minutes`);
+  return timer;
+}
+
 async function initDbWithRetry(attempts = 5) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -2077,12 +2098,15 @@ async function initDbWithRetry(attempts = 5) {
     AUTO_CLOSE_SWEEP_MS
   );
 
+  const keepaliveTimer = startKeepalive();
+
   let shuttingDown = false;
   const shutdown = async signal => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`${signal} received - shutting down`);
     clearInterval(sweepTimer);
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
     try { await app.stop(); } catch (err) { console.warn('server close failed:', err.message); }
     try { await pool.end(); } catch (err) { console.warn('pool close failed:', err.message); }
     process.exit(0);

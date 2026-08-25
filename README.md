@@ -125,13 +125,39 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 4. Set environment variables (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `DATABASE_URL`)
 5. Copy the public URL and update all Slack app Request URLs
 
-> ⚠️ Render's free tier spins down after 15 minutes of inactivity.
-> Use https://cron-job.org (free) to ping your URL every 10 minutes to keep it awake.
+> ⚠️ Render's free tier spins down after 15 minutes of inactivity. See
+> **Staying awake** below — without it, the first command after a nap fails.
 
 ### Railway
 1. Go to https://railway.app → New Project → Deploy from GitHub
 2. Add environment variables
 3. Copy the public URL and update Slack app Request URLs
+
+---
+
+## Staying awake
+
+A sleeping instance cannot answer in time. Slack gives a slash command **3 seconds**
+to respond, and invalidates its `trigger_id` after **3 seconds** — while waking a
+cold container takes tens of seconds. You get `operation_timeout` from Slackbot,
+then `expired_trigger_id` from the app, and the command has to be run again.
+
+Two layers, and you want both:
+
+**1. An external monitor — this is the one that matters.** Only an outside request
+can wake a sleeping instance. Point [cron-job.org](https://cron-job.org) or
+[UptimeRobot](https://uptimerobot.com) at `https://<your-service>.onrender.com/health`
+every **10 minutes** — under the 15-minute limit, with room for one missed run.
+`/health` touches no database, so the ping costs almost nothing.
+
+**2. `KEEPALIVE_URL` — belt and braces.** Set it to that same `/health` URL and the
+bot pings itself every 10 minutes, no third-party account needed. Leave it unset
+locally. It stops a *running* instance from falling asleep, but it cannot wake one
+that already has — which is why layer 1 is not optional.
+
+> On the free plan, staying awake all month uses roughly 730 of the 750 free
+> instance-hours. Fine for one service; if you keep several free services warm in
+> the same account, the allowance runs out.
 
 ---
 
@@ -158,6 +184,7 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 | Problem | Fix |
 |--------|-----|
 | Bot not responding | Check `.env` tokens are correct |
+| First command fails, retry works | The host had gone to sleep — see **Staying awake** |
 | Commands not found | Verify Slash Commands have the right Request URL |
 | Votes not working | Confirm Interactivity is enabled with the correct URL |
 | ngrok URL changed | Update Request URLs in Slack app settings |

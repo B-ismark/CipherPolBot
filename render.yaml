@@ -11,6 +11,10 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      # Set to https://<your-service>.onrender.com/health to stop the free
+      # instance sleeping (see README: Staying awake)
+      - key: KEEPALIVE_URL
+        sync: false
       # Multi-workspace installs only (leave SLACK_BOT_TOKEN unset if used)
       - key: SLACK_CLIENT_ID
         sync: false
