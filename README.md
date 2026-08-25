@@ -128,6 +128,33 @@ when the poll is posted.
 Votes cast anywhere the poll appears count toward the same poll, and every copy
 of the message updates on every vote.
 
+**Voting from the message.** Every option carries its own numbered button, so a
+poll can be answered where it is read - no modal, one press. That works in a
+channel and in a DM alike.
+
+Two things a button cannot do, because Slack renders one message for everyone
+and it cannot be personalised:
+
+- **It cannot show you which option you picked.** Press **🗳️ Vote** for that -
+  the modal is per-person, opens on your previous answers, and is titled *Change
+  Your Vote* once you have one. Each press does reply privately to confirm what
+  it recorded.
+- **It cannot express a ranking or a Likert grid.** There is no single click that
+  means "third place", so those question types have no inline buttons and still
+  open the modal. Multiple choice, yes/no, agree/disagree and NPS all get them.
+  A mixed poll gets buttons on the questions that can take them, and the reply
+  says the rest still need the modal.
+
+On a multi-select question a press toggles that option, so you can pick several
+and take one back. Adding a choice is allowed even when the creator turned vote
+changes off - taking one back is not, since that is changing your mind.
+
+Hiding the tally no longer hides the ballot. With **Show results** set to *Only
+to creator* or *After close*, the options and their buttons are still listed;
+only the counts, bars and voter names are withheld. Previously the whole option
+list went with them, which left a question in the channel with no visible
+answers.
+
 **You always get a ballot.** Pick only people and you get your own copy of the
 poll too, so you can vote in it and watch the results come in - a poll its
 creator cannot vote in is broken, not a preference. Pick a channel and you do

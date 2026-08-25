@@ -950,6 +950,30 @@ function buildPreviewModal(meta) {
 // pickers and the footer - what the preview modal spends before any question.
 const FIXED_PREVIEW_BLOCKS = 10;
 
+// Slack rejects a message over 100 blocks outright. A long poll therefore has
+// to be summarised rather than trimmed: cutting the tail off a ballot would
+// silently drop questions people could otherwise answer, and they'd have no
+// way to tell. So past the limit the whole question list collapses to one
+// listing and everyone uses the modal, which is a view and gets its own 100.
+const MAX_MESSAGE_BLOCKS = 100;
+
+// A section caps at 3000 characters, which a listing of enough long questions
+// will reach on its own.
+function clampText(text, limit = 2900) {
+  return text.length <= limit ? text : text.slice(0, limit - 1) + '…';
+}
+
+function compactQuestionBlocks(poll) {
+  const listing = (poll.questions || []).map((q, i) =>
+    `${getTypeIcon(q.type)}  *${i + 1}. ${q.text}*${(q.options || []).length ? `  _${q.options.length} options_` : ''}`
+  ).join('\n');
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: clampText(listing) } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: '_Too long to lay out in a message - use the button below to answer it._' }] },
+    { type: 'divider' }
+  ];
+}
+
 // Slack rejects a whole view over the block limit, so an over-long preview is
 // trimmed with a line saying so rather than failing to open at all.
 function capBlocks(blocks, limit) {
@@ -1101,15 +1125,54 @@ function pollProgressBar(count, total, width = 16) {
   return '█'.repeat(filled) + '░'.repeat(width - filled);
 }
 
-function buildQuestionResultBlock(q, qi, poll, viewerId = null) {
+// Which questions can be answered by pressing one button. A ranking or a
+// Likert grid cannot - there is no single click that means "third place" -
+// so those keep sending people to the vote modal. This is deliberately the
+// same set that gets the option-and-bar rendering below, so the two cannot
+// drift apart.
+function isInlineVotable(type) {
+  return !['open_ended', 'likert', 'ranking'].includes(type);
+}
+
+// Slack renders one message for everyone, so an inline ballot cannot tick the
+// option you chose or grey out the rest - only the vote modal knows who is
+// reading. All this does is let you answer without opening anything, which
+// for a one-question poll is the whole interaction.
+function optionAccessory(poll, qi, oi, interactive) {
+  if (!interactive) return {};
+  return {
+    accessory: {
+      type: 'button',
+      text: { type: 'plain_text', text: OPTION_EMOJIS[oi] || `${oi + 1}`, emoji: true },
+      // Unique per option: Slack rejects a repeated action_id in one message.
+      action_id: `vote_option_${qi}_${oi}`,
+      value: `${poll.id}::${qi}::${oi}`
+    }
+  };
+}
+
+function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = false) {
   const qVotes = poll.votes[qi] || {};
 
   if (!canViewResults(poll, viewerId)) {
-    return [
+
+    // Hiding the tally is a rule about numbers, not about the ballot. It used
+    // to hide the options as well, which on the default setting left the
+    // message as a question with no visible answers - nobody could see what
+    // they were being asked to pick without opening a modal first.
+    const head =
       {
         type: 'section',
         text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${resultsHiddenReason(poll)}_` }
-      },
+      };
+    if (!isInlineVotable(q.type)) return [head, { type: 'divider' }];
+    return [
+      head,
+      ...q.options.map((option, oi) => ({
+        type: 'section',
+        text: { type: 'mrkdwn', text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*` },
+        ...optionAccessory(poll, qi, oi, interactive)
+      })),
       { type: 'divider' }
     ];
   }
@@ -1183,7 +1246,7 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null) {
 
   const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
   const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
-  const typeHint   = `${getTypeIcon(q.type)} _${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}_`;
+  const typeHint   = `${getTypeIcon(q.type)} _${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}${interactive ? '  ·  press a number to vote' : ''}_`;
 
   let displayOptions = q.options.map((option, oi) => ({ option, oi }));
   if (poll.orderByVotes && totalVotes > 0) {
@@ -1208,7 +1271,8 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null) {
       text: {
         type: 'mrkdwn',
         text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*${isWinner ? '  🏆' : ''}\n${statLine}${voterLine}`
-      }
+      },
+      ...optionAccessory(poll, qi, oi, interactive)
     };
   });
 
@@ -1265,12 +1329,14 @@ function buildPollBlocks(poll) {
         { type: 'button', text: { type: 'plain_text', text: '🔒  Close', emoji: true }, action_id: 'close_poll', value: poll.id }
       ];
 
-  return [
+  // Everything but the questions is fixed, so the questions are what has to
+  // give when the message will not fit.
+  const frame = questionBlocks => [
     { type: 'header', text: { type: 'plain_text', text: `📊  ${poll.title}`, emoji: true } },
     ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
     { type: 'context', elements: [{ type: 'mrkdwn', text: statusParts.join('  ·  ') }] },
     { type: 'divider' },
-    ...questions.flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll)),
+    ...questionBlocks,
     { type: 'actions', elements: actionButtons },
     {
       // The id and its commands used to sit here, on a message the whole
@@ -1280,6 +1346,11 @@ function buildPollBlocks(poll) {
       elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>` }]
     }
   ];
+
+  // A closed poll is a record rather than a ballot, so the buttons go with it -
+  // and by then the tally is public anyway.
+  const full = frame(questions.flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, null, !isClosed)));
+  return full.length <= MAX_MESSAGE_BLOCKS ? full : frame(compactQuestionBlocks(poll));
 }
 
 function buildShareModal(poll) {
@@ -2364,6 +2435,111 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
   }
 
   await ack({ response_action: 'update', view: buildPostVoteModal(finalPoll, userId) });
+  await updatePollMessage(client, finalPoll);
+});
+
+// The ballot on the poll message itself. One press is one answer, which is why
+// only list questions carry buttons - see isInlineVotable. Multi-question polls
+// still work: every list question gets its own row, and anything that needs the
+// modal is called out in the reply.
+app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  const [pollId, qiRaw, oiRaw] = `${action.value}`.split('::');
+  const qi = Number(qiRaw), oi = Number(oiRaw);
+
+  // Everything this handler says is ephemeral. A shared message cannot address
+  // one person, and without a reply a press would look like it did nothing on a
+  // poll whose tally is hidden.
+  const tell = async text => {
+    try { await respond({ response_type: 'ephemeral', replace_original: false, text }); }
+    catch (err) { console.warn('inline vote reply failed:', err.message); }
+  };
+
+  const dbClient = await pool.connect();
+  let finalPoll = null, note = null;
+  try {
+    await dbClient.query('BEGIN');
+    const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
+    if (!rows.length) {
+      await dbClient.query('ROLLBACK');
+      return await tell('❌ This poll no longer exists.');
+    }
+    const poll = rowToPoll(rows[0]);
+
+    if (poll.status === 'closed') {
+      await dbClient.query('ROLLBACK');
+      return await tell('🔒 This poll is closed - your vote was *not* recorded.');
+    }
+    if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
+      await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
+      await dbClient.query('COMMIT');
+      await tell('⏰ This poll reached its close time - your vote was *not* recorded.');
+      await updatePollMessage(client, { ...poll, status: 'closed' });
+      await sendCloseNotifications(client, { ...poll, status: 'closed' });
+      return;
+    }
+
+    const q = (poll.questions || [])[qi];
+    if (!q || !isInlineVotable(q.type) || !(q.options || [])[oi]) {
+      await dbClient.query('ROLLBACK');
+      return await tell('⚠️ That option is not part of this poll any more. Press *🗳️ Vote* to answer it.');
+    }
+
+    poll.votes[qi] = poll.votes[qi] || {};
+    const qv = poll.votes[qi];
+    const picked = ids => (ids || []).includes(userId);
+    const answered = Object.values(qv).some(picked);
+
+    if (q.allowMultiple) {
+      // Adding another choice is not changing your mind, so it is allowed even
+      // when vote changes are off. Taking one back is.
+      if (picked(qv[oi])) {
+        if (!poll.allowRevote) {
+          await dbClient.query('ROLLBACK');
+          return await tell(`🔒 You already picked *${q.options[oi]}*, and the creator turned off vote changes.`);
+        }
+        qv[oi] = (qv[oi] || []).filter(id => id !== userId);
+        note = `Took back your vote for *${q.options[oi]}*.`;
+      } else {
+        qv[oi] = [...(qv[oi] || []), userId];
+        note = `Added your vote for *${q.options[oi]}*.`;
+      }
+    } else {
+      if (answered && !poll.allowRevote) {
+        await dbClient.query('ROLLBACK');
+        return await tell('🔒 You have already answered this question, and the creator turned off vote changes.');
+      }
+      if (picked(qv[oi])) {
+        await dbClient.query('ROLLBACK');
+        return await tell(`✅ You already voted for *${q.options[oi]}* - nothing changed.`);
+      }
+      Object.keys(qv).forEach(k => { qv[k] = (qv[k] || []).filter(id => id !== userId); });
+      qv[oi] = [...(qv[oi] || []), userId];
+      note = `Your vote for *${q.options[oi]}* is in.`;
+    }
+
+    const voteTimestamps = poll.voteTimestamps || {};
+    voteTimestamps[userId] = new Date().toISOString();
+    await dbClient.query(
+      'UPDATE polls SET votes=$1, vote_timestamps=$2 WHERE id=$3',
+      [JSON.stringify(poll.votes), JSON.stringify(voteTimestamps), pollId]
+    );
+    await dbClient.query('COMMIT');
+    poll.voteTimestamps = voteTimestamps;
+    finalPoll = poll;
+  } catch (err) {
+    try { await dbClient.query('ROLLBACK'); } catch (e) { /* transaction already gone */ }
+    console.error('vote_option transaction error:', err.message);
+    return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
+  } finally {
+    dbClient.release();
+  }
+
+  // A press answers one question. If the poll has any that a button cannot
+  // express, say so rather than letting someone think they are done.
+  const needsModal = (finalPoll.questions || []).some(qq => !isInlineVotable(qq.type));
+  await tell(`✅ ${note}${needsModal ? '  This poll also has questions that need the *🗳️ Vote* button.' : ''}`);
   await updatePollMessage(client, finalPoll);
 });
 
