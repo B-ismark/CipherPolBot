@@ -173,7 +173,7 @@ async function awaitSchema(timeoutMs) {
 }
 
 const AUTO_CLOSE_SWEEP_MS = 60 * 1000;
-const KEEPALIVE_MS = 10 * 60 * 1000;
+const KEEPALIVE_MS = 5 * 60 * 1000;
 
 // Clients the sweeper builds for itself, keyed by team. Request handlers get
 // their client from Bolt and never come through here.
@@ -1499,11 +1499,28 @@ function buildQuestion(text, type, optionsRaw, allowMultiple) {
 // happened instead of surfacing the raw API error (or nothing at all).
 const WAKE_UP_MESSAGE = '⏳ The bot was waking up and missed the 3-second window Slack allows. Run the command again - it will open straight away.';
 
+// Same cause, better offer: a slash command also hands us a response_url that
+// stays good for 30 minutes, long after the 3-second trigger_id died. So the
+// apology can land in the channel they typed in, carrying a button - and a
+// button click arrives with a fresh trigger_id, which is the whole point.
+function wakeUpPrompt(channelId) {
+  return {
+    response_type: 'ephemeral',
+    text: WAKE_UP_MESSAGE,
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: '⏳ I was asleep and missed the 3-second window Slack allows. Press the button - it opens straight away.' } },
+      { type: 'actions', elements: [
+        { type: 'button', text: { type: 'plain_text', text: '📊  Open poll builder', emoji: true }, action_id: 'open_poll_creator', value: channelId || '', style: 'primary' }
+      ] }
+    ]
+  };
+}
+
 function isExpiredTrigger(err) {
   return `${err.data?.error || err.message}`.includes('expired_trigger_id');
 }
 
-async function handleNewPoll({ ack, body, client }) {
+async function handleNewPoll({ ack, body, client, respond }) {
   await ack();
   try {
     // Checked here as well as at the till, because the till is the Post button
@@ -1518,11 +1535,42 @@ async function handleNewPoll({ ack, body, client }) {
     });
   } catch (err) {
     console.error('/newpoll error:', err);
-    await dmUser(client, body.user_id, isExpiredTrigger(err)
-      ? WAKE_UP_MESSAGE
-      : `❌ Could not open poll creator: ${err.message}`);
+    if (isExpiredTrigger(err)) {
+      try {
+        return await respond(wakeUpPrompt(body.channel_id));
+      } catch (e) {
+        // response_url can fail too (30 minutes gone, or five uses spent). The
+        // DM is the floor: they hear something either way.
+        console.warn('wake-up prompt failed:', e.message);
+      }
+      return await dmUser(client, body.user_id, WAKE_UP_MESSAGE);
+    }
+    await dmUser(client, body.user_id, `❌ Could not open poll creator: ${err.message}`);
   }
 }
+
+// The button on that prompt. It opens the same modal the command would have,
+// prefilled with the channel the command was typed in - not the one this click
+// came from, which for an ephemeral is the same thing anyway.
+app.action('open_poll_creator', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  try {
+    if (!canCreatePoll(userId)) {
+      return await dmUser(client, userId, `⏳ ${pollCreationLimitMessage()}`);
+    }
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildCreationModal({ channelId: action.value || body.channel?.id || userId, userId, savedQuestions: [] })
+    });
+    // The prompt has done its job; clear it so the channel is not left with a
+    // stale apology and a button that now opens a second modal.
+    try { await respond({ delete_original: true }); } catch (e) { /* already gone */ }
+  } catch (err) {
+    console.error('open_poll_creator error:', err);
+    await dmUser(client, userId, `❌ Could not open poll creator: ${err.message}`);
+  }
+});
 
 app.command('/newpoll', handleNewPoll);
 app.command('/poll', handleNewPoll);

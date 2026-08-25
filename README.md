@@ -202,9 +202,17 @@ button on the poll itself.
 A sleeping instance cannot answer in time. Slack gives a slash command **3 seconds**
 to respond, and invalidates its `trigger_id` after **3 seconds** — while waking a
 cold container takes tens of seconds. You get `operation_timeout` from Slackbot,
-then `expired_trigger_id` from the app, and the command has to be run again.
+then `expired_trigger_id` from the app.
 
-Two layers, and you want both:
+That is survivable rather than silent: a slash command also hands the app a
+`response_url` good for **30 minutes**, long after the `trigger_id` is dead. So
+`/newpoll` answers the nap in the channel you typed in, with an **Open poll
+builder** button - a button click carries a fresh `trigger_id`, so it opens
+immediately and no question has to be retyped. One extra click, not a lost
+command. Only `/newpoll` and `/poll` get this; the global shortcut has no
+`response_url`, so it falls back to a DM.
+
+Better still is not to nap at all. Two layers, and you want both:
 
 **1. An external monitor — this is the one that matters.** Only an outside request
 can wake a sleeping instance. Point [cron-job.org](https://cron-job.org) or
@@ -265,9 +273,15 @@ because its results view has to be part of the ack, and is told to retry if the 
 still coming up. Once the bot is up, both waits cost nothing measurable.
 
 **2. `KEEPALIVE_URL` — belt and braces.** Set it to that same `/health` URL and the
-bot pings itself every 10 minutes, no third-party account needed. Leave it unset
+bot pings itself every 5 minutes, no third-party account needed. Leave it unset
 locally. It stops a *running* instance from falling asleep, but it cannot wake one
 that already has — which is why layer 1 is not optional.
+
+Two caveats worth knowing before you trust it on its own. It is `sync: false` in
+`render.yaml`, meaning Render will not fill it in for you — an unset variable is
+silently no keepalive at all, and the only symptom is the failing first command.
+And because any gap puts the instance to sleep for good, the interval is 5 minutes
+rather than 10: three chances to miss the 15-minute deadline instead of one.
 
 > On the free plan, staying awake all month uses roughly 730 of the 750 free
 > instance-hours. Fine for one service; if you keep several free services warm in
