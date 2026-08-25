@@ -1665,6 +1665,13 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
 
 app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
   const meta = JSON.parse(view.private_metadata);
+
+  // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll
+  // is several database and API round trips, and on a cold host that overran
+  // the deadline, so the user got "we had trouble connecting" on a poll that
+  // had in fact been created. Clearing the stack leaves no stale modal behind.
+  await ack({ response_action: 'clear' });
+
   try {
     // Same key authorize() resolved this request with, so the auto-close
     // sweeper can find the token again later.
@@ -1674,9 +1681,6 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       teamId: context.teamId ?? body.team?.id ?? view.team_id
     });
     await createAndPostPoll(client, meta, teamId);
-    // Clear entire modal stack so no stale data is visible when user closes
-    await ack({ response_action: 'clear' });
-    // Ephemeral success confirmation in the channel
     const channel = await resolveChannel(client, meta.channelId, meta.userId);
     await client.chat.postEphemeral({
       channel,
@@ -1685,9 +1689,8 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
     });
   } catch (err) {
     console.error('poll_preview_submit error:', err);
-    await ack();
-    const errorMsg = err.message || 'Failed to create poll.';
-    await notifyError(client, meta.userId, `❌ ${errorMsg}`);
+    // The modal is already gone, so the only way left to report this is a DM.
+    await notifyError(client, meta.userId, `❌ ${err.message || 'Failed to create poll.'}`);
   }
 });
 
