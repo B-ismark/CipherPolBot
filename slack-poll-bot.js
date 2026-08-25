@@ -1,15 +1,18 @@
 require('dotenv').config();
 const { App, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
+const { sslOptionFor } = require('./lib/db');
 const { Pool } = require('pg');
 
 // ==================== DATABASE ====================
 
 // TLS is driven by sslmode in DATABASE_URL (use sslmode=verify-full for hosted
-// Postgres). Do not add ssl: { rejectUnauthorized: false } - it would let a MITM
-// read the connection credentials and every vote.
+// Postgres), falling back to verified TLS for a remote host whose URL says
+// nothing - see lib/db.js. Do not add ssl: { rejectUnauthorized: false }: it
+// would let a MITM read the connection credentials and every vote.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: sslOptionFor(process.env.DATABASE_URL),
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
   max: 5

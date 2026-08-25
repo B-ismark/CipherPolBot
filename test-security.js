@@ -19,6 +19,7 @@ const {
 
 const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
+const { sslOptionFor } = require('./lib/db');
 
 const q = (text = 'Q1', options = ['A', 'B']) => ({ text, options });
 
@@ -136,4 +137,21 @@ test('an oauth response maps to the same key, with team null for org-wide', () =
   assert.strictEqual(installationKeyFromOAuth({ team: { id: 'T1' } }), 'T1');
   assert.strictEqual(installationKeyFromOAuth({ is_enterprise_install: true, enterprise: { id: 'E1' }, team: null }), 'E1');
   assert.strictEqual(installationKeyFromOAuth({}), null);
+});
+
+test('a remote database with no sslmode still gets verified TLS', () => {
+  assert.deepStrictEqual(sslOptionFor('postgresql://u:p@db.example.com/app'), { rejectUnauthorized: true });
+});
+
+test('the connection string wins whenever it mentions ssl', () => {
+  assert.strictEqual(sslOptionFor('postgresql://u:p@db.example.com/app?sslmode=verify-full'), undefined);
+  assert.strictEqual(sslOptionFor('postgresql://u:p@db.example.com/app?sslmode=no-verify'), undefined);
+  assert.strictEqual(sslOptionFor('postgresql://u:p@db.example.com/app?ssl=true'), undefined);
+});
+
+test('a local database is left alone, as is a missing or unparseable url', () => {
+  assert.strictEqual(sslOptionFor('postgresql://u:p@localhost:5432/app'), undefined);
+  assert.strictEqual(sslOptionFor('postgresql://u:p@127.0.0.1/app'), undefined);
+  assert.strictEqual(sslOptionFor(undefined), undefined);
+  assert.strictEqual(sslOptionFor('not a url'), undefined);
 });
