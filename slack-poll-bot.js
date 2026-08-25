@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { App, ExpressReceiver } = require('@slack/bolt');
+const { WebClient } = require('@slack/web-api');
 const { Pool } = require('pg');
 
 // ==================== DATABASE ====================
@@ -46,6 +47,9 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS message_refs TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS notify_on_close TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS co_creators TEXT NOT NULL DEFAULT '[]'`);
+  // Needed to pick the right bot token for polls the bot acts on by itself
+  // (the auto-close sweeper). Null on polls created before this column existed.
+  await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS team_id TEXT`);
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS question`).catch(() => {});
   await pool.query(`ALTER TABLE polls DROP COLUMN IF EXISTS options`).catch(() => {});
   await pool.query(`
@@ -59,8 +63,8 @@ async function initDb() {
 
 async function savePoll(poll) {
   await pool.query(`
-    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs, notify_on_close, co_creators)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs, notify_on_close, co_creators, team_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     ON CONFLICT (id) DO UPDATE SET
       title=EXCLUDED.title, description=EXCLUDED.description, questions=EXCLUDED.questions,
       votes=EXCLUDED.votes, anonymous=EXCLUDED.anonymous, allow_revote=EXCLUDED.allow_revote,
@@ -69,7 +73,8 @@ async function savePoll(poll) {
       close_at=EXCLUDED.close_at, vote_timestamps=EXCLUDED.vote_timestamps,
       show_results=EXCLUDED.show_results, order_by_votes=EXCLUDED.order_by_votes,
       message_refs=EXCLUDED.message_refs, notify_on_close=EXCLUDED.notify_on_close,
-      co_creators=EXCLUDED.co_creators
+      co_creators=EXCLUDED.co_creators,
+      team_id=COALESCE(EXCLUDED.team_id, polls.team_id)
   `, [
     poll.id, poll.title, poll.description || '',
     JSON.stringify(poll.questions), JSON.stringify(poll.votes),
@@ -79,7 +84,8 @@ async function savePoll(poll) {
     poll.showResults || 'creator_only', poll.orderByVotes || false,
     JSON.stringify(poll.messageRefs || []),
     JSON.stringify(poll.notifyOnClose || []),
-    JSON.stringify(poll.coCreators || [])
+    JSON.stringify(poll.coCreators || []),
+    poll.teamId || null
   ]);
 }
 
@@ -87,7 +93,7 @@ function rowToPoll(row) {
   return {
     ...row,
     channelId: row.channel_id, messageTs: row.message_ts, createdAt: row.created_at,
-    allowRevote: row.allow_revote, closeAt: row.close_at,
+    allowRevote: row.allow_revote, closeAt: row.close_at, teamId: row.team_id,
     showResults: row.show_results || 'creator_only',
     orderByVotes: row.order_by_votes || false,
     messageRefs: JSON.parse(row.message_refs || '[]'),
@@ -140,19 +146,50 @@ async function closePoll(pollId) {
 
 const AUTO_CLOSE_SWEEP_MS = 60 * 1000;
 
+// Clients the sweeper builds for itself, keyed by team. Request handlers get
+// their client from Bolt and never come through here.
+const teamClients = new Map();
+
+async function clientForPoll(poll) {
+  // Single-workspace deployments have one token for everything.
+  if (process.env.SLACK_BOT_TOKEN) return app.client;
+
+  let teamId = poll.teamId;
+  if (!teamId) {
+    // Polls created before team_id existed: unambiguous if only one workspace
+    // ever installed the bot.
+    const { rows } = await pool.query('SELECT team_id FROM slack_installations LIMIT 2');
+    if (rows.length !== 1) return null;
+    teamId = rows[0].team_id;
+  }
+  if (teamClients.has(teamId)) return teamClients.get(teamId);
+
+  const { rows } = await pool.query('SELECT data FROM slack_installations WHERE team_id = $1', [teamId]);
+  if (!rows.length) return null;
+  const token = JSON.parse(rows[0].data).access_token;
+  if (!token) return null;
+  const client = new WebClient(token);
+  teamClients.set(teamId, client);
+  return client;
+}
+
 // close_at used to be honoured only when someone tried to vote after it passed,
 // so a quiet poll stayed "Active" for ever. The UPDATE is atomic, so a vote
 // holding the row lock cannot be closed twice.
-async function sweepOverduePolls(client) {
+async function sweepOverduePolls() {
   const { rows } = await pool.query(
     "UPDATE polls SET status='closed' WHERE status='active' AND close_at IS NOT NULL AND close_at <= NOW() RETURNING *"
   );
   if (!rows.length) return 0;
   console.log(`⏰ Auto-closed ${rows.length} overdue poll(s)`);
-  if (!client) return rows.length;
   for (const row of rows) {
     const poll = rowToPoll(row);
     try {
+      const client = await clientForPoll(poll);
+      if (!client) {
+        console.warn(`auto-closed ${poll.id} in the database only: no bot token for team ${poll.teamId || 'unknown'}`);
+        continue;
+      }
       await updatePollMessage(client, poll);
       await sendCloseNotifications(client, poll);
     } catch (err) {
@@ -1115,7 +1152,7 @@ function buildPostVoteModal(poll, viewerId = null) {
 
 // ==================== POLL CREATION HELPER ====================
 
-async function createAndPostPoll(client, meta) {
+async function createAndPostPoll(client, meta, teamId = null) {
   const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false } = meta;
 
   // Rate limiting check
@@ -1148,6 +1185,7 @@ async function createAndPostPoll(client, meta) {
     allowRevote: pollSettings.includes('allow_revote'),
     creator: userId,
     channelId,
+    teamId,
     closeAt: closeAt || null,
     showResults,
     orderByVotes,
@@ -1618,7 +1656,7 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
 app.view('poll_preview_submit', async ({ ack, body, view, client }) => {
   const meta = JSON.parse(view.private_metadata);
   try {
-    await createAndPostPoll(client, meta);
+    await createAndPostPoll(client, meta, body.team?.id || body.enterprise?.id || view.team_id || null);
     const title = meta.pollTitle || meta.savedQuestions[0]?.text || 'Poll';
     await ack({ response_action: 'update', view: buildSuccessModal(title) });
   } catch (err) {
@@ -2005,14 +2043,11 @@ async function initDbWithRetry(attempts = 5) {
     process.exit(1);
   }
 
-  // Multi-workspace OAuth installs have no single bot token, and polls do not
-  // record their team, so those deployments close overdue polls in the database
-  // without updating the Slack message.
-  const sweepClient = process.env.SLACK_BOT_TOKEN ? app.client : null;
-  if (!sweepClient) console.warn('⚠️  No SLACK_BOT_TOKEN: overdue polls will close silently');
-  await sweepOverduePolls(sweepClient).catch(err => console.warn('startup sweep failed:', err.message));
+  // The sweeper resolves a bot token per poll, so it works for OAuth installs
+  // too - see clientForPoll.
+  await sweepOverduePolls().catch(err => console.warn('startup sweep failed:', err.message));
   const sweepTimer = setInterval(
-    () => sweepOverduePolls(sweepClient).catch(err => console.warn('auto-close sweep failed:', err.message)),
+    () => sweepOverduePolls().catch(err => console.warn('auto-close sweep failed:', err.message)),
     AUTO_CLOSE_SWEEP_MS
   );
 
