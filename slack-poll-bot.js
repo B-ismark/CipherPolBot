@@ -292,12 +292,20 @@ const app = new App({
 
 app.error(async (err) => console.error('Bolt error:', JSON.stringify(err, null, 2)));
 
+// Slack does not let an app post into a DM between two people: it has no
+// membership there and cannot be given one. So a command run in such a DM is
+// answered in the user's own DM with the bot instead. redirected says whether
+// that substitution happened, so the caller can explain itself - a DM with the
+// bot is also a D channel, and that one needs no explanation.
+async function resolveChannelInfo(client, channelId, userId) {
+  if (!channelId.startsWith('D')) return { channel: channelId, redirected: false };
+  const r = await client.conversations.open({ users: userId });
+  return { channel: r.channel.id, redirected: r.channel.id !== channelId };
+}
+
 async function resolveChannel(client, channelId, userId) {
-  if (channelId.startsWith('D')) {
-    const r = await client.conversations.open({ users: userId });
-    return r.channel.id;
-  }
-  return channelId;
+  const { channel } = await resolveChannelInfo(client, channelId, userId);
+  return channel;
 }
 
 async function notifyError(client, userId, text) {
@@ -1122,14 +1130,17 @@ function buildShareModal(poll) {
           type: 'conversations_select',
           action_id: 'value',
           placeholder: { type: 'plain_text', text: 'Choose a channel...' },
-          filter: { include: ['public', 'private', 'im', 'mpim'], exclude_bot_users: true }
+          // Channels only. An app cannot post into a DM between two people, nor
+          // into a group DM it was never added to, so offering either here would
+          // just be a choice that fails.
+          filter: { include: ['public', 'private'], exclude_bot_users: true }
         }
       },
       {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: 'Votes cast from any channel count toward the same poll.'
+          text: 'Votes cast from any channel count toward the same poll. For a private channel, invite me to it first.'
         }]
       }
     ]
@@ -1225,7 +1236,7 @@ async function createAndPostPoll(client, meta, teamId = null) {
   };
 
   await savePoll(poll);
-  const channel = await resolveChannel(client, channelId, userId);
+  const { channel, redirected } = await resolveChannelInfo(client, channelId, userId);
   const result = await client.chat.postMessage({
     channel,
     text: `📊 ${poll.title}`,
@@ -1235,6 +1246,7 @@ async function createAndPostPoll(client, meta, teamId = null) {
   poll.channelId = channel;
   poll.messageRefs = [{ channelId: channel, messageTs: result.ts }];
   await savePoll(poll);
+  return { poll, channel, redirected };
 }
 
 // ==================== HELPERS ====================
@@ -1713,12 +1725,42 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       enterpriseId: context.enterpriseId ?? body.enterprise?.id,
       teamId: context.teamId ?? body.team?.id ?? view.team_id
     });
-    await createAndPostPoll(client, meta, teamId);
-    const channel = await resolveChannel(client, meta.channelId, meta.userId);
-    await client.chat.postEphemeral({
+    const { poll, channel, redirected } = await createAndPostPoll(client, meta, teamId);
+
+    if (!redirected) {
+      await client.chat.postEphemeral({
+        channel,
+        user: meta.userId,
+        text: `✅ *${poll.title}* has been posted!`
+      });
+      return;
+    }
+
+    // A real message rather than an ephemeral one: the button has to survive a
+    // reload, and opening the share modal here instead would race Slack's
+    // 3-second trigger_id, which the poll we just posted has already spent.
+    await client.chat.postMessage({
       channel,
-      user: meta.userId,
-      text: `✅ *${meta.pollTitle || 'Your poll'}* has been posted!`
+      text: `✅ ${poll.title} was posted here - Slack does not let apps post into a DM between two people.`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `✅ *${poll.title}* was posted here, just above.\n\nSlack does not let an app post into a DM between two people, so it could not go into the conversation you ran the command from. Send it wherever you need it:`
+          }
+        },
+        {
+          type: 'actions',
+          elements: [
+            { type: 'button', text: { type: 'plain_text', text: '📤  Post to a channel', emoji: true }, style: 'primary', action_id: 'share_poll', value: poll.id }
+          ]
+        },
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: 'Votes cast from anywhere you post it all count toward this one poll.' }]
+        }
+      ]
     });
   } catch (err) {
     console.error('poll_preview_submit error:', err);
@@ -1790,7 +1832,11 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(updatedRefs), pollId]);
   } catch (err) {
     console.error('share_poll_submit error:', err);
-    await notifyError(client, body.user.id, `❌ Failed to share poll: ${err.message}`);
+    const code = err.data?.error || err.message;
+    const cannotPost = `${code}`.includes('channel_not_found') || `${code}`.includes('not_in_channel');
+    await notifyError(client, body.user.id, cannotPost
+      ? '❌ I could not post there. If it is a private channel, invite me to it first (`/invite @Cipher Pol`) and try again.'
+      : `❌ Failed to share poll: ${err.message}`);
   }
 });
 
