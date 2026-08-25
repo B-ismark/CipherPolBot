@@ -235,8 +235,12 @@ const {
   MAX_POLL_TITLE_LENGTH,
   MAX_POLL_DESCRIPTION_LENGTH,
   MAX_NOTIFY_SUBSCRIBERS_PER_POLL,
+  MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR,
   validatePollInputs,
+  canCreatePoll,
+  pollCreationLimitMessage,
   checkPollCreationRateLimit,
+  checkShareRateLimit,
   checkNotificationRateLimit
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
@@ -451,17 +455,14 @@ function describeFailures(failures) {
   return `Could not post to ${list}.${needsInvite ? ' For a private channel, invite me to it first (\`/invite @Cipher Pol\`).' : ''}`;
 }
 
-async function notifyError(client, userId, text) {
+// The way to reach one person when there is no channel to answer in, or when
+// the answer should not be in one. Every caller supplies its own marker, so this
+// carries good news and bad alike.
+async function dmUser(client, userId, text) {
   try {
     const r = await client.conversations.open({ users: userId });
     await client.chat.postMessage({ channel: r.channel.id, text });
-  } catch (e) { console.error('notifyError failed:', e.message); }
-}
-
-// Same delivery as notifyError - a DM to one person - for messages that are not
-// errors.
-async function dmUser(client, userId, text) {
-  return notifyError(client, userId, text);
+  } catch (e) { console.error('dmUser failed:', e.message); }
 }
 
 function buildNoticeModal(title, text) {
@@ -1261,7 +1262,7 @@ function buildPollBlocks(poll) {
         { type: 'button', text: { type: 'plain_text', text: '📊  View Results', emoji: true }, style: 'primary', action_id: 'view_results_modal', value: poll.id },
         // Posts the poll message (results included once closed) into another
         // channel - deliberately open to any member, unlike /poll-share.
-        { type: 'button', text: { type: 'plain_text', text: '📤  Post to Channel', emoji: true }, action_id: 'share_poll', value: poll.id }
+        { type: 'button', text: { type: 'plain_text', text: '📤  Send', emoji: true }, action_id: 'share_poll', value: poll.id }
       ]
     : [
         {
@@ -1271,7 +1272,7 @@ function buildPollBlocks(poll) {
           action_id: 'open_vote_modal',
           value: poll.id
         },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Share', emoji: true }, action_id: 'share_poll', value: poll.id },
+        { type: 'button', text: { type: 'plain_text', text: '📤  Send', emoji: true }, action_id: 'share_poll', value: poll.id },
         // Everyone sees this button - Slack cannot show one person a different
         // version of a message - so the handler turns away anyone who is not
         // running the poll. Without it, closing a poll that was created without
@@ -1302,7 +1303,7 @@ function buildShareModal(poll) {
   return {
     type: 'modal',
     callback_id: 'share_poll_submit',
-    title: { type: 'plain_text', text: 'Share Poll' },
+    title: { type: 'plain_text', text: 'Send Poll' },
     submit: { type: 'plain_text', text: '📤  Send Poll' },
     close: { type: 'plain_text', text: 'Cancel' },
     private_metadata: JSON.stringify({ pollId: poll.id }),
@@ -1426,9 +1427,15 @@ async function createAndPostPoll(client, meta, teamId = null) {
 
   const { posted, failures: postFailures } = await postPollTo(client, poll, targets);
   const allFailures = [...failures, ...postFailures];
-  // Every destination failing is a failed poll; some of them failing is not, so
-  // the poll stands and the creator is told which ones missed.
-  if (!posted.length) throw new Error(describeFailures(allFailures));
+
+  // Nothing landed. The poll is not deleted: every question the creator just
+  // typed is in that row, the usual cause is fixable (a private channel the app
+  // has not been invited to yet), and /polls-list can send it once it is fixed.
+  // Throwing here used to leave the same row behind anyway, just without
+  // telling anyone it was there.
+  if (!posted.length) {
+    return { poll, channel: null, posted: [], failures: allFailures, redirected, usedFallback, nowhere: true };
+  }
 
   // A poll its own creator cannot vote in is broken, not a preference. Sending
   // it only to other people left them with nothing to click - the confirmation
@@ -1499,13 +1506,19 @@ function isExpiredTrigger(err) {
 async function handleNewPoll({ ack, body, client }) {
   await ack();
   try {
+    // Checked here as well as at the till, because the till is the Post button
+    // on the last screen - discovering the cap there costs the creator every
+    // question they just typed. canCreatePoll only looks; it does not spend.
+    if (!canCreatePoll(body.user_id)) {
+      return await dmUser(client, body.user_id, `⏳ ${pollCreationLimitMessage()}`);
+    }
     await client.views.open({
       trigger_id: body.trigger_id,
       view: buildCreationModal({ channelId: body.channel_id, userId: body.user_id, savedQuestions: [] })
     });
   } catch (err) {
     console.error('/newpoll error:', err);
-    await notifyError(client, body.user_id, isExpiredTrigger(err)
+    await dmUser(client, body.user_id, isExpiredTrigger(err)
       ? WAKE_UP_MESSAGE
       : `❌ Could not open poll creator: ${err.message}`);
   }
@@ -1517,13 +1530,16 @@ app.command('/poll', handleNewPoll);
 app.shortcut('create_poll', async ({ ack, shortcut, client }) => {
   await ack();
   try {
+    if (!canCreatePoll(shortcut.user.id)) {
+      return await dmUser(client, shortcut.user.id, `⏳ ${pollCreationLimitMessage()}`);
+    }
     await client.views.open({
       trigger_id: shortcut.trigger_id,
       view: buildCreationModal({ channelId: shortcut.channel?.id || shortcut.user.id, userId: shortcut.user.id, savedQuestions: [] })
     });
   } catch (err) {
     console.error('create_poll shortcut error:', err);
-    await notifyError(client, shortcut.user.id, isExpiredTrigger(err)
+    await dmUser(client, shortcut.user.id, isExpiredTrigger(err)
       ? WAKE_UP_MESSAGE
       : `❌ Could not open poll creator: ${err.message}`);
   }
@@ -1542,7 +1558,7 @@ app.command('/poll-results', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({ channel, user: userId, text: `📊 Results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Poll Results', userId) });
   } catch (err) {
     console.error('/poll-results error:', err);
-    await notifyError(client, body.user_id, `❌ /poll-results failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /poll-results failed: ${err.message}`);
   }
 });
 
@@ -1552,7 +1568,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
     const pollId = body.text.trim().replace(/`/g, '');
-    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID`' });
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID` - posts the *results* into this channel. To send another copy of the poll itself, press *📤 Send* on the poll.' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
@@ -1566,7 +1582,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
     console.error('/poll-share error:', err);
-    await notifyError(client, body.user_id, `❌ /poll-share failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /poll-share failed: ${err.message}`);
   }
 });
 
@@ -1605,7 +1621,7 @@ app.command('/polls-list', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
   } catch (err) {
     console.error('/polls-list error:', err);
-    await notifyError(client, body.user_id, `❌ /polls-list failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /polls-list failed: ${err.message}`);
   }
 });
 
@@ -1635,7 +1651,7 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
   } catch (err) {
     console.error('/polls-archive error:', err);
-    await notifyError(client, body.user_id, `❌ /polls-archive failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /polls-archive failed: ${err.message}`);
   }
 });
 
@@ -1704,7 +1720,7 @@ app.command('/poll-close', async ({ ack, body, client }) => {
     await finalizePollClose(client, poll, channel);
   } catch (err) {
     console.error('/poll-close error:', err);
-    await notifyError(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
   }
 });
 
@@ -1721,7 +1737,7 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
     await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
   } catch (err) {
     console.error('/poll-edit error:', err);
-    await notifyError(client, body.user_id, `❌ /poll-edit failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /poll-edit failed: ${err.message}`);
   }
 });
 
@@ -1792,7 +1808,7 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     });
   } catch (err) {
     console.error('/poll-export error:', err);
-    await notifyError(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
+    await dmUser(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
   }
 });
 
@@ -1961,7 +1977,17 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       enterpriseId: context.enterpriseId ?? body.enterprise?.id,
       teamId: context.teamId ?? body.team?.id ?? view.team_id
     });
-    const { poll, posted, failures, redirected, usedFallback } = await createAndPostPoll(client, meta, teamId);
+    const { poll, posted, failures, redirected, usedFallback, nowhere } = await createAndPostPoll(client, meta, teamId);
+
+    if (nowhere) {
+      // A DM, not an ephemeral: this needs acting on later, and an ephemeral is
+      // gone on the next reload.
+      return await dmUser(client, meta.userId, [
+        `❌ *${poll.title}* could not be posted anywhere.`,
+        `⚠️ ${describeFailures(failures)}`,
+        `Nothing you typed is lost - the poll is saved. Fix the reason above, then run \`/polls-list\` and press *📤 Send*.`
+      ].join('\n\n'));
+    }
 
     const lines = [`✅ *${poll.title}* was posted to ${posted.map(p => p.label).join(', ')}.`];
 
@@ -1998,7 +2024,7 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
   } catch (err) {
     console.error('poll_preview_submit error:', err);
     // The modal is already gone, so the only way left to report this is a DM.
-    await notifyError(client, meta.userId, `❌ ${err.message || 'Failed to create poll.'}`);
+    await dmUser(client, meta.userId, `❌ ${err.message || 'Failed to create poll.'}`);
   }
 });
 
@@ -2061,6 +2087,13 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     // poll should be posted a second time where it already is.
     const { targets, failures } = await resolveDestinations(client, { channelIds, userIds }, null, actor);
 
+    // Anyone who can see a poll can send it on - that is the point - so this is
+    // the only thing between one member and every channel in the workspace.
+    // Counted per destination, since ten at a time is the abuse shape.
+    if (targets.length && !await checkShareRateLimit(actor, targets.length)) {
+      return await dmUser(client, actor, `⏳ You have shared polls to ${MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR} places in the last hour, which is the limit. Try again later.`);
+    }
+
     // One poll with two messages in the same place is two things to keep in
     // step on every vote, and reads as a duplicate to everyone there.
     const already = new Set((poll.messageRefs || []).map(r => r.channelId));
@@ -2085,7 +2118,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     await dmUser(client, actor, parts.join('\n\n'));
   } catch (err) {
     console.error('share_poll_submit error:', err);
-    await notifyError(client, actor, `❌ Failed to share poll: ${err.message}`);
+    await dmUser(client, actor, `❌ Failed to share poll: ${err.message}`);
   }
 });
 
@@ -2356,7 +2389,7 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
     await finalizePollClose(client, poll, channel);
   } catch (err) {
     console.error('close_poll error:', err);
-    await notifyError(client, userId, isExpiredTrigger(err)
+    await dmUser(client, userId, isExpiredTrigger(err)
       ? WAKE_UP_MESSAGE
       : `❌ Could not close poll: ${err.message}`);
   }
@@ -2374,12 +2407,12 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
     // Checked again here, not only where the modal was opened: co-creators can
     // be removed, and this is the step that actually ends the poll.
     if (!isCreatorOrCoCreator(poll, userId)) {
-      return await notifyError(client, userId, `❌ Only <@${poll.creator}> can close this poll.`);
+      return await dmUser(client, userId, `❌ Only <@${poll.creator}> can close this poll.`);
     }
     await finalizePollClose(client, poll, channelId);
   } catch (err) {
     console.error('poll_close_confirm error:', err);
-    await notifyError(client, userId, `❌ Failed to close poll: ${err.message}`);
+    await dmUser(client, userId, `❌ Failed to close poll: ${err.message}`);
   }
 });
 

@@ -12,8 +12,11 @@ const {
   MAX_QUESTIONS_PER_POLL,
   MAX_POLLS_PER_USER_PER_DAY,
   MAX_NOTIFICATIONS_PER_USER_PER_HOUR,
+  MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR,
   validatePollInputs,
+  canCreatePoll,
   checkPollCreationRateLimit,
+  checkShareRateLimit,
   checkNotificationRateLimit
 } = require('./lib/validation');
 
@@ -176,4 +179,56 @@ test('a sustained outage fails the check so the instance is recycled', () => {
 test('an instance still creating its schema is never reported ready', () => {
   assert.deepStrictEqual(healthStatus({ schemaReady: false, dbOk: true }), { httpStatus: 503, status: 'degraded' });
   assert.deepStrictEqual(healthStatus({ schemaReady: false, dbOk: false }), { httpStatus: 503, status: 'degraded' });
+});
+
+// ---- the door check must not spend what the till collects ----------------
+
+test('opening the poll creator does not use up a poll', async () => {
+  const user = 'U_door_check';
+  for (let i = 0; i < 50; i++) {
+    assert.strictEqual(canCreatePoll(user), true, 'looking is free, however often');
+  }
+  for (let i = 0; i < MAX_POLLS_PER_USER_PER_DAY; i++) {
+    await checkPollCreationRateLimit(user);
+  }
+  assert.strictEqual(canCreatePoll(user), false, 'and the cap still arrives on time');
+  await assert.rejects(() => checkPollCreationRateLimit(user), /maximum of/);
+});
+
+test('the door check and the cap agree on the boundary', async () => {
+  const user = 'U_boundary';
+  for (let i = 0; i < MAX_POLLS_PER_USER_PER_DAY - 1; i++) {
+    await checkPollCreationRateLimit(user);
+  }
+  assert.strictEqual(canCreatePoll(user), true, 'one left means one left');
+  await checkPollCreationRateLimit(user);
+  assert.strictEqual(canCreatePoll(user), false);
+});
+
+// ---- sharing is what any member can do, so it is what needs a ceiling ----
+
+test('sharing is capped per destination, not per share', async () => {
+  const user = 'U_sharer';
+  // Ten destinations at a time is the abuse shape, so ten must cost ten.
+  assert.strictEqual(await checkShareRateLimit(user, 10), true);
+  assert.strictEqual(await checkShareRateLimit(user, 10), true);
+  assert.strictEqual(await checkShareRateLimit(user, 10), true);
+  assert.strictEqual(
+    await checkShareRateLimit(user, 1), false,
+    `three shares of ten spend the whole ${MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR}-destination hour`
+  );
+});
+
+test('a share too big for the remaining budget spends none of it', async () => {
+  const user = 'U_partial';
+  await checkShareRateLimit(user, MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR - 2);
+  assert.strictEqual(await checkShareRateLimit(user, 5), false, 'refused, not truncated');
+  assert.strictEqual(await checkShareRateLimit(user, 2), true, 'and the refusal cost nothing');
+});
+
+test('one person hitting the share cap does not gag anyone else', async () => {
+  const loud = 'U_loud', quiet = 'U_quiet';
+  await checkShareRateLimit(loud, MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR);
+  assert.strictEqual(await checkShareRateLimit(loud, 1), false);
+  assert.strictEqual(await checkShareRateLimit(quiet, 1), true);
 });
