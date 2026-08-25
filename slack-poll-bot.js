@@ -1241,14 +1241,6 @@ function buildPollBlocks(poll) {
     poll.closeAt && !isClosed ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
   ].filter(Boolean);
 
-  const hasAnyVotes = participants > 0;
-
-  const voteLabel = hasAnyVotes && poll.allowRevote
-    ? '🔄  Change Vote'
-    : participants > 0
-      ? `🗳️  Vote  ·  ${participants} voted`
-      : '🗳️  Vote';
-
   // Closed poll: view results + share; Active poll: vote + share
   const actionButtons = isClosed
     ? [
@@ -1260,7 +1252,7 @@ function buildPollBlocks(poll) {
     : [
         {
           type: 'button',
-          text: { type: 'plain_text', text: voteLabel, emoji: true },
+          text: { type: 'plain_text', text: '🗳️  Vote', emoji: true },
           style: 'primary',
           action_id: 'open_vote_modal',
           value: poll.id
