@@ -586,7 +586,7 @@ function buildCreationModal(meta, errorMsg = null) {
         type: 'input', block_id: 'poll_description',
         label: { type: 'plain_text', text: 'Description' },
         optional: true,
-        hint: { type: 'plain_text', text: 'Supports *bold*, _italic_, and `code` formatting' },
+        hint: { type: 'plain_text', text: 'Markup stays literal here: *bold*, _italic_ and `code` render once the poll is posted' },
         element: {
           type: 'plain_text_input', action_id: 'value', multiline: true,
           placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
@@ -667,6 +667,7 @@ function buildEditModal(poll, errorMsg = null) {
         type: 'input', block_id: 'edit_description',
         label: { type: 'plain_text', text: 'Description' },
         optional: true,
+        hint: { type: 'plain_text', text: 'Markup stays literal here: *bold*, _italic_ and `code` render once the poll is posted' },
         element: {
           type: 'plain_text_input', action_id: 'value', multiline: true,
           placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
