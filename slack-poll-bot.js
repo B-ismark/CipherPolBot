@@ -1046,6 +1046,15 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null) {
   ];
 }
 
+// Shown only to the creator: the id, and the commands that need it.
+function pollAdminHint(poll) {
+  return [
+    `ID: \`${poll.id}\``,
+    `\`/poll-close ${poll.id}\``,
+    `\`/poll-export ${poll.id}\``
+  ].join('  ·  ');
+}
+
 function buildPollBlocks(poll) {
   const questions = poll.questions || [];
   const isClosed  = poll.status === 'closed';
@@ -1094,11 +1103,11 @@ function buildPollBlocks(poll) {
     ...questions.flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll)),
     { type: 'actions', elements: actionButtons },
     {
+      // The id and its commands used to sit here, on a message the whole
+      // channel reads, when only the creator has any use for them. They are
+      // sent privately when the poll is created, and `/polls-list` has them.
       type: 'context',
-      elements: [{
-        type: 'mrkdwn',
-        text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`  ·  \`/poll-share ${poll.id}\`  ·  \`/poll-export ${poll.id}\``
-      }]
+      elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>` }]
     }
   ];
 }
@@ -1731,7 +1740,11 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       await client.chat.postEphemeral({
         channel,
         user: meta.userId,
-        text: `✅ *${poll.title}* has been posted!`
+        text: `✅ *${poll.title}* has been posted!`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `✅ *${poll.title}* has been posted!` } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: pollAdminHint(poll) }] }
+        ]
       });
       return;
     }
@@ -1759,7 +1772,8 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
         {
           type: 'context',
           elements: [{ type: 'mrkdwn', text: 'Votes cast from anywhere you post it all count toward this one poll.' }]
-        }
+        },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: pollAdminHint(poll) }] }
       ]
     });
   } catch (err) {
