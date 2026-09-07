@@ -111,23 +111,6 @@ function rowToPoll(row) {
   };
 }
 
-function getAllVoters(poll) {
-  const voters = new Set();
-  Object.entries(poll.votes).forEach(([qi, qv]) => {
-    const q = poll.questions[parseInt(qi)];
-    if (!q) return;
-    if (q.type === 'open_ended' || q.type === 'ranking') {
-      Object.keys(qv).forEach(uid => voters.add(uid));
-    } else if (q.type === 'likert') {
-      Object.values(qv).forEach(ratings =>
-        Object.values(ratings).forEach(uids => uids.forEach(uid => voters.add(uid)))
-      );
-    } else {
-      Object.values(qv).forEach(uids => uids.forEach(uid => voters.add(uid)));
-    }
-  });
-  return voters;
-}
 
 async function getPoll(id) {
   const { rows } = await pool.query('SELECT * FROM polls WHERE id = $1', [id]);
@@ -241,13 +224,22 @@ const {
   pollCreationLimitMessage,
   checkPollCreationRateLimit,
   checkShareRateLimit,
-  checkNotificationRateLimit
+  checkNotificationRateLimit,
+  draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { installationKey, installationKeyFromOAuth } = require('./lib/install');
+const { getAllVoters, pollMessageRefs } = require('./lib/poll');
 const {
-  MAX_DESTINATIONS, normalizeDestinations, assertDestinationLimit, dedupeTargets
-} = require('./lib/destinations');
+  readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
+  buildOptionsModal, buildEditModal, buildPreviewModal, METADATA_FULL, readCurrentQuestion,
+  readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
+  buildQuestion, buildVoteModal, isInlineVotable, pollAdminHint, buildPollBlocks,
+  buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
+  buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv
+} = require('./lib/views');
+const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
+const { installationKey, installationKeyFromOAuth } = require('./lib/install');
+const { normalizeDestinations, assertDestinationLimit, dedupeTargets } = require('./lib/destinations');
 
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
@@ -386,54 +378,8 @@ function toMessageRefs(posted) {
   return posted.map(({ channelId, messageTs }) => ({ channelId, messageTs }));
 }
 
-// The two pickers, shared by the last step of poll creation and the Share modal.
-// Kept together because the pair only makes sense as a pair: an app cannot post
-// into a DM between two people, so a person is not a conversation to choose -
-// they are a user id to open a DM with.
-function destinationBlocks({ channels = [], users = [], channelsLabel = 'Channels', peopleHint } = {}) {
-  return [
-    {
-      type: 'input', block_id: 'poll_dest_channels',
-      label: { type: 'plain_text', text: channelsLabel },
-      optional: true,
-      element: {
-        type: 'multi_conversations_select', action_id: 'value',
-        placeholder: { type: 'plain_text', text: 'Pick channels...' },
-        max_selected_items: MAX_DESTINATIONS,
-        filter: { include: ['public', 'private'] },
-        ...(channels.length ? { initial_conversations: channels } : {})
-      }
-    },
-    {
-      type: 'input', block_id: 'poll_dest_users',
-      label: { type: 'plain_text', text: 'People' },
-      optional: true,
-      hint: { type: 'plain_text', text: peopleHint || 'Each person gets the poll in their own DM with me' },
-      element: {
-        type: 'multi_users_select', action_id: 'value',
-        placeholder: { type: 'plain_text', text: 'Pick people...' },
-        max_selected_items: MAX_DESTINATIONS,
-        ...(users.length ? { initial_users: users } : {})
-      }
-    }
-  ];
-}
 
-// What the pickers came back with. Both blocks are optional, so both can be
-// absent from the submission entirely.
-function readDestinations(values) {
-  return {
-    destChannels: values?.poll_dest_channels?.value?.selected_conversations || [],
-    destUsers:    values?.poll_dest_users?.value?.selected_users || []
-  };
-}
 
-// The conversation a command was run in, if it is one the app could post a poll
-// into. A DM is not: the picker cannot offer it and the app cannot post there,
-// so it is left unset and the fallback in resolveDestinations handles it.
-function prefillableChannel(channelId) {
-  return /^[CG]/.test(channelId || '') ? [channelId] : [];
-}
 
 // Whether the poll landed somewhere its creator can read and vote in.
 //
@@ -465,966 +411,68 @@ async function dmUser(client, userId, text) {
   } catch (e) { console.error('dmUser failed:', e.message); }
 }
 
-function buildNoticeModal(title, text) {
-  return {
-    type: 'modal',
-    title: { type: 'plain_text', text: title },
-    close: { type: 'plain_text', text: 'Close' },
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }]
-  };
-}
 
 // ==================== CONSTANTS ====================
 
-// Slack rejects oversized messages, so long lists are capped and say so.
-const POLL_LIST_PAGE_SIZE = 20;
 
-function truncationNote(total, shownCount) {
-  if (total <= shownCount) return [];
-  return [{
-    type: 'context',
-    elements: [{ type: 'mrkdwn', text: `Showing ${shownCount} of ${total} - close old polls to shorten this list.` }]
-  }];
-}
 
-const OPTION_EMOJIS = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
 
-const QUESTION_TYPES = [
-  { value: 'multiple_choice', label: 'Multiple choice' },
-  { value: 'yes_no',          label: 'Yes / No' },
-  { value: 'agree_disagree',  label: 'Agree / Disagree' },
-  { value: 'scale_5',         label: '1-to-5 scale' },
-  { value: 'scale_10',        label: '1-to-10 scale' },
-  { value: 'nps',             label: 'NPS (0–10)' },
-  { value: 'likert',          label: 'Likert matrix' },
-  { value: 'ranking',         label: 'Ranking' },
-  { value: 'open_ended',      label: 'Open ended' }
-];
 
-const QUESTION_TYPE_ICONS = {
-  multiple_choice: '📋', yes_no: '✅', agree_disagree: '⚖️',
-  scale_5: '⭐', scale_10: '🔢', nps: '📈',
-  likert: '📊', ranking: '🏅', open_ended: '💬'
-};
 
-const LIKERT_SCALE = [
-  { label: '1 — Strongly Disagree', value: '0' },
-  { label: '2 — Disagree',          value: '1' },
-  { label: '3 — Neutral',           value: '2' },
-  { label: '4 — Agree',             value: '3' },
-  { label: '5 — Strongly Agree',    value: '4' }
-];
 
-const AUTO_OPTION_TYPES = ['yes_no', 'agree_disagree', 'scale_5', 'scale_10', 'nps', 'open_ended'];
 
-function getAutoOptions(type) {
-  switch (type) {
-    case 'yes_no':         return ['Yes', 'No'];
-    case 'agree_disagree': return ['Strongly Agree', 'Agree', 'Neutral', 'Disagree', 'Strongly Disagree'];
-    case 'scale_5':        return ['1', '2', '3', '4', '5'];
-    case 'scale_10':       return ['1','2','3','4','5','6','7','8','9','10'];
-    case 'nps':            return ['0','1','2','3','4','5','6','7','8','9','10'];
-    case 'open_ended':     return [];
-    default:               return [];
-  }
-}
 
-function getTypeLabel(type) {
-  return QUESTION_TYPES.find(t => t.value === type)?.label || type;
-}
 
-function getTypeIcon(type) {
-  return QUESTION_TYPE_ICONS[type] || '❓';
-}
 
-function parseOptions(raw) {
-  const sep = raw.includes('\n') ? '\n' : ',';
-  return raw.split(sep).map(o => o.trim()).filter(Boolean);
-}
 
 // ==================== MODAL BUILDERS ====================
 
-// Grouped options for question type picker (Hick's Law — scannable categories)
-const QUESTION_TYPE_GROUPS = [
-  {
-    label: { type: 'plain_text', text: 'Basic' },
-    options: [
-      { text: { type: 'plain_text', text: '📋 Multiple choice' }, value: 'multiple_choice' },
-      { text: { type: 'plain_text', text: '✅ Yes / No' },        value: 'yes_no' },
-      { text: { type: 'plain_text', text: '⚖️ Agree / Disagree' }, value: 'agree_disagree' }
-    ]
-  },
-  {
-    label: { type: 'plain_text', text: 'Scales' },
-    options: [
-      { text: { type: 'plain_text', text: '⭐ 1-to-5 scale' },  value: 'scale_5' },
-      { text: { type: 'plain_text', text: '🔢 1-to-10 scale' }, value: 'scale_10' },
-      { text: { type: 'plain_text', text: '📈 NPS (0–10)' },    value: 'nps' }
-    ]
-  },
-  {
-    label: { type: 'plain_text', text: 'Advanced' },
-    options: [
-      { text: { type: 'plain_text', text: '📊 Likert matrix' }, value: 'likert' },
-      { text: { type: 'plain_text', text: '🏅 Ranking' },       value: 'ranking' },
-      { text: { type: 'plain_text', text: '💬 Open ended' },    value: 'open_ended' }
-    ]
-  }
-];
-
-function findTypeOption(type) {
-  for (const group of QUESTION_TYPE_GROUPS) {
-    const opt = group.options.find(o => o.value === type);
-    if (opt) return opt;
-  }
-  return QUESTION_TYPE_GROUPS[0].options[0];
-}
-
-function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}) {
-  const needsOptions = !AUTO_OPTION_TYPES.includes(questionType);
-
-  const blocks = [
-    {
-      type: 'input',
-      block_id: `q_text_${qNum}`,
-      label: { type: 'plain_text', text: 'Question' },
-      element: {
-        type: 'plain_text_input',
-        action_id: 'value',
-        placeholder: { type: 'plain_text', text: 'Write your question...' },
-        ...(restore.text ? { initial_value: restore.text } : {})
-      }
-    },
-    {
-      type: 'input',
-      block_id: `q_type_${qNum}`,
-      label: { type: 'plain_text', text: 'Question type' },
-      dispatch_action: true,
-      element: {
-        type: 'static_select',
-        action_id: 'question_type_changed',
-        option_groups: QUESTION_TYPE_GROUPS,
-        initial_option: findTypeOption(questionType)
-      }
-    }
-  ];
-
-  if (needsOptions) {
-    const isLikert  = questionType === 'likert';
-    const isRanking = questionType === 'ranking';
-    const optLabel  = isLikert  ? 'Statements to rate (one per line)'
-                    : isRanking ? 'Items to rank (one per line)'
-                    : 'Answer choices';
-    const optHint   = isLikert  ? 'Each statement will be rated on a 1–5 Strongly Disagree → Strongly Agree scale'
-                    : isRanking ? 'Voters will assign a rank to each item (1 = top choice)'
-                    : 'One option per line, or separate with commas';
-    const optPlaceholder = isLikert  ? 'The onboarding process is clear\nI feel supported by my team'
-                         : isRanking ? 'Feature A\nFeature B\nFeature C'
-                         : 'Option 1\nOption 2\nOption 3';
-    blocks.push({
-      type: 'input',
-      block_id: `q_options_${qNum}`,
-      label: { type: 'plain_text', text: optLabel },
-      hint: { type: 'plain_text', text: optHint },
-      optional: false,
-      element: {
-        type: 'plain_text_input',
-        action_id: 'value',
-        multiline: true,
-        placeholder: { type: 'plain_text', text: optPlaceholder },
-        ...(restore.options ? { initial_value: restore.options } : {})
-      }
-    });
-  } else if (questionType === 'open_ended') {
-    blocks.push({
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: '_💬 Open ended — voters will type a free-text response_' }]
-    });
-  } else {
-    const preview = getAutoOptions(questionType).join(' · ');
-    blocks.push({
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: `_Auto-generated options: ${preview}_` }]
-    });
-  }
-
-  // Only show multi-select for applicable types
-  const multiSelectApplicable = !['open_ended', 'yes_no', 'agree_disagree', 'scale_5', 'scale_10', 'nps', 'likert', 'ranking'].includes(questionType);
-  if (multiSelectApplicable) {
-    blocks.push({
-      type: 'input',
-      block_id: `q_multiple_${qNum}`,
-      label: { type: 'plain_text', text: 'Options' },
-      optional: true,
-      element: {
-        type: 'checkboxes',
-        action_id: 'value',
-        options: [{
-          text: { type: 'mrkdwn', text: '*Allow multiple selections*' },
-          value: 'multiple'
-        }],
-        ...(restore.allowMultiple ? {
-          initial_options: [{ text: { type: 'mrkdwn', text: '*Allow multiple selections*' }, value: 'multiple' }]
-        } : {})
-      }
-    });
-  }
-
-  return blocks;
-}
-
-function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {}, errorMsg = null) {
-  const { savedQuestions = [], editingIndex } = meta;
-  const isEditing = editingIndex !== undefined && editingIndex !== null;
-  const qNum = savedQuestions.length + 1;
-
-  const addButton = isEditing ? [] : [
-    { type: 'divider' },
-    {
-      type: 'actions',
-      block_id: 'question_actions',
-      elements: [{
-        type: 'button',
-        text: { type: 'plain_text', text: '＋  Add another question' },
-        action_id: 'add_another_question'
-      }]
-    }
-  ];
-
-  return {
-    type: 'modal',
-    callback_id: 'question_submit',
-    title: { type: 'plain_text', text: isEditing ? 'Edit Question' : 'Add Question' },
-    submit: { type: 'plain_text', text: isEditing ? 'Save Changes' : 'Continue →' },
-    close: { type: 'plain_text', text: '← Back' },
-    notify_on_close: true,
-    private_metadata: JSON.stringify(meta),
-    blocks: [
-      ...(savedQuestions.length > 0 && !isEditing ? [
-        ...savedQuestionsBlocks(savedQuestions),
-        { type: 'section', text: { type: 'mrkdwn', text: '*Add another question:*' } }
-      ] : []),
-      ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
-      ...questionFormBlocks(qNum, currentType, restore),
-      ...addButton
-    ]
-  };
-}
 
 
-const SHOW_RESULTS_OPTIONS = [
-  { text: { type: 'plain_text', text: 'In real-time' },       value: 'realtime' },
-  { text: { type: 'plain_text', text: 'After poll closes' },  value: 'on_close' },
-  { text: { type: 'plain_text', text: 'Only to creator' },    value: 'creator_only' }
-];
 
-function buildCreationModal(meta, errorMsg = null) {
-  const {
-    pollTitle = '', pollDescription = '', pollSettings = [],
-    closeAt, showResults = 'creator_only', orderByVotes = false
-  } = meta;
 
-  const settingsOptions = [
-    { text: { type: 'mrkdwn', text: '*Anonymous* — hide who voted for what' }, value: 'anonymous' },
-    { text: { type: 'mrkdwn', text: '*Allow vote changes* — voters can update their choice' }, value: 'allow_revote' }
-  ];
-  const activeSettings = pollSettings.filter(v => settingsOptions.some(o => o.value === v));
-  const orderOpt = [{ text: { type: 'mrkdwn', text: '*Sort by vote count* — most-voted option first' }, value: 'yes' }];
 
-  return {
-    type: 'modal',
-    callback_id: 'poll_submit',
-    title: { type: 'plain_text', text: 'Create Poll' },
-    submit: { type: 'plain_text', text: meta.savedQuestions?.length ? `＋  Add Questions  (${meta.savedQuestions.length} added)` : '＋  Add Questions' },
-    close: { type: 'plain_text', text: 'Cancel' },
-    notify_on_close: true,
-    private_metadata: JSON.stringify(meta),
-    blocks: [
-      ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
-      // ── Questions summary (progressive disclosure) ────
-      ...((meta.savedQuestions?.length) ? [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*Questions added (${meta.savedQuestions.length}):*\n` +
-              meta.savedQuestions.map((q, i) => `${i + 1}. ${getTypeIcon(q.type)} ${q.text}`).join('\n')
-          }
-        },
-        { type: 'divider' }
-      ] : []),
-      // ── Content ──────────────────────────────────────
-      {
-        type: 'input', block_id: 'poll_title',
-        label: { type: 'plain_text', text: 'Poll title' },
-        element: {
-          type: 'plain_text_input', action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Give your poll a name...' },
-          ...(pollTitle ? { initial_value: pollTitle } : {})
-        }
-      },
-      {
-        type: 'input', block_id: 'poll_description',
-        label: { type: 'plain_text', text: 'Description' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Markup stays literal here: *bold*, _italic_ and `code` render once the poll is posted' },
-        element: {
-          type: 'plain_text_input', action_id: 'value', multiline: true,
-          placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
-          ...(pollDescription ? { initial_value: pollDescription } : {})
-        }
-      },
-      { type: 'divider' },
-      {
-        type: 'input', block_id: 'poll_settings',
-        label: { type: 'plain_text', text: 'Voting' },
-        optional: true,
-        element: {
-          type: 'checkboxes', action_id: 'value',
-          options: settingsOptions,
-          ...(activeSettings.length ? { initial_options: activeSettings.map(v => settingsOptions.find(o => o.value === v)) } : {})
-        }
-      },
-      {
-        type: 'input', block_id: 'poll_show_results',
-        label: { type: 'plain_text', text: 'Show results' },
-        element: {
-          type: 'static_select', action_id: 'value',
-          options: SHOW_RESULTS_OPTIONS,
-          initial_option: SHOW_RESULTS_OPTIONS.find(o => o.value === showResults) || SHOW_RESULTS_OPTIONS[0]
-        }
-      },
-      {
-        type: 'input', block_id: 'poll_order_by_votes',
-        label: { type: 'plain_text', text: 'Result order' },
-        optional: true,
-        element: {
-          type: 'checkboxes', action_id: 'value',
-          options: orderOpt,
-          ...(orderByVotes ? { initial_options: orderOpt } : {})
-        }
-      },
-      { type: 'divider' },
-      {
-        type: 'input', block_id: 'poll_close_at',
-        label: { type: 'plain_text', text: 'Auto-close date & time' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Poll will stop accepting votes at this time' },
-        element: {
-          type: 'datetimepicker', action_id: 'value',
-          ...(closeAt ? { initial_date_time: Math.floor(new Date(closeAt).getTime() / 1000) } : {})
-        }
-      }
-    ]
-  };
-}
 
-function buildEditModal(poll, errorMsg = null) {
-  return {
-    type: 'modal',
-    callback_id: 'poll_edit_submit',
-    title: { type: 'plain_text', text: 'Edit Poll' },
-    submit: { type: 'plain_text', text: 'Save Changes' },
-    close: { type: 'plain_text', text: 'Cancel' },
-    private_metadata: JSON.stringify({ pollId: poll.id }),
-    blocks: [
-      ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
-      {
-        type: 'input', block_id: 'edit_title',
-        label: { type: 'plain_text', text: 'Poll title' },
-        element: {
-          type: 'plain_text_input', action_id: 'value',
-          initial_value: poll.title
-        }
-      },
-      {
-        type: 'input', block_id: 'edit_description',
-        label: { type: 'plain_text', text: 'Description' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Markup stays literal here: *bold*, _italic_ and `code` render once the poll is posted' },
-        element: {
-          type: 'plain_text_input', action_id: 'value', multiline: true,
-          placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
-          ...(poll.description ? { initial_value: poll.description } : {})
-        }
-      },
-      {
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: '_Questions cannot be edited after votes have been cast._' }]
-      }
-    ]
-  };
-}
 
-function savedQuestionsBlocks(savedQuestions) {
-  if (!savedQuestions.length) return [];
-  return [
-    { type: 'section', text: { type: 'mrkdwn', text: '*Questions added:*' } },
-    ...savedQuestions.map((q, i) => ({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `*${i + 1}.* ${q.text}\n_${getTypeIcon(q.type)} ${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${q.type !== 'open_ended' && q.options.length ? '  —  ' + q.options.slice(0, 4).join(', ') + (q.options.length > 4 ? '…' : '') : ''}_`
-      },
-      accessory: {
-        type: 'overflow',
-        action_id: 'question_action',
-        options: [
-          { text: { type: 'plain_text', text: '✏️  Edit' },     value: `edit:${i}` },
-          { text: { type: 'plain_text', text: '⧉  Duplicate' }, value: `duplicate:${i}` },
-          { text: { type: 'plain_text', text: '↑  Move Up' },   value: `move_up:${i}` },
-          { text: { type: 'plain_text', text: '↓  Move Down' }, value: `move_down:${i}` },
-          { text: { type: 'plain_text', text: '🗑️  Delete' },  value: `delete:${i}` }
-        ]
-      }
-    })),
-    { type: 'divider' }
-  ];
-}
 
-function buildPreviewModal(meta) {
-  const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt } = meta;
-  // ?? not ||, so a creator who clears the channel picker stays cleared.
-  const destChannels = meta.destChannels ?? prefillableChannel(meta.channelId);
-  const destUsers    = meta.destUsers ?? [];
-  const tags = [];
-  if (pollSettings.includes('anonymous'))    tags.push('🔒 Anonymous');
-  if (pollSettings.includes('allow_revote')) tags.push('🔄 Vote changes allowed');
-  if (showResults === 'on_close')            tags.push('👁 Results after close');
-  if (showResults === 'creator_only')        tags.push('👁 Results for creator only');
-  if (closeAt)                               tags.push(`⏰ Closes ${new Date(closeAt).toLocaleString()}`);
 
-  const questionBlocks = savedQuestions.flatMap((q, i) => [
-    {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `*${i + 1}. ${q.text}*\n_${getTypeIcon(q.type)} ${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}_`
-      }
-    },
-    ...(q.type === 'open_ended'
-      ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: '_Voters will type a free-text response_' }] }]
-      : q.options.map((opt, oi) => ({
-          type: 'section',
-          text: { type: 'mrkdwn', text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`} ${opt}` }
-        }))
-    ),
-    { type: 'divider' }
-  ]);
 
-  return {
-    type: 'modal',
-    callback_id: 'poll_preview_submit',
-    title: { type: 'plain_text', text: 'Preview & Confirm' },
-    submit: { type: 'plain_text', text: '🚀  Post Poll' },
-    close: { type: 'plain_text', text: '← Back' },
-    private_metadata: JSON.stringify(meta),
-    blocks: [
-      { type: 'header', text: { type: 'plain_text', text: pollTitle || 'Untitled Poll' } },
-      ...(pollDescription ? [{ type: 'section', text: { type: 'mrkdwn', text: pollDescription } }] : []),
-      ...(tags.length ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: tags.join('  ·  ') }] }] : []),
-      { type: 'divider' },
-      // A long poll can run past Slack's limit of 100 blocks in a view, and the
-      // pickers below are the point of this screen - so the preview is what
-      // gives way, not the thing you came here to do.
-      ...capBlocks(questionBlocks, 100 - FIXED_PREVIEW_BLOCKS),
-      { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
-      ...destinationBlocks({
-        channels: destChannels,
-        users: destUsers,
-        peopleHint: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.'
-      }),
-      {
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Leave both pickers empty to post in the conversation you started from`
-        }]
-      }
-    ]
-  };
-}
 
-// Header, description, tags, three dividers, the Where to post heading, two
-// pickers and the footer - what the preview modal spends before any question.
-const FIXED_PREVIEW_BLOCKS = 10;
 
-// Slack rejects a message over 100 blocks outright. A long poll therefore has
-// to be summarised rather than trimmed: cutting the tail off a ballot would
-// silently drop questions people could otherwise answer, and they'd have no
-// way to tell. So past the limit the whole question list collapses to one
-// listing and everyone uses the modal, which is a view and gets its own 100.
-const MAX_MESSAGE_BLOCKS = 100;
 
-// A section caps at 3000 characters, which a listing of enough long questions
-// will reach on its own.
-function clampText(text, limit = 2900) {
-  return text.length <= limit ? text : text.slice(0, limit - 1) + '…';
-}
 
-function compactQuestionBlocks(poll) {
-  const listing = (poll.questions || []).map((q, i) =>
-    `${getTypeIcon(q.type)}  *${i + 1}. ${q.text}*${(q.options || []).length ? `  _${q.options.length} options_` : ''}`
-  ).join('\n');
-  return [
-    { type: 'section', text: { type: 'mrkdwn', text: clampText(listing) } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: '_Too long to lay out in a message - use the button below to answer it._' }] },
-    { type: 'divider' }
-  ];
-}
 
-// Slack rejects a whole view over the block limit, so an over-long preview is
-// trimmed with a line saying so rather than failing to open at all.
-function capBlocks(blocks, limit) {
-  if (blocks.length <= limit) return blocks;
-  return [
-    ...blocks.slice(0, limit - 1),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `_…preview trimmed. All ${blocks.length} blocks of this poll will be posted._` }] }
-  ];
-}
 
-function buildVoteModal(poll, previousVotes = {}) {
-  const hasVoted = Object.keys(previousVotes).length > 0;
-  const questionBlocks = poll.questions.flatMap((q, qi) => {
-    const prev = previousVotes[qi] || [];
-    const label = `${getTypeIcon(q.type)}  ${qi + 1}. ${q.text}`;
 
-    if (q.type === 'open_ended') {
-      return [{
-        type: 'input',
-        block_id: `vote_q${qi}`,
-        label: { type: 'plain_text', text: label },
-        element: {
-          type: 'plain_text_input',
-          action_id: 'response',
-          multiline: true,
-          placeholder: { type: 'plain_text', text: 'Type your response...' },
-          ...(prev[0] ? { initial_value: prev[0] } : {})
-        }
-      }];
-    }
 
-    if (q.type === 'likert') {
-      const likertOpts = LIKERT_SCALE.map(s => ({ text: { type: 'plain_text', text: s.label }, value: s.value }));
-      return [
-        { type: 'section', text: { type: 'mrkdwn', text: `*${label}*\n_Rate each statement on a 1–5 scale_` } },
-        ...q.options.map((stmt, si) => ({
-          type: 'input',
-          block_id: `vote_q${qi}_s${si}`,
-          label: { type: 'plain_text', text: stmt },
-          element: {
-            type: 'static_select',
-            action_id: 'rating',
-            placeholder: { type: 'plain_text', text: 'Choose a rating...' },
-            options: likertOpts
-          }
-        }))
-      ];
-    }
 
-    if (q.type === 'ranking') {
-      const rankOpts = q.options.map((_, i) => ({
-        text: { type: 'plain_text', text: `#${i + 1}` },
-        value: String(i + 1)
-      }));
-      return [
-        { type: 'section', text: { type: 'mrkdwn', text: `*${label}*\n_Assign a rank to each item — 1 = top choice_` } },
-        ...q.options.map((opt, oi) => ({
-          type: 'input',
-          block_id: `vote_q${qi}_r${oi}`,
-          label: { type: 'plain_text', text: opt },
-          element: {
-            type: 'static_select',
-            action_id: 'rank',
-            placeholder: { type: 'plain_text', text: 'Rank...' },
-            options: rankOpts
-          }
-        }))
-      ];
-    }
 
-    if (q.allowMultiple) {
-      // Some Slack clients draw checkboxes as circles, which reads as a radio
-      // group, so the label carries the affordance too - it is bold and above
-      // the options, where the hint is grey and below them.
-      return [{
-        type: 'input',
-        block_id: `vote_q${qi}`,
-        label: { type: 'plain_text', text: `${label}  (choose one or more)` },
-        hint: { type: 'plain_text', text: 'Select all that apply - more than one answer is allowed' },
-        element: {
-          type: 'checkboxes',
-          action_id: 'selected',
-          options: q.options.map((opt, oi) => ({ text: { type: 'mrkdwn', text: opt }, value: String(oi) })),
-          ...(prev.length ? { initial_options: prev.map(oi => ({ text: { type: 'mrkdwn', text: q.options[oi] }, value: String(oi) })) } : {})
-        }
-      }];
-    }
 
-    return [{
-      type: 'input',
-      block_id: `vote_q${qi}`,
-      label: { type: 'plain_text', text: label },
-      element: {
-        type: 'static_select',
-        action_id: 'selected',
-        placeholder: { type: 'plain_text', text: 'Select an option' },
-        options: q.options.map((opt, oi) => ({ text: { type: 'plain_text', text: opt }, value: String(oi) })),
-        ...(prev.length ? { initial_option: { text: { type: 'plain_text', text: q.options[prev[0]] }, value: String(prev[0]) } } : {})
-      }
-    }];
-  });
-
-  const notifyOpt = [{ text: { type: 'mrkdwn', text: '*Notify me when this poll closes*' }, value: 'notify' }];
-
-  return {
-    type: 'modal',
-    callback_id: 'vote_submit',
-    title: { type: 'plain_text', text: hasVoted ? 'Change Your Vote' : 'Cast Your Vote' },
-    submit: { type: 'plain_text', text: hasVoted ? 'Update Vote' : 'Submit Vote' },
-    close: { type: 'plain_text', text: 'Cancel' },
-    private_metadata: JSON.stringify({ pollId: poll.id }),
-    blocks: [
-      { type: 'header', text: { type: 'plain_text', text: poll.title } },
-      ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-      {
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: [
-            `${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}`,
-            poll.anonymous ? '🔒 Anonymous' : null,
-            poll.closeAt ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
-          ].filter(Boolean).join('  ·  ')
-        }]
-      },
-      { type: 'divider' },
-      ...questionBlocks,
-      { type: 'divider' },
-      {
-        type: 'input',
-        block_id: 'vote_notify',
-        label: { type: 'plain_text', text: 'Notifications' },
-        optional: true,
-        element: {
-          type: 'checkboxes',
-          action_id: 'value',
-          options: notifyOpt
-        }
-      }
-    ]
-  };
-}
 
 // ==================== POLL DISPLAY ====================
 
-function pollProgressBar(count, total, width = 16) {
-  if (total === 0) return '░'.repeat(width);
-  const filled = Math.round((count / total) * width);
-  return '█'.repeat(filled) + '░'.repeat(width - filled);
-}
 
-// Which questions can be answered by pressing one button. A ranking or a
-// Likert grid cannot - there is no single click that means "third place" -
-// so those keep sending people to the vote modal. This is deliberately the
-// same set that gets the option-and-bar rendering below, so the two cannot
-// drift apart.
-function isInlineVotable(type) {
-  return !['open_ended', 'likert', 'ranking'].includes(type);
-}
 
-// Slack renders one message for everyone, so an inline ballot cannot tick the
-// option you chose or grey out the rest - only the vote modal knows who is
-// reading. All this does is let you answer without opening anything, which
-// for a one-question poll is the whole interaction.
-function optionAccessory(poll, qi, oi, interactive) {
-  if (!interactive) return {};
-  return {
-    accessory: {
-      type: 'button',
-      text: { type: 'plain_text', text: OPTION_EMOJIS[oi] || `${oi + 1}`, emoji: true },
-      // Unique per option: Slack rejects a repeated action_id in one message.
-      action_id: `vote_option_${qi}_${oi}`,
-      value: `${poll.id}::${qi}::${oi}`
-    }
-  };
-}
 
-function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = false) {
-  const qVotes = poll.votes[qi] || {};
 
-  if (!canViewResults(poll, viewerId)) {
 
-    // Hiding the tally is a rule about numbers, not about the ballot. It used
-    // to hide the options as well, which on the default setting left the
-    // message as a question with no visible answers - nobody could see what
-    // they were being asked to pick without opening a modal first.
-    const head =
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${resultsHiddenReason(poll)}_` }
-      };
-    if (!isInlineVotable(q.type)) return [head, { type: 'divider' }];
-    return [
-      head,
-      ...q.options.map((option, oi) => ({
-        type: 'section',
-        text: { type: 'mrkdwn', text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*` },
-        ...optionAccessory(poll, qi, oi, interactive)
-      })),
-      { type: 'divider' }
-    ];
-  }
 
-  if (q.type === 'open_ended') {
-    const responses = Object.entries(qVotes);
-    const count = responses.length;
-    const body = count === 0
-      ? '_No responses yet_'
-      : poll.anonymous
-        ? `_${count} anonymous response${count !== 1 ? 's' : ''}_`
-        : responses.map(([uid, t]) => `> <@${uid}>:  ${t}`).join('\n');
-    return [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${count} response${count !== 1 ? 's' : ''}_\n${body}`
-        }
-      },
-      { type: 'divider' }
-    ];
-  }
 
-  if (q.type === 'likert') {
-    const stmtBlocks = q.options.flatMap((stmt, si) => {
-      const ratings = qVotes[si] || {};
-      const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
-      const bars = LIKERT_SCALE.map(({ label, value }) => {
-        const cnt = (ratings[value] || []).length;
-        const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
-        const bar = pollProgressBar(cnt, total, 10);
-        return `  \`${bar}\`  *${pct}%*  ${label}`;
-      }).join('\n');
-      return [{
-        type: 'section',
-        text: { type: 'mrkdwn', text: `*${stmt}*  —  _${total} response${total !== 1 ? 's' : ''}_\n${bars}` }
-      }];
-    });
-    return [
-      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*` } },
-      ...stmtBlocks,
-      { type: 'divider' }
-    ];
-  }
 
-  if (q.type === 'ranking') {
-    const allRankings = Object.values(qVotes);
-    const avgRanks = q.options.map((_, oi) => {
-      if (!allRankings.length) return null;
-      const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
-      return ranks.length ? ranks.reduce((a, b) => a + b, 0) / ranks.length : null;
-    });
-    const sorted = q.options
-      .map((opt, oi) => ({ opt, avg: avgRanks[oi] }))
-      .sort((a, b) => (a.avg ?? 999) - (b.avg ?? 999));
-    const medals = ['🥇', '🥈', '🥉'];
-    const optBlocks = sorted.map(({ opt, avg }, rank) => ({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `${medals[rank] || `${rank + 1}.`}  *${opt}*  ${avg !== null ? `·  avg rank *${avg.toFixed(1)}*` : '·  _no votes yet_'}`
-      }
-    }));
-    return [
-      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
-      ...optBlocks,
-      { type: 'divider' }
-    ];
-  }
-
-  const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-  const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
-  const typeHint   = `${getTypeIcon(q.type)} _${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}${interactive ? '  ·  press a number to vote' : ''}_`;
-
-  let displayOptions = q.options.map((option, oi) => ({ option, oi }));
-  if (poll.orderByVotes && totalVotes > 0) {
-    displayOptions = displayOptions.sort((a, b) => (qVotes[b.oi] || []).length - (qVotes[a.oi] || []).length);
-  }
-
-  const optionBlocks = displayOptions.map(({ option, oi }) => {
-    const voters   = qVotes[oi] || [];
-    const count    = voters.length;
-    const pct      = totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
-    const bar      = pollProgressBar(count, totalVotes);
-    const isWinner = totalVotes > 0 && count === maxVotes && count > 0;
-    const voterLine = !poll.anonymous && count > 0
-      ? `\n${voters.map(id => `<@${id}>`).join('  ')}`
-      : '';
-    const statLine = totalVotes === 0
-      ? '_No votes yet_'
-      : `\`${bar}\`  *${pct}%*  (${count} vote${count !== 1 ? 's' : ''})`;
-
-    return {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `${OPTION_EMOJIS[oi] || `${oi + 1}.`}  *${option}*${isWinner ? '  🏆' : ''}\n${statLine}${voterLine}`
-      },
-      ...optionAccessory(poll, qi, oi, interactive)
-    };
-  });
-
-  return [
-    { type: 'section', text: { type: 'mrkdwn', text: `*${qi + 1}. ${q.text}*\n${typeHint}` } },
-    ...optionBlocks,
-    { type: 'divider' }
-  ];
-}
-
-// Shown only to the creator: the id, and the commands that need it.
-function pollAdminHint(poll) {
-  // No /poll-close here: the poll message carries a Close button now.
-  return [
-    `ID: \`${poll.id}\``,
-    `\`/poll-export ${poll.id}\``
-  ].join('  ·  ');
-}
-
-function buildPollBlocks(poll) {
-  const questions = poll.questions || [];
-  const isClosed  = poll.status === 'closed';
-  const participants = getAllVoters(poll).size;
-
-  const statusParts = [
-    isClosed ? '🔒 *Closed*' : '🟢 *Active*',
-    poll.anonymous   ? '🔒 Anonymous'            : null,
-    poll.allowRevote ? '🔄 Vote changes allowed'  : null,
-    participants > 0 ? `*${participants}* participant${participants !== 1 ? 's' : ''}` : '_No responses yet_',
-    poll.closeAt && !isClosed ? `⏰ Closes ${new Date(poll.closeAt).toLocaleString()}` : null
-  ].filter(Boolean);
-
-  // Closed poll: view results + share; Active poll: vote + share
-  const actionButtons = isClosed
-    ? [
-        { type: 'button', text: { type: 'plain_text', text: '📊  View Results', emoji: true }, style: 'primary', action_id: 'view_results_modal', value: poll.id },
-        // Posts the poll message (results included once closed) into another
-        // channel - deliberately open to any member, unlike /poll-share.
-        { type: 'button', text: { type: 'plain_text', text: '📤  Send', emoji: true }, action_id: 'share_poll', value: poll.id }
-      ]
-    : [
-        {
-          type: 'button',
-          text: { type: 'plain_text', text: '🗳️  Vote', emoji: true },
-          style: 'primary',
-          action_id: 'open_vote_modal',
-          value: poll.id
-        },
-        { type: 'button', text: { type: 'plain_text', text: '📤  Send', emoji: true }, action_id: 'share_poll', value: poll.id },
-        // Everyone sees this button - Slack cannot show one person a different
-        // version of a message - so the handler turns away anyone who is not
-        // running the poll. Without it, closing a poll that was created without
-        // an auto-close time meant finding its id and typing a slash command.
-        { type: 'button', text: { type: 'plain_text', text: '🔒  Close', emoji: true }, action_id: 'close_poll', value: poll.id }
-      ];
-
-  // Everything but the questions is fixed, so the questions are what has to
-  // give when the message will not fit.
-  const frame = questionBlocks => [
-    { type: 'header', text: { type: 'plain_text', text: `📊  ${poll.title}`, emoji: true } },
-    ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: statusParts.join('  ·  ') }] },
-    { type: 'divider' },
-    ...questionBlocks,
-    { type: 'actions', elements: actionButtons },
-    {
-      // The id and its commands used to sit here, on a message the whole
-      // channel reads, when only the creator has any use for them. They are
-      // sent privately when the poll is created, and `/polls-list` has them.
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>` }]
-    }
-  ];
-
-  // A closed poll is a record rather than a ballot, so the buttons go with it -
-  // and by then the tally is public anyway.
-  const full = frame(questions.flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, null, !isClosed)));
-  return full.length <= MAX_MESSAGE_BLOCKS ? full : frame(compactQuestionBlocks(poll));
-}
-
-function buildShareModal(poll) {
-  const totalParticipants = getAllVoters(poll).size;
-
-  return {
-    type: 'modal',
-    callback_id: 'share_poll_submit',
-    title: { type: 'plain_text', text: 'Send Poll' },
-    submit: { type: 'plain_text', text: '📤  Send Poll' },
-    close: { type: 'plain_text', text: 'Cancel' },
-    private_metadata: JSON.stringify({ pollId: poll.id }),
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*${poll.title}*\n_${poll.questions.length} question${poll.questions.length !== 1 ? 's' : ''}  ·  ${totalParticipants} participant${totalParticipants !== 1 ? 's' : ''}_`
-        }
-      },
-      { type: 'divider' },
-      ...destinationBlocks({ peopleHint: 'Each person gets the poll in their own DM with me. Pick yourself to get a copy you can vote in.' }),
-      {
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: 'Votes cast anywhere it is posted count toward the same poll. For a private channel, invite me to it first.'
-        }]
-      }
-    ]
-  };
-}
-
-function buildResultsBlocks(poll, heading, viewerId = null) {
-  const participants = getAllVoters(poll).size;
-  return [
-    { type: 'header', text: { type: 'plain_text', text: heading } },
-    { type: 'section', text: { type: 'mrkdwn', text: `📊 *${poll.title}*` } },
-    ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* participant${participants === 1 ? '' : 's'}  ·  Created by <@${poll.creator}>${poll.anonymous ? '  ·  🔒 Anonymous' : ''}` }] },
-    { type: 'divider' },
-    ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, viewerId))
-  ];
-}
 
 async function updatePollMessage(client, poll) {
-  const refs = poll.messageRefs?.length
-    ? poll.messageRefs
-    : (poll.channelId && poll.messageTs ? [{ channelId: poll.channelId, messageTs: poll.messageTs }] : []);
+  const refs = pollMessageRefs(poll);
   const blocks = buildPollBlocks(poll);
   await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
     client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${poll.title}`, blocks })
   ));
 }
 
-function buildPostVoteModal(poll, viewerId = null) {
-  const participants = getAllVoters(poll).size;
-  return {
-    type: 'modal',
-    title: { type: 'plain_text', text: '✅ Vote Recorded' },
-    close: { type: 'plain_text', text: 'Close' },
-    blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: `Your vote has been recorded for *${poll.title}*!` } },
-      { type: 'context', elements: [{ type: 'mrkdwn', text: `*${participants}* participant${participants !== 1 ? 's' : ''} so far` }] },
-      { type: 'divider' },
-      ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, viewerId))
-    ]
-  };
-}
 
 // ==================== POLL CREATION HELPER ====================
 
 async function createAndPostPoll(client, meta, teamId = null) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false, destChannels = [], destUsers = [] } = meta;
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false, destChannels = [], destUsers = [] } = meta;
 
   // The submission has already been acked, so nothing here is racing Slack's
   // 3-second deadline and this wait costs nothing once the bot is up.
@@ -1522,31 +570,12 @@ async function createAndPostPoll(client, meta, teamId = null) {
 
 // ==================== HELPERS ====================
 
-function readCurrentQuestion(values, qNum) {
-  return {
-    text:          (values[`q_text_${qNum}`]?.value?.value || '').trim(),
-    type:          values[`q_type_${qNum}`]?.question_type_changed?.selected_option?.value || 'multiple_choice',
-    optionsRaw:    values[`q_options_${qNum}`]?.value?.value || '',
-    allowMultiple: (values[`q_multiple_${qNum}`]?.value?.selected_options?.length || 0) > 0
-  };
-}
 
-function readMainModalSettings(values, meta) {
-  const closeAtRaw = values.poll_close_at?.value?.selected_date_time;
-  return {
-    pollTitle:       (values.poll_title?.value?.value       ?? meta.pollTitle       ?? '').trim(),
-    pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
-    pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
-    closeAt:         closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : (meta.closeAt || null),
-    showResults:     values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? 'creator_only',
-    orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false)
-  };
-}
 
-function buildQuestion(text, type, optionsRaw, allowMultiple) {
-  const options = AUTO_OPTION_TYPES.includes(type) ? getAutoOptions(type) : parseOptions(optionsRaw);
-  return { text, type, options, allowMultiple };
-}
+
+
+
+
 
 // ==================== COMMANDS ====================
 
@@ -1559,17 +588,34 @@ const WAKE_UP_MESSAGE = '⏳ The bot was waking up and missed the 3-second windo
 // stays good for 30 minutes, long after the 3-second trigger_id died. So the
 // apology can land in the channel they typed in, carrying a button - and a
 // button click arrives with a fresh trigger_id, which is the whole point.
-function wakeUpPrompt(channelId) {
+function wakeUpPrompt(channelId, commandText) {
   return {
     response_type: 'ephemeral',
     text: WAKE_UP_MESSAGE,
     blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: '⏳ I was asleep and missed the 3-second window Slack allows. Press the button - it opens straight away.' } },
       { type: 'actions', elements: [
-        { type: 'button', text: { type: 'plain_text', text: '📊  Open poll builder', emoji: true }, action_id: 'open_poll_creator', value: channelId || '', style: 'primary' }
+        {
+          type: 'button', text: { type: 'plain_text', text: '📊  Open poll builder', emoji: true },
+          action_id: 'open_poll_creator', style: 'primary',
+          // Carries the command's own text as well as its channel, so anything
+          // typed on the command line survives the nap too.
+          value: JSON.stringify({ channelId: channelId || '', text: (commandText || '').slice(0, 1500) })
+        }
       ] }
     ]
   };
+}
+
+// The button on that prompt used to carry a bare channel id. Read both shapes so
+// a prompt posted before this change still opens.
+function readWakeUpValue(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return typeof parsed === 'object' && parsed ? parsed : {};
+  } catch {
+    return { channelId: value || '' };
+  }
 }
 
 function isExpiredTrigger(err) {
@@ -1585,15 +631,20 @@ async function handleNewPoll({ ack, body, client, respond }) {
     if (!canCreatePoll(body.user_id)) {
       return await dmUser(client, body.user_id, `⏳ ${pollCreationLimitMessage()}`);
     }
+    const prefill = parseComposeArgs(body.text);
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildCreationModal({ channelId: body.channel_id, userId: body.user_id, savedQuestions: [] })
+      view: buildComposeModal(
+        { channelId: body.channel_id, userId: body.user_id, savedQuestions: [] },
+        'multiple_choice',
+        prefill
+      )
     });
   } catch (err) {
     console.error('/newpoll error:', err);
     if (isExpiredTrigger(err)) {
       try {
-        return await respond(wakeUpPrompt(body.channel_id));
+        return await respond(wakeUpPrompt(body.channel_id, body.text));
       } catch (e) {
         // response_url can fail too (30 minutes gone, or five uses spent). The
         // DM is the floor: they hear something either way.
@@ -1615,9 +666,14 @@ app.action('open_poll_creator', async ({ ack, body, client, action, respond }) =
     if (!canCreatePoll(userId)) {
       return await dmUser(client, userId, `⏳ ${pollCreationLimitMessage()}`);
     }
+    const { channelId, text } = readWakeUpValue(action.value);
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildCreationModal({ channelId: action.value || body.channel?.id || userId, userId, savedQuestions: [] })
+      view: buildComposeModal(
+        { channelId: channelId || body.channel?.id || userId, userId, savedQuestions: [] },
+        'multiple_choice',
+        parseComposeArgs(text)
+      )
     });
     // The prompt has done its job; clear it so the channel is not left with a
     // stale apology and a button that now opens a second modal.
@@ -1639,7 +695,7 @@ app.shortcut('create_poll', async ({ ack, shortcut, client }) => {
     }
     await client.views.open({
       trigger_id: shortcut.trigger_id,
-      view: buildCreationModal({ channelId: shortcut.channel?.id || shortcut.user.id, userId: shortcut.user.id, savedQuestions: [] })
+      view: buildComposeModal({ channelId: shortcut.channel?.id || shortcut.user.id, userId: shortcut.user.id, savedQuestions: [] })
     });
   } catch (err) {
     console.error('create_poll shortcut error:', err);
@@ -1690,6 +746,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
   }
 });
 
+
 app.command('/polls-list', async ({ ack, body, client }) => {
   await ack();
   try {
@@ -1697,32 +754,11 @@ app.command('/polls-list', async ({ ack, body, client }) => {
     const channel = await resolveChannel(client, body.channel_id, userId);
     const polls = await getAllPolls('active');
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now. Use `/polls-archive` to see closed polls.' });
-    const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
-    const listBlocks = [
-      { type: 'header', text: { type: 'plain_text', text: 'Active Polls' } },
-      ...shown.map((p, i) => {
-        const participants = getAllVoters(p).size;
-        const tags = [
-          `${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}`,
-          `${participants} participant${participants !== 1 ? 's' : ''}`,
-          ...(p.anonymous   ? ['🔒 Anonymous'] : []),
-          ...(p.allowRevote ? ['🔄 Revote on'] : []),
-          ...(p.closeAt     ? [`⏰ Closes ${new Date(p.closeAt).toLocaleString()}`] : [])
-        ];
-        return {
-          type: 'section',
-          text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` },
-          accessory: {
-            type: 'button',
-            text: { type: 'plain_text', text: '📤  Send', emoji: true },
-            action_id: 'share_poll',
-            value: p.id
-          }
-        };
-      }),
-      ...truncationNote(polls.length, shown.length)
-    ];
-    await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+    await client.chat.postEphemeral({
+      channel, user: userId,
+      text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`,
+      blocks: pollListBlocks(polls)
+    });
   } catch (err) {
     console.error('/polls-list error:', err);
     await dmUser(client, body.user_id, `❌ /polls-list failed: ${err.message}`);
@@ -1736,53 +772,59 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     const channel = await resolveChannel(client, body.channel_id, userId);
     const polls = await getAllPolls('closed');
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls yet.' });
-    const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
-    const listBlocks = [
-      { type: 'header', text: { type: 'plain_text', text: 'Closed Polls' } },
-      ...shown.map((p, i) => {
-        const participants = getAllVoters(p).size;
-        return {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${participants} participant${participants !== 1 ? 's' : ''}  ·  ${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}  ·  Created by <@${p.creator}>`
-          }
-        };
-      }),
-      ...truncationNote(polls.length, shown.length),
-      { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results POLL_ID\` to view full results` }] }
-    ];
-    await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+    await client.chat.postEphemeral({
+      channel, user: userId,
+      text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`,
+      blocks: pollListBlocks(polls, { closed: true })
+    });
   } catch (err) {
     console.error('/polls-archive error:', err);
     await dmUser(client, body.user_id, `❌ /polls-archive failed: ${err.message}`);
   }
 });
 
-// Losing votes by accident cannot be undone, so closing a poll that has any is
-// confirmed first. channelId travels in private_metadata because the final
-// results are posted where the close was asked for, which the view submission
-// does not otherwise know.
-function buildCloseConfirmModal(poll, channelId, participants) {
-  return {
-    type: 'modal',
-    callback_id: 'poll_close_confirm',
-    title: { type: 'plain_text', text: 'Close Poll?' },
-    submit: { type: 'plain_text', text: '🔒  Close Poll' },
-    close: { type: 'plain_text', text: 'Cancel' },
-    private_metadata: JSON.stringify({ pollId: poll.id, channelId }),
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `Are you sure you want to close *${poll.title}*?\n\n*${participants}* participant${participants !== 1 ? 's have' : ' has'} voted. This cannot be undone.`
-        }
-      },
-      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Closing the poll will notify opted-in participants and post final results.' }] }
-    ]
-  };
-}
+// 📊 Results, from a poll list. The button on the poll message can assume the
+// poll is closed and readable; this one cannot, so it checks the poll's own
+// results setting and says why when the answer is no.
+app.action('list_poll_results', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) return await deny('❌ That poll no longer exists.');
+    if (!canViewResults(poll, userId)) return await deny(`🔒 ${resultsHiddenReason(poll)}.`);
+    await client.views.open({ trigger_id: body.trigger_id, view: buildResultsModal(poll, userId) });
+  } catch (err) {
+    console.error('list_poll_results error:', err);
+    await dmUser(client, userId, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open those results: ${err.message}`);
+  }
+});
+
+// ⬇️ Export, from a poll list. The CSV goes to the creator's own DM rather than
+// wherever they pressed it: a file upload does not honour chat:write.public, so
+// a channel the bot has not been invited to would simply fail - and per-voter
+// rows are the creator's business anyway.
+app.action('list_poll_export', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) return await deny('❌ That poll no longer exists.');
+    if (!isCreatorOrCoCreator(poll, userId)) return await deny(`❌ Only <@${poll.creator}> can export this poll.`);
+    const own = await client.conversations.open({ users: userId });
+    await uploadPollCsv(client, poll, own.channel.id);
+    await deny(`⬇️ The CSV for *${poll.title}* is in your DM with me.`);
+  } catch (err) {
+    console.error('list_poll_export error:', err);
+    await dmUser(client, userId, `❌ Could not export that poll: ${err.message}`);
+  }
+});
+
+
 
 // Closing is the same three steps wherever it was triggered from: every copy of
 // the poll message has to stop offering a vote, the final results have to be
@@ -1845,6 +887,20 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
   }
 });
 
+
+// Upload that CSV wherever the request came from. File uploads do not honour
+// chat:write.public, so this only works in a DM or a channel the bot is in -
+// hence the failure being reported rather than swallowed.
+async function uploadPollCsv(client, poll, channel) {
+  await client.files.uploadV2({
+    channel_id: channel,
+    filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
+    content: buildPollCsv(poll),
+    title: `Results: ${poll.title}`,
+    initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
+  });
+}
+
 app.command('/poll-export', async ({ ack, body, client }) => {
   await ack();
   try {
@@ -1854,88 +910,43 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
-
-    // A cell starting with any of these is executed as a formula by Excel and
-    // Sheets, so prefix it with an apostrophe before quoting.
-    const FORMULA_PREFIXES = ['=', '+', '-', '@', String.fromCharCode(9), String.fromCharCode(13)];
-    const esc = v => {
-      const raw = String(v == null ? '' : v);
-      const safe = FORMULA_PREFIXES.includes(raw[0]) ? "'" + raw : raw;
-      return '"' + safe.split('"').join('""') + '"';
-    };
-    const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
-
-    poll.questions.forEach((q, qi) => {
-      const qVotes = poll.votes[qi] || {};
-      if (q.type === 'open_ended') {
-        Object.entries(qVotes).forEach(([uid, text]) => {
-          const ts = poll.voteTimestamps?.[uid] || '';
-          rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
-        });
-        if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
-      } else if (q.type === 'ranking') {
-        const allRankings = Object.values(qVotes);
-        q.options.forEach((opt, oi) => {
-          const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
-          const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
-          rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
-        });
-      } else if (q.type === 'likert') {
-        q.options.forEach((stmt, si) => {
-          const ratings = qVotes[si] || {};
-          const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
-          LIKERT_SCALE.forEach(({ label, value }) => {
-            const cnt = (ratings[value] || []).length;
-            const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
-            rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
-          });
-        });
-      } else {
-        const total = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-        q.options.forEach((opt, oi) => {
-          const voters = qVotes[oi] || [];
-          const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
-          rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
-        });
-      }
-    });
-
-    const csv = rows.map(r => r.map(esc).join(',')).join('\n');
-    await client.files.uploadV2({
-      channel_id: channel,
-      filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
-      content: csv,
-      title: `Results: ${poll.title}`,
-      initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
-    });
+    await uploadPollCsv(client, poll, channel);
   } catch (err) {
     console.error('/poll-export error:', err);
     await dmUser(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
   }
 });
 
-// ==================== MAIN MODAL ACTIONS ====================
+// ==================== COMPOSE SCREEN ACTIONS ====================
+
+// Every button here runs readComposeState first. A block action arrives with
+// the whole view state, so whatever has been typed - the question, the title,
+// the destination picks - is folded into the metadata before another screen is
+// pushed on top or this one is rebuilt underneath. That is what lets the flow
+// be one screen with side trips, instead of a corridor of screens.
 
 app.action('question_action', async ({ ack, body, client }) => {
   await ack();
-  const meta = JSON.parse(body.view.private_metadata);
+  const { meta, question } = readComposeState(body.view);
   const [action, idxStr] = body.actions[0].selected_option.value.split(':');
   const idx = parseInt(idxStr);
-  let qs = [...meta.savedQuestions];
+  let qs = [...(meta.savedQuestions || [])];
 
   if (action === 'edit') {
     const q = qs[idx];
+    if (!q) return;
     qs.splice(idx, 1);
-    const editMeta = { ...meta, savedQuestions: qs, editingIndex: idx, questionPageViewId: body.view.id };
+    const editMeta = {
+      ...meta, savedQuestions: qs, editingIndex: idx,
+      draft: question, questionPageViewId: body.view.id
+    };
     try {
       await client.views.push({
         trigger_id: body.trigger_id,
-        view: buildQuestionModal(editMeta, q.type, {
+        view: buildQuestionModal(editMeta, formTypeFor(q), {
           text: q.text,
-          options: ['multiple_choice', 'likert', 'ranking'].includes(q.type) ? q.options.join('\n') : '',
-          allowMultiple: q.allowMultiple
+          options: ['multiple_choice', 'likert', 'ranking'].includes(q.type) ? q.options.join('\n') : ''
         })
       });
     } catch (err) { console.error('edit push error:', err); }
@@ -1949,130 +960,227 @@ app.action('question_action', async ({ ack, body, client }) => {
     case 'delete':    qs.splice(idx, 1); break;
   }
 
-  const updatedMeta = { ...meta, savedQuestions: qs };
-  await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
+  try {
+    await client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal({ ...meta, savedQuestions: qs }, question.type, restoreQuestion(question))
+    });
+  } catch (err) { console.warn('compose refresh failed:', err.message); }
 });
 
-// ==================== QUESTION MODAL ACTIONS ====================
-
+// The type picker rewrites the form beneath it - a rating scale needs no choices
+// typed, a ranking needs items rather than options. It lives on both the compose
+// screen and the edit screen, so which one is being rebuilt is read off the view.
 app.action('question_type_changed', async ({ ack, body, client }) => {
   await ack();
-  const meta = JSON.parse(body.view.private_metadata);
-  const values = body.view.state.values;
-  const qNum = meta.savedQuestions.length + 1;
   const newType = body.actions[0].selected_option.value;
-  const currentText    = values[`q_text_${qNum}`]?.value?.value || '';
-  const currentOptions = values[`q_options_${qNum}`]?.value?.value || '';
-  const allowMultiple  = (values[`q_multiple_${qNum}`]?.value?.selected_options?.length || 0) > 0;
 
+  if (body.view.callback_id === 'poll_compose_submit') {
+    const { meta, question } = readComposeState(body.view);
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, newType, restoreQuestion(question))
+    });
+  }
+
+  const meta = JSON.parse(body.view.private_metadata);
+  const question = readCurrentQuestion(body.view.state.values, (meta.savedQuestions || []).length + 1);
   await client.views.update({
     view_id: body.view.id,
-    view: buildQuestionModal(meta, newType, { text: currentText, options: currentOptions, allowMultiple })
+    view: buildQuestionModal(meta, newType, restoreQuestion(question))
   });
 });
 
 app.action('add_another_question', async ({ ack, body, client }) => {
   await ack();
-  const meta = JSON.parse(body.view.private_metadata);
-  const values = body.view.state.values;
-  const qNum = meta.savedQuestions.length + 1;
-  const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
+  const { meta, question } = readComposeState(body.view);
 
-  if (!text) {
+  const problem = questionFormError(question);
+  if (problem) {
     return client.views.update({
       view_id: body.view.id,
-      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter a question.')
-    });
-  }
-  if (!AUTO_OPTION_TYPES.includes(type) && parseOptions(optionsRaw).length < 2) {
-    return client.views.update({
-      view_id: body.view.id,
-      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter at least 2 options.')
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), problem === 'text'
+        ? 'Write this question before adding another.'
+        : 'Give this question at least 2 choices before adding another.')
     });
   }
 
   const updatedMeta = {
     ...meta,
-    savedQuestions: [...meta.savedQuestions, buildQuestion(text, type, optionsRaw, allowMultiple)],
+    savedQuestions: [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)],
     editingIndex: null
   };
 
-  await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
+  // Refused here rather than accepted and then silently dropped by Slack: the
+  // question still in the form is what would be lost, and it is still on screen
+  // to be posted or shortened.
+  if (!draftFitsInView(updatedMeta)) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), METADATA_FULL)
+    });
+  }
+
+  await client.views.update({ view_id: body.view.id, view: buildComposeModal(updatedMeta) });
+});
+
+app.action('compose_options', async ({ ack, body, client }) => {
+  await ack();
+  const { meta, question } = readComposeState(body.view);
+
+  // The settings have to stay reachable however long the poll is, so when the
+  // draft will not fit alongside it the half-typed question is what gives way -
+  // and the screen says so, rather than losing it quietly.
+  let carried = { ...meta, draft: question, composeViewId: body.view.id };
+  const draftDropped = !draftFitsInView(carried);
+  if (draftDropped) carried = { ...meta, composeViewId: body.view.id };
+
+  try {
+    await client.views.push({
+      trigger_id: body.trigger_id,
+      view: buildOptionsModal(carried, draftDropped)
+    });
+  } catch (err) {
+    console.error('compose_options push error:', err);
+    await dmUser(client, body.user.id, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open the poll options: ${err.message}`);
+  }
+});
+
+app.action('compose_preview', async ({ ack, body, client }) => {
+  await ack();
+  const { meta, question } = readComposeState(body.view);
+
+  // A question still sitting in the form counts. A preview that left it out
+  // would be a preview of a different poll from the one the button next to it
+  // would post.
+  const staged = questionFormError(question)
+    ? [...(meta.savedQuestions || [])]
+    : [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)];
+
+  if (!staged.length) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), 'Write a question first — there is nothing to preview yet.')
+    });
+  }
+
+  // Unlike the options screen there is nothing here worth dropping to make it
+  // fit: a preview of part of the poll would be worse than none. Post Poll is
+  // right next to this button and does not go through a view at all.
+  const carried = { ...meta, savedQuestions: staged };
+  if (!draftFitsInView(carried)) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), `${METADATA_FULL} Posting still works — it is only the preview that cannot carry this much.`)
+    });
+  }
+
+  try {
+    await client.views.push({ trigger_id: body.trigger_id, view: buildPreviewModal(carried) });
+  } catch (err) {
+    console.error('compose_preview push error:', err);
+    await dmUser(client, body.user.id, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open the preview: ${err.message}`);
+  }
 });
 
 // ==================== VIEW SUBMISSIONS ====================
 
-app.view('poll_submit', async ({ ack, body, view }) => {
-  const meta = JSON.parse(view.private_metadata);
-  const values = view.state.values;
-  const settings = readMainModalSettings(values, meta);
-  const mergedMeta = { ...meta, ...settings };
+// 🚀 Post Poll, straight from the compose screen. This is the whole of the
+// ordinary path: one screen, one submit.
+app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => {
+  const { meta, qNum, question } = readComposeState(view);
+  const alreadyHas = (meta.savedQuestions || []).length > 0;
 
-  await ack({
-    response_action: 'push',
-    view: buildQuestionModal(mergedMeta)
-  });
-});
-
-app.view('question_submit', async ({ ack, body, view, client }) => {
-  const meta = JSON.parse(view.private_metadata);
-  const values = view.state.values;
-  const qNum = meta.savedQuestions.length + 1;
-  const isEditing = meta.editingIndex !== undefined && meta.editingIndex !== null;
-  const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
-
-  if (!text && !isEditing) {
-    if (!meta.savedQuestions?.length) {
+  // Validated before the ack, because response_action:'errors' *is* the ack and
+  // cannot follow one. A blank form is only an error when it is the only
+  // question there is - with questions already added it means "no more". But a
+  // form with choices and no question is a slip, not a decision, so it is
+  // caught rather than quietly dropped along with what was typed in it.
+  if (question.text || question.optionsRaw || !alreadyHas) {
+    const problem = questionFormError(question);
+    if (problem === 'text') {
       return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please enter a question.' } });
     }
-    return await ack({ response_action: 'push', view: buildPreviewModal(meta) });
-  }
-
-  if (text) {
-    if (!AUTO_OPTION_TYPES.includes(type) && parseOptions(optionsRaw).length < 2) {
+    if (problem === 'options') {
       return await ack({ response_action: 'errors', errors: { [`q_options_${qNum}`]: 'Please enter at least 2 options.' } });
     }
   }
 
-  const newQ = text ? buildQuestion(text, type, optionsRaw, allowMultiple) : null;
-  let updatedQuestions = [...meta.savedQuestions];
-  if (isEditing && newQ) {
-    updatedQuestions.splice(meta.editingIndex, 0, newQ);
-  } else if (newQ) {
-    updatedQuestions.push(newQ);
-  }
+  const savedQuestions = question.text
+    ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)]
+    : [...(meta.savedQuestions || [])];
 
-  if (!updatedQuestions.length) {
-    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please add at least one question.' } });
-  }
-
-  const updatedMeta = { ...meta, savedQuestions: updatedQuestions, editingIndex: null };
-
-  if (isEditing) {
-    await ack();
-    const questionPageViewId = meta.questionPageViewId;
-    if (questionPageViewId) {
-      try { await client.views.update({ view_id: questionPageViewId, view: buildQuestionModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
-    }
-    try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
-  } else {
-    await ack({ response_action: 'push', view: buildPreviewModal(updatedMeta) });
-  }
+  // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll is
+  // several database and API round trips, and on a cold host that overran the
+  // deadline, so the creator got "we had trouble connecting" on a poll that had
+  // in fact been created.
+  await ack({ response_action: 'clear' });
+  await postComposedPoll(client, { ...meta, savedQuestions }, body, view, context);
 });
 
+app.view('poll_options_submit', async ({ ack, body, view, client }) => {
+  const meta = JSON.parse(view.private_metadata);
+  const merged = { ...meta, ...readOptionsSettings(view.state.values, meta) };
+  await ack();
+
+  // Acking pops this screen off and reveals the compose screen, which is then
+  // rebuilt so its summary line reflects what was just saved. Rebuilding from
+  // the captured metadata is what keeps the question, title and picks intact.
+  const composeViewId = meta.composeViewId || view.root_view_id;
+  if (!composeViewId) return;
+  try {
+    await client.views.update({ view_id: composeViewId, view: rebuildComposeView(merged) });
+  } catch (err) { console.warn('compose refresh failed:', err.message); }
+});
+
+// Only ever an edit now - adding a question happens on the compose screen.
+app.view('question_submit', async ({ ack, body, view, client }) => {
+  const meta = JSON.parse(view.private_metadata);
+  const qNum = (meta.savedQuestions || []).length + 1;
+  const question = readCurrentQuestion(view.state.values, qNum);
+
+  const problem = questionFormError(question);
+  if (problem === 'text') {
+    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please enter a question.' } });
+  }
+  if (problem === 'options') {
+    return await ack({ response_action: 'errors', errors: { [`q_options_${qNum}`]: 'Please enter at least 2 options.' } });
+  }
+
+  // Put back where it was taken from: question_action removes the question being
+  // edited, so the index it was at is where the edited version belongs.
+  const questions = [...(meta.savedQuestions || [])];
+  const at = Number.isInteger(meta.editingIndex) ? meta.editingIndex : questions.length;
+  questions.splice(at, 0, buildQuestion(question.text, question.type, question.optionsRaw));
+
+  await ack();
+  const composeViewId = meta.questionPageViewId || view.root_view_id;
+  if (!composeViewId) return;
+  try {
+    await client.views.update({
+      view_id: composeViewId,
+      view: rebuildComposeView({ ...meta, savedQuestions: questions, editingIndex: null })
+    });
+  } catch (err) { console.warn('compose refresh failed:', err.message); }
+});
+
+// 🚀 Post Poll from the preview screen. The destinations were captured on the
+// compose screen, so unlike before they arrive in the metadata rather than in
+// this submission - which is why ← Back no longer resets them.
 app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
-  // The destinations are picked on this modal, so they arrive in the submission
-  // rather than in the metadata that has been carried since the first screen.
-  const meta = { ...JSON.parse(view.private_metadata), ...readDestinations(view.state?.values) };
-
-  // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll
-  // is several database and API round trips, and on a cold host that overran
-  // the deadline, so the user got "we had trouble connecting" on a poll that
-  // had in fact been created. Clearing the stack leaves no stale modal behind.
+  const meta = JSON.parse(view.private_metadata);
   await ack({ response_action: 'clear' });
+  await postComposedPoll(client, meta, body, view, context);
+});
 
+// Shared by both Post Poll buttons: create it, post it, and report where it
+// went. The modal stack is already cleared by the time this runs, so every
+// outcome has to be reported in a message.
+async function postComposedPoll(client, meta, body, view, context) {
   try {
     // Same key authorize() resolved this request with, so the auto-close
     // sweeper can find the token again later.
@@ -2126,11 +1234,12 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       await client.chat.postEphemeral({ channel: confirmChannel, user: meta.userId, text, blocks });
     }
   } catch (err) {
-    console.error('poll_preview_submit error:', err);
+    console.error('postComposedPoll error:', err);
     // The modal is already gone, so the only way left to report this is a DM.
     await dmUser(client, meta.userId, `❌ ${err.message || 'Failed to create poll.'}`);
   }
-});
+}
+
 
 app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
   const { pollId } = JSON.parse(view.private_metadata);
@@ -2543,27 +1652,15 @@ app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
   await updatePollMessage(client, finalPoll);
 });
 
-// "📊 View Results" button on closed poll message
+
 app.action('view_results_modal', async ({ ack, body, client, action }) => {
   await ack();
   try {
     const poll = await getPoll(action.value);
     if (!poll) return;
-    const participants = getAllVoters(poll).size;
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        title: { type: 'plain_text', text: 'Poll Results' },
-        close: { type: 'plain_text', text: 'Close' },
-        blocks: [
-          { type: 'header', text: { type: 'plain_text', text: poll.title } },
-          ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-          { type: 'context', elements: [{ type: 'mrkdwn', text: `🔒 Closed  ·  *${participants}* participant${participants !== 1 ? 's' : ''}  ·  Created by <@${poll.creator}>` }] },
-          { type: 'divider' },
-          ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, body.user.id))
-        ]
-      }
+      view: buildResultsModal(poll, body.user.id)
     });
   } catch (err) {
     console.error('view_results_modal error:', err);
@@ -2586,8 +1683,13 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
     if (poll.status === 'closed') return await deny('⚠️ This poll is already closed.');
 
     // Final results belong where the poll was being read, not necessarily where
-    // it was first posted - the same poll can be in several channels.
-    const channel = body.channel?.id || poll.channelId;
+    // it was first posted - the same poll can be in several channels. But this
+    // button is on the poll lists now as well, and those can be run anywhere:
+    // a click from a channel the poll was never posted to falls back to the
+    // poll's own channel rather than dropping its results into a bystander.
+    const from = body.channel?.id;
+    const showsThisPoll = from && pollMessageRefs(poll).some(r => r.channelId === from);
+    const channel = showsThisPoll ? from : (poll.channelId || from);
     const participants = getAllVoters(poll).size;
     if (participants > 0) {
       return await client.views.open({

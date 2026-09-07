@@ -10,6 +10,8 @@ const assert = require('node:assert');
 const {
   MAX_OPTIONS_PER_QUESTION,
   MAX_QUESTIONS_PER_POLL,
+  MAX_VIEW_METADATA,
+  draftFitsInView,
   MAX_POLLS_PER_USER_PER_DAY,
   MAX_NOTIFICATIONS_PER_USER_PER_HOUR,
   MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR,
@@ -51,6 +53,79 @@ test('rejects too many options in one question', () => {
 test('rejects too many questions in one poll', () => {
   const questions = Array.from({ length: MAX_QUESTIONS_PER_POLL + 1 }, (_, i) => q(`Q${i + 1}`));
   assert.throws(() => validatePollInputs('Title', '', questions), /exceeds maximum number of questions/);
+});
+
+// The draft-size ceiling. This is the limit that actually fires when a poll gets
+// long: MAX_QUESTIONS_PER_POLL sits behind it and cannot be reached through the
+// builder, because a half-finished poll travels inside a Slack view's
+// private_metadata and is therefore capped in bytes rather than questions.
+
+// The shape the poll builder carries between screens.
+const draft = (questions = []) => ({
+  channelId: 'C0123456789',
+  userId: 'U0123456789',
+  savedQuestions: questions,
+  destChannels: ['C0123456789'],
+  destUsers: []
+});
+
+const composed = (text, options) => ({ text, type: 'multiple_choice', options, allowMultiple: false });
+
+test('an empty draft fits, with room to spare', () => {
+  assert.strictEqual(draftFitsInView(draft()), true);
+});
+
+// Grow one question until the serialised draft crosses the limit, then check
+// both sides of that exact boundary - more honest than computing the overhead
+// of JSON.stringify by hand.
+function atBoundary() {
+  const meta = draft();
+  let pad = 0;
+  while (JSON.stringify({ ...meta, savedQuestions: [composed('x'.repeat(pad), [])] }).length <= MAX_VIEW_METADATA) pad++;
+  return {
+    over:  { ...meta, savedQuestions: [composed('x'.repeat(pad), [])] },
+    under: { ...meta, savedQuestions: [composed('x'.repeat(pad - 1), [])] }
+  };
+}
+
+test('a draft right on the ceiling still fits', () => {
+  const { under } = atBoundary();
+  assert.ok(JSON.stringify(under).length <= MAX_VIEW_METADATA);
+  assert.strictEqual(draftFitsInView(under), true);
+});
+
+test('the first character past the ceiling does not fit', () => {
+  const { over } = atBoundary();
+  assert.ok(JSON.stringify(over).length > MAX_VIEW_METADATA);
+  assert.strictEqual(draftFitsInView(over), false);
+});
+
+test('a realistic multi-question poll is nowhere near the ceiling', () => {
+  const questions = Array.from({ length: 5 }, (_, i) =>
+    composed(`Which option do you prefer for area ${i + 1}?`, ['Dark mode', 'Offline sync', 'Better search']));
+  assert.strictEqual(draftFitsInView(draft(questions)), true);
+});
+
+test('the ceiling bites well before MAX_QUESTIONS_PER_POLL, which is why it exists', () => {
+  const questions = Array.from({ length: MAX_QUESTIONS_PER_POLL }, (_, i) =>
+    composed(`Which option do you prefer for area ${i + 1}?`, ['Dark mode', 'Offline sync', 'Better search']));
+  // A poll the validator would accept, that the builder cannot carry - so the
+  // builder has to refuse it in words rather than let Slack drop the view.
+  validatePollInputs('Title', '', questions);
+  assert.strictEqual(draftFitsInView(draft(questions)), false);
+});
+
+test('a draft is measured whole, not per question - long questions bite sooner', () => {
+  const wordy = composed(
+    'Thinking about the last three months, how well did our release process support the work you were trying to do?',
+    ['Very well, no complaints', 'Well, with minor friction', 'Neither well nor badly',
+     'Badly, it slowed me down', 'Very badly, it blocked me', 'I have no opinion']);
+  const terse = composed('Lunch?', ['Thai', 'Sushi']);
+  const fitsWordy = n => draftFitsInView(draft(Array(n).fill(wordy)));
+  const fitsTerse = n => draftFitsInView(draft(Array(n).fill(terse)));
+  // Same question count, different verdicts: the limit is bytes, not questions.
+  assert.strictEqual(fitsTerse(10), true);
+  assert.strictEqual(fitsWordy(10), false);
 });
 
 test('rejects a missing title and an empty question list', () => {
