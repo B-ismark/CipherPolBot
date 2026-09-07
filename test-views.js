@@ -37,6 +37,10 @@ const LIMITS = {
   privateMetadata: 3000
 };
 
+// Pictographs, dingbats, arrows and the variation selector - the ranges Slack
+// has a :shortcode: for and will therefore escape in a view's chrome.
+const EMOJI = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/u;
+
 function auditView(view, label) {
   assert.ok(view.blocks.length <= LIMITS.blocksPerView,
     `${label}: ${view.blocks.length} blocks exceeds ${LIMITS.blocksPerView}`);
@@ -45,6 +49,13 @@ function auditView(view, label) {
     if (view[key]) {
       assert.ok(view[key].text.length <= LIMITS.viewTitle,
         `${label}: ${key} "${view[key].text}" is ${view[key].text.length} chars, over ${LIMITS.viewTitle}`);
+      // A modal's chrome is not block content: Slack escapes an emoji here back
+      // into its :shortcode:, so "🚀 Post Poll" reaches the user reading
+      // literally ":rocket: Post Poll". It renders fine inside a block, which
+      // is what made this look like a mystery rather than a rule - the same
+      // character worked three blocks further down the same screen.
+      assert.doesNotMatch(view[key].text, EMOJI,
+        `${label}: ${key} "${view[key].text}" carries an emoji, which Slack will show as a :shortcode:`);
     }
   }
 
@@ -233,14 +244,15 @@ test('no label or hint on the compose screen runs past three phone lines', () =>
   }
 });
 
-test('the settings summary stays inside three phone lines', () => {
-  // It is the last thing on the screen and the least urgent, but it grew to
-  // four wrapped lines once it listed where every setting lived.
+test('the settings summary stays inside two phone lines however much is changed', () => {
+  // It is the last thing on the screen and the least urgent. Every setting at
+  // once is the worst case, and it still has to read as a glance rather than a
+  // paragraph pressed against the right edge.
   const longest = settingsSummary({
-    pollTitle: 'Q3 planning', pollSettings: ['anonymous', 'allow_revote'],
-    showResults: 'on_close', orderByVotes: true
+    pollTitle: 'Q3 planning offsite venue', pollSettings: ['anonymous', 'allow_revote'],
+    showResults: 'creator_only', orderByVotes: true, closeAt: Date.now()
   });
-  assert.ok(longest.length <= MOBILE_LINE * 4, `summary is ${longest.length} chars: "${longest}"`);
+  assert.ok(longest.length <= MOBILE_LINE * 2, `summary is ${longest.length} chars: "${longest}"`);
 });
 
 test('no type picker entry can lose its meaning to truncation', () => {
@@ -403,18 +415,33 @@ test('a half-typed question survives a trip to the options screen and back', () 
   }
 });
 
-test('the summary line names the title, so moving it is not hiding it', () => {
-  assert.match(settingsSummary({ pollTitle: 'Q3 planning' }), /Q3 planning/);
-  assert.match(settingsSummary({}), /Named after your first question/);
-  assert.match(settingsSummary({}), /More options/);
+test('a poll nobody has configured gets no summary line at all', () => {
+  // The line used to list four values nobody had chosen and then explain the
+  // button sitting directly above it. Silence is the correct report when there
+  // is nothing to report.
+  assert.strictEqual(settingsSummary({}), null);
+  assert.strictEqual(settingsSummary({ showResults: 'realtime' }), null);
 });
 
-test('the summary line reports what the settings actually are', () => {
-  assert.match(settingsSummary({}), /Live results/);
+test('the compose screen drops the summary block when there is no summary', () => {
+  const plain = buildComposeModal(draft());
+  const configured = buildComposeModal({ ...draft(), pollSettings: ['anonymous'] });
+  assert.ok(!plain.blocks.some(b => b.type === 'context'),
+    'a default poll should carry no context block');
+  assert.ok(configured.blocks.some(b => b.type === 'context'),
+    'a changed setting should be reported back');
+  assert.strictEqual(configured.blocks.length, plain.blocks.length + 1);
+});
+
+test('the summary line reports only what was actually changed', () => {
+  assert.match(settingsSummary({ pollTitle: 'Q3 planning' }), /Q3 planning/);
   assert.match(settingsSummary({ showResults: 'on_close' }), /after close/);
   assert.match(settingsSummary({ showResults: 'creator_only' }), /creator only/);
   assert.match(settingsSummary({ pollSettings: ['anonymous'] }), /Anonymous/);
   assert.match(settingsSummary({ pollSettings: ['allow_revote'] }), /Vote changes/);
+  assert.match(settingsSummary({ orderByVotes: true }), /Sorted by votes/);
+  // The default never appears, or the line is back to reporting non-news.
+  assert.doesNotMatch(settingsSummary({ pollSettings: ['anonymous'] }), /Live results/);
 });
 
 test('restoreQuestion carries only what the form can restore', () => {
