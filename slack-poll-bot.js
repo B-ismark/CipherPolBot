@@ -241,7 +241,8 @@ const {
   pollCreationLimitMessage,
   checkPollCreationRateLimit,
   checkShareRateLimit,
-  checkNotificationRateLimit
+  checkNotificationRateLimit,
+  draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
 const { AUTO_OPTION_TYPES, parseOptions, parseComposeArgs, questionFormError } = require('./lib/compose');
@@ -1629,17 +1630,9 @@ function readComposeState(view) {
   };
 }
 
-// Slack rejects a view whose private_metadata runs past 3000 characters, and
-// the whole draft poll travels in it - so questions long enough hit that ceiling
-// well before the 50 the validator allows. A rejected view is a silent failure,
-// which is the worst kind, so the draft is measured where it grows and the limit
-// is said out loud instead.
-const MAX_VIEW_METADATA = 3000;
+// What to say when draftFitsInView says no. The limit itself lives with the
+// other limits in lib/validation.js; this is only the wording.
 const METADATA_FULL = 'This draft is as long as the builder can carry — Slack limits how much a half-finished poll can hold. Post what you have, or shorten a question.';
-
-function metadataSize(meta) {
-  return JSON.stringify(meta).length;
-}
 
 // A question as read off a form, in the shape the form builder wants it back.
 function restoreQuestion(q = {}) {
@@ -2217,7 +2210,7 @@ app.action('add_another_question', async ({ ack, body, client }) => {
   // Refused here rather than accepted and then silently dropped by Slack: the
   // question still in the form is what would be lost, and it is still on screen
   // to be posted or shortened.
-  if (metadataSize(updatedMeta) > MAX_VIEW_METADATA) {
+  if (!draftFitsInView(updatedMeta)) {
     return client.views.update({
       view_id: body.view.id,
       view: buildComposeModal(meta, question.type, restoreQuestion(question), METADATA_FULL)
@@ -2235,7 +2228,7 @@ app.action('compose_options', async ({ ack, body, client }) => {
   // draft will not fit alongside it the half-typed question is what gives way -
   // and the screen says so, rather than losing it quietly.
   let carried = { ...meta, draft: question, composeViewId: body.view.id };
-  const draftDropped = metadataSize(carried) > MAX_VIEW_METADATA;
+  const draftDropped = !draftFitsInView(carried);
   if (draftDropped) carried = { ...meta, composeViewId: body.view.id };
 
   try {
@@ -2273,7 +2266,7 @@ app.action('compose_preview', async ({ ack, body, client }) => {
   // fit: a preview of part of the poll would be worse than none. Post Poll is
   // right next to this button and does not go through a view at all.
   const carried = { ...meta, savedQuestions: staged };
-  if (metadataSize(carried) > MAX_VIEW_METADATA) {
+  if (!draftFitsInView(carried)) {
     return client.views.update({
       view_id: body.view.id,
       view: buildComposeModal(meta, question.type, restoreQuestion(question), `${METADATA_FULL} Posting still works — it is only the preview that cannot carry this much.`)
