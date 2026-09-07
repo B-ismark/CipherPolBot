@@ -107,21 +107,32 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ```
 → Opens **New Poll**: one screen, and posting is one click from it.
 
-The screen asks in the order a poll is actually thought of - the question and
-its choices first, then what the poll is called, then where it goes. Question
-types are multiple choice, yes/no, agree/disagree, 1-to-5 and 1-to-10 scales,
-NPS, Likert matrix, ranking and open-ended.
+It holds three things and nothing else: the question, its choices, and where it
+goes. That fits one screen without scrolling, so the whole poll is in view at
+once. Question types are multiple choice - *pick one* or *pick several* -
+yes/no, agree/disagree, 1-to-5 and 1-to-10 scales, NPS, Likert matrix, ranking
+and open-ended. Picking several is an entry in the type picker rather than a
+checkbox underneath, so the decision is made where the kind of question is
+already being chosen.
 
-Everything else has a working default and lives behind **⚙️ More options** -
-anonymous voting, whether votes can be changed, who sees the results and when,
-result ordering, and an auto-close time. A line at the bottom of the screen
-says what those defaults currently are, so nothing is hidden, only out of the
-way. Two more buttons sit next to it: **＋ Add another question** for a
+Everything with a working answer already lives behind **⚙️ More options** - the
+title, a description, anonymous voting, whether votes can be changed, who sees
+the results and when, result ordering, and an auto-close time. A line at the
+bottom of the screen names what the poll is called and what those settings
+currently are, so moving them out of the way is not the same as hiding them.
+Two more buttons sit next to it: **＋ Add another question** for a
 multi-question poll, and **👁 Preview** to see the poll as it will look. Neither
 is a step you have to take.
 
-**The title is optional.** A poll with no title is named after its first
-question, which for a single-question poll is what you would have typed anyway.
+Progressive disclosure in Slack is not free the way it is on the web: there is
+no way to collapse a field, so revealing one costs a click *and* a round trip -
+and on a host that sleeps, that is the last thing you want on the common path.
+So the screen is kept short by leaving things out rather than by folding them
+up, and the only round trips are the ones you ask for.
+
+**The title is optional**, which is why it is in there rather than on the way
+in. A poll with no title is named after its first question - for a
+single-question poll, the sentence you would have typed twice.
 
 **Straight from the command line.** `/poll Lunch? Thai, Sushi, Pizza` opens the
 screen with the question and all three choices already filled in - the question

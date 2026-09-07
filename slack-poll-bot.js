@@ -245,7 +245,7 @@ const {
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { AUTO_OPTION_TYPES, parseOptions, parseComposeArgs, questionFormError } = require('./lib/compose');
+const { AUTO_OPTION_TYPES, parseOptions, parseComposeArgs, questionFormError, resolveQuestionType, formTypeFor } = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 const {
   MAX_DESTINATIONS, normalizeDestinations, assertDestinationLimit, dedupeTargets
@@ -544,7 +544,8 @@ const QUESTION_TYPE_GROUPS = [
   {
     label: { type: 'plain_text', text: 'Basic' },
     options: [
-      { text: { type: 'plain_text', text: '📋 Multiple choice' }, value: 'multiple_choice' },
+      { text: { type: 'plain_text', text: '📋 Multiple choice — pick one' },     value: 'multiple_choice' },
+      { text: { type: 'plain_text', text: '☑️ Multiple choice — pick several' }, value: 'multiple_select' },
       { text: { type: 'plain_text', text: '✅ Yes / No' },        value: 'yes_no' },
       { text: { type: 'plain_text', text: '⚖️ Agree / Disagree' }, value: 'agree_disagree' }
     ]
@@ -650,28 +651,9 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
     });
   }
 
-  // Only show multi-select for applicable types
-  const multiSelectApplicable = !['open_ended', 'yes_no', 'agree_disagree', 'scale_5', 'scale_10', 'nps', 'likert', 'ranking'].includes(questionType);
-  if (multiSelectApplicable) {
-    blocks.push({
-      type: 'input',
-      block_id: `q_multiple_${qNum}`,
-      label: { type: 'plain_text', text: 'Options' },
-      optional: true,
-      element: {
-        type: 'checkboxes',
-        action_id: 'value',
-        options: [{
-          text: { type: 'mrkdwn', text: '*Allow multiple selections*' },
-          value: 'multiple'
-        }],
-        ...(restore.allowMultiple ? {
-          initial_options: [{ text: { type: 'mrkdwn', text: '*Allow multiple selections*' }, value: 'multiple' }]
-        } : {})
-      }
-    });
-  }
-
+  // No "allow multiple selections" checkbox: picking several is an entry in the
+  // type picker above, which is one block fewer and puts the decision where the
+  // kind of question is already being chosen.
   return blocks;
 }
 
@@ -717,10 +699,13 @@ const ORDER_BY_VOTES_OPTIONS = [
 ];
 
 // What the poll will do, on one line, so the creator never has to open the
-// options screen just to find out what the defaults were.
+// options screen to find out what the defaults were - and, now that the title
+// lives in there too, never has to open it to see what the poll is called. This
+// line is what keeps moving things out of the way from turning into hiding them.
 function settingsSummary(meta) {
-  const { pollSettings = [], showResults = DEFAULT_SHOW_RESULTS, closeAt, orderByVotes = false } = meta;
+  const { pollTitle = '', pollSettings = [], showResults = DEFAULT_SHOW_RESULTS, closeAt, orderByVotes = false } = meta;
   const parts = [
+    pollTitle ? `📝 “${pollTitle}”` : '📝 Named after your first question',
     showResults === 'realtime' ? '📊 Live results'
       : showResults === 'on_close' ? '👁 Results after close'
       : '👁 Results for creator only',
@@ -729,7 +714,7 @@ function settingsSummary(meta) {
     ...(orderByVotes ? ['↕️ Sorted by votes'] : []),
     ...(closeAt ? [`⏰ Closes ${new Date(closeAt).toLocaleString()}`] : [])
   ];
-  return `${parts.join('  ·  ')}  —  change these under *⚙️ More options*`;
+  return `${parts.join('  ·  ')}  —  title, description and these settings live under *⚙️ More options*`;
 }
 
 // The whole poll on one screen, in the order it is thought of: the question
@@ -742,7 +727,7 @@ function settingsSummary(meta) {
 // the destination picks, is captured into private_metadata before another screen
 // is pushed. That is why going back no longer resets the pickers.
 function buildComposeModal(meta, currentType = 'multiple_choice', restore = {}, errorMsg = null) {
-  const { savedQuestions = [], pollTitle = '', pollDescription = '', channelId } = meta;
+  const { savedQuestions = [], channelId } = meta;
   const qNum = savedQuestions.length + 1;
   const hasSaved = savedQuestions.length > 0;
   // ?? not ||, so a creator who clears the channel picker stays cleared.
@@ -766,35 +751,13 @@ function buildComposeModal(meta, currentType = 'multiple_choice', restore = {}, 
       // ── The question ─────────────────────────────────
       ...questionFormBlocks(qNum, currentType, restore, { optional: hasSaved }),
       { type: 'divider' },
-      // ── What it is called ────────────────────────────
-      {
-        type: 'input', block_id: 'poll_title',
-        label: { type: 'plain_text', text: 'Poll title' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Optional — a poll with no title is named after its first question' },
-        element: {
-          type: 'plain_text_input', action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Only needed if it should differ from the question...' },
-          ...(pollTitle ? { initial_value: pollTitle } : {})
-        }
-      },
-      {
-        type: 'input', block_id: 'poll_description',
-        label: { type: 'plain_text', text: 'Description' },
-        optional: true,
-        hint: { type: 'plain_text', text: 'Markup stays literal here: *bold*, _italic_ and `code` render once the poll is posted' },
-        element: {
-          type: 'plain_text_input', action_id: 'value', multiline: true,
-          placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
-          ...(pollDescription ? { initial_value: pollDescription } : {})
-        }
-      },
-      { type: 'divider' },
       // ── Where it goes ────────────────────────────────
-      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
+      // No heading above these: two labelled pickers do not need a label of
+      // their own, so the first one carries the framing instead.
       ...destinationBlocks({
         channels: destChannels,
         users: destUsers,
+        channelsLabel: 'Where to post',
         peopleHint: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.'
       }),
       {
@@ -815,7 +778,10 @@ function buildComposeModal(meta, currentType = 'multiple_choice', restore = {}, 
 // button, saved back into private_metadata, and summarised in one line on the
 // screen it came from - so nothing here is hidden, only out of the way.
 function buildOptionsModal(meta, draftDropped = false) {
-  const { pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false } = meta;
+  const {
+    pollTitle = '', pollDescription = '',
+    pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false
+  } = meta;
   const activeSettings = pollSettings.filter(v => VOTING_SETTINGS_OPTIONS.some(o => o.value === v));
 
   return {
@@ -831,6 +797,33 @@ function buildOptionsModal(meta, draftDropped = false) {
         text: { type: 'mrkdwn', text: '⚠️ *The question you were part-way through typing will not be here when you go back* — this poll is long enough that the draft no longer fits. Cancel, add that question first, then come back.' }
       }] : []),
       { type: 'context', elements: [{ type: 'mrkdwn', text: 'All of these have a working default — change only what you need.' }] },
+      // The title is an override rather than an input: a poll with none is named
+      // after its first question, so asking for it on the way in was asking
+      // people to write the same sentence twice. It lives here with the other
+      // things that have an answer already.
+      {
+        type: 'input', block_id: 'poll_title',
+        label: { type: 'plain_text', text: 'Poll title' },
+        optional: true,
+        hint: { type: 'plain_text', text: 'Leave blank and the poll is named after its first question' },
+        element: {
+          type: 'plain_text_input', action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Only needed if it should differ from the question...' },
+          ...(pollTitle ? { initial_value: pollTitle } : {})
+        }
+      },
+      {
+        type: 'input', block_id: 'poll_description',
+        label: { type: 'plain_text', text: 'Description' },
+        optional: true,
+        hint: { type: 'plain_text', text: 'Markup stays literal here: *bold*, _italic_ and `code` render once the poll is posted' },
+        element: {
+          type: 'plain_text_input', action_id: 'value', multiline: true,
+          placeholder: { type: 'plain_text', text: 'Add context or instructions (optional)...' },
+          ...(pollDescription ? { initial_value: pollDescription } : {})
+        }
+      },
+      { type: 'divider' },
       {
         type: 'input', block_id: 'poll_settings',
         label: { type: 'plain_text', text: 'Voting' },
@@ -1597,8 +1590,7 @@ function readCurrentQuestion(values, qNum) {
   return {
     text:          (values[`q_text_${qNum}`]?.value?.value || '').trim(),
     type:          values[`q_type_${qNum}`]?.question_type_changed?.selected_option?.value || 'multiple_choice',
-    optionsRaw:    values[`q_options_${qNum}`]?.value?.value || '',
-    allowMultiple: (values[`q_multiple_${qNum}`]?.value?.selected_options?.length || 0) > 0
+    optionsRaw:    values[`q_options_${qNum}`]?.value?.value || ''
   };
 }
 
@@ -1607,6 +1599,8 @@ function readCurrentQuestion(values, qNum) {
 function readOptionsSettings(values, meta) {
   const closeAtRaw = values.poll_close_at?.value?.selected_date_time;
   return {
+    pollTitle:       (values.poll_title?.value?.value       ?? meta.pollTitle       ?? '').trim(),
+    pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
     pollSettings: values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
     closeAt:      closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : null,
     showResults:  values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? DEFAULT_SHOW_RESULTS,
@@ -1625,13 +1619,10 @@ function readComposeState(view) {
   const meta = JSON.parse(view.private_metadata);
   const values = view.state?.values || {};
   const qNum = (meta.savedQuestions || []).length + 1;
+  // The title and description are not on this screen any more, so they simply
+  // travel on in the metadata the options screen put them there.
   return {
-    meta: {
-      ...meta,
-      pollTitle:       (values.poll_title?.value?.value       ?? meta.pollTitle       ?? '').trim(),
-      pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
-      ...readDestinations(values)
-    },
+    meta: { ...meta, ...readDestinations(values) },
     qNum,
     question: readCurrentQuestion(values, qNum)
   };
@@ -1643,7 +1634,7 @@ const METADATA_FULL = 'This draft is as long as the builder can carry — Slack 
 
 // A question as read off a form, in the shape the form builder wants it back.
 function restoreQuestion(q = {}) {
-  return { text: q.text || '', options: q.optionsRaw || '', allowMultiple: !!q.allowMultiple };
+  return { text: q.text || '', options: q.optionsRaw || '' };
 }
 
 // Rebuild the compose screen from metadata alone, half-typed question and all.
@@ -1656,7 +1647,11 @@ function rebuildComposeView(meta) {
   return buildComposeModal(rest, draft.type || 'multiple_choice', restoreQuestion(draft));
 }
 
-function buildQuestion(text, type, optionsRaw, allowMultiple) {
+// Takes the type as the *form* offers it - where "pick several" is its own
+// entry - and returns the question in the shape polls have always been stored
+// in, so nothing downstream or already in the database has to know about that.
+function buildQuestion(text, formType, optionsRaw) {
+  const { type, allowMultiple } = resolveQuestionType(formType);
   const options = AUTO_OPTION_TYPES.includes(type) ? getAutoOptions(type) : parseOptions(optionsRaw);
   return { text, type, options, allowMultiple };
 }
@@ -2146,10 +2141,9 @@ app.action('question_action', async ({ ack, body, client }) => {
     try {
       await client.views.push({
         trigger_id: body.trigger_id,
-        view: buildQuestionModal(editMeta, q.type, {
+        view: buildQuestionModal(editMeta, formTypeFor(q), {
           text: q.text,
-          options: ['multiple_choice', 'likert', 'ranking'].includes(q.type) ? q.options.join('\n') : '',
-          allowMultiple: q.allowMultiple
+          options: ['multiple_choice', 'likert', 'ranking'].includes(q.type) ? q.options.join('\n') : ''
         })
       });
     } catch (err) { console.error('edit push error:', err); }
@@ -2210,7 +2204,7 @@ app.action('add_another_question', async ({ ack, body, client }) => {
 
   const updatedMeta = {
     ...meta,
-    savedQuestions: [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple)],
+    savedQuestions: [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)],
     editingIndex: null
   };
 
@@ -2260,7 +2254,7 @@ app.action('compose_preview', async ({ ack, body, client }) => {
   // would post.
   const staged = questionFormError(question)
     ? [...(meta.savedQuestions || [])]
-    : [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple)];
+    : [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)];
 
   if (!staged.length) {
     return client.views.update({
@@ -2314,7 +2308,7 @@ app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => 
   }
 
   const savedQuestions = question.text
-    ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple)]
+    ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)]
     : [...(meta.savedQuestions || [])];
 
   // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll is
@@ -2358,7 +2352,7 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
   // edited, so the index it was at is where the edited version belongs.
   const questions = [...(meta.savedQuestions || [])];
   const at = Number.isInteger(meta.editingIndex) ? meta.editingIndex : questions.length;
-  questions.splice(at, 0, buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple));
+  questions.splice(at, 0, buildQuestion(question.text, question.type, question.optionsRaw));
 
   await ack();
   const composeViewId = meta.questionPageViewId || view.root_view_id;
