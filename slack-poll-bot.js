@@ -1460,10 +1460,17 @@ function buildResultsBlocks(poll, heading, viewerId = null) {
   ];
 }
 
+// Every message this poll has. messageRefs is the current shape; polls created
+// before it carry a single channelId/messageTs pair instead. Both callers have
+// to agree on that fallback or they will disagree about where the poll is - one
+// updating its messages, the other deciding where its final results belong.
+function pollMessageRefs(poll) {
+  if (poll.messageRefs?.length) return poll.messageRefs;
+  return poll.channelId && poll.messageTs ? [{ channelId: poll.channelId, messageTs: poll.messageTs }] : [];
+}
+
 async function updatePollMessage(client, poll) {
-  const refs = poll.messageRefs?.length
-    ? poll.messageRefs
-    : (poll.channelId && poll.messageTs ? [{ channelId: poll.channelId, messageTs: poll.messageTs }] : []);
+  const refs = pollMessageRefs(poll);
   const blocks = buildPollBlocks(poll);
   await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
     client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${poll.title}`, blocks })
@@ -2910,7 +2917,7 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
     // a click from a channel the poll was never posted to falls back to the
     // poll's own channel rather than dropping its results into a bystander.
     const from = body.channel?.id;
-    const showsThisPoll = from && (poll.messageRefs || []).some(r => r.channelId === from);
+    const showsThisPoll = from && pollMessageRefs(poll).some(r => r.channelId === from);
     const channel = showsThisPoll ? from : (poll.channelId || from);
     const participants = getAllVoters(poll).size;
     if (participants > 0) {
