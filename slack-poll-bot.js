@@ -244,6 +244,7 @@ const {
   checkNotificationRateLimit
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
+const { AUTO_OPTION_TYPES, parseOptions, parseComposeArgs, questionFormError } = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 const {
   MAX_DESTINATIONS, normalizeDestinations, assertDestinationLimit, dedupeTargets
@@ -515,8 +516,6 @@ const LIKERT_SCALE = [
   { label: '5 — Strongly Agree',    value: '4' }
 ];
 
-const AUTO_OPTION_TYPES = ['yes_no', 'agree_disagree', 'scale_5', 'scale_10', 'nps', 'open_ended'];
-
 function getAutoOptions(type) {
   switch (type) {
     case 'yes_no':         return ['Yes', 'No'];
@@ -535,11 +534,6 @@ function getTypeLabel(type) {
 
 function getTypeIcon(type) {
   return QUESTION_TYPE_ICONS[type] || '❓';
-}
-
-function parseOptions(raw) {
-  const sep = raw.includes('\n') ? '\n' : ',';
-  return raw.split(sep).map(o => o.trim()).filter(Boolean);
 }
 
 // ==================== MODAL BUILDERS ====================
@@ -580,7 +574,13 @@ function findTypeOption(type) {
   return QUESTION_TYPE_GROUPS[0].options[0];
 }
 
-function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}) {
+// The question form. `optional` makes the text and choices optional at the
+// Slack level, which is what lets the compose screen be submitted once at least
+// one question is already saved - the form there is for the *next* question, so
+// leaving it blank has to mean "no more", not "you forgot something". With
+// nothing saved yet the fields stay required, so Slack raises that inline
+// without a round trip.
+function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}, { optional = false } = {}) {
   const needsOptions = !AUTO_OPTION_TYPES.includes(questionType);
 
   const blocks = [
@@ -588,6 +588,7 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
       type: 'input',
       block_id: `q_text_${qNum}`,
       label: { type: 'plain_text', text: 'Question' },
+      optional,
       element: {
         type: 'plain_text_input',
         action_id: 'value',
@@ -626,7 +627,7 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
       block_id: `q_options_${qNum}`,
       label: { type: 'plain_text', text: optLabel },
       hint: { type: 'plain_text', text: optHint },
-      optional: false,
+      optional,
       element: {
         type: 'plain_text_input',
         action_id: 'value',
@@ -673,40 +674,22 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
   return blocks;
 }
 
+// The edit screen for a question that has already been added, pushed on top of
+// the compose screen. Adding a question now happens on the compose screen
+// itself, so this only ever edits one.
 function buildQuestionModal(meta, currentType = 'multiple_choice', restore = {}, errorMsg = null) {
-  const { savedQuestions = [], editingIndex } = meta;
-  const isEditing = editingIndex !== undefined && editingIndex !== null;
-  const qNum = savedQuestions.length + 1;
-
-  const addButton = isEditing ? [] : [
-    { type: 'divider' },
-    {
-      type: 'actions',
-      block_id: 'question_actions',
-      elements: [{
-        type: 'button',
-        text: { type: 'plain_text', text: '＋  Add another question' },
-        action_id: 'add_another_question'
-      }]
-    }
-  ];
+  const qNum = (meta.savedQuestions || []).length + 1;
 
   return {
     type: 'modal',
     callback_id: 'question_submit',
-    title: { type: 'plain_text', text: isEditing ? 'Edit Question' : 'Add Question' },
-    submit: { type: 'plain_text', text: isEditing ? 'Save Changes' : 'Continue →' },
-    close: { type: 'plain_text', text: '← Back' },
-    notify_on_close: true,
+    title: { type: 'plain_text', text: 'Edit Question' },
+    submit: { type: 'plain_text', text: 'Save Changes' },
+    close: { type: 'plain_text', text: 'Cancel' },
     private_metadata: JSON.stringify(meta),
     blocks: [
-      ...(savedQuestions.length > 0 && !isEditing ? [
-        ...savedQuestionsBlocks(savedQuestions),
-        { type: 'section', text: { type: 'mrkdwn', text: '*Add another question:*' } }
-      ] : []),
       ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
-      ...questionFormBlocks(qNum, currentType, restore),
-      ...addButton
+      ...questionFormBlocks(qNum, currentType, restore)
     ]
   };
 }
@@ -718,48 +701,79 @@ const SHOW_RESULTS_OPTIONS = [
   { text: { type: 'plain_text', text: 'Only to creator' },    value: 'creator_only' }
 ];
 
-function buildCreationModal(meta, errorMsg = null) {
-  const {
-    pollTitle = '', pollDescription = '', pollSettings = [],
-    closeAt, showResults = 'creator_only', orderByVotes = false
-  } = meta;
+// A poll whose point is a visible tally should show one. Defaulting to the most
+// restrictive setting meant the common intent cost two clicks in a dropdown, and
+// left a question in the channel whose answers nobody could see.
+const DEFAULT_SHOW_RESULTS = 'realtime';
 
-  const settingsOptions = [
-    { text: { type: 'mrkdwn', text: '*Anonymous* — hide who voted for what' }, value: 'anonymous' },
-    { text: { type: 'mrkdwn', text: '*Allow vote changes* — voters can update their choice' }, value: 'allow_revote' }
+const VOTING_SETTINGS_OPTIONS = [
+  { text: { type: 'mrkdwn', text: '*Anonymous* — hide who voted for what' }, value: 'anonymous' },
+  { text: { type: 'mrkdwn', text: '*Allow vote changes* — voters can update their choice' }, value: 'allow_revote' }
+];
+
+const ORDER_BY_VOTES_OPTIONS = [
+  { text: { type: 'mrkdwn', text: '*Sort by vote count* — most-voted option first' }, value: 'yes' }
+];
+
+// What the poll will do, on one line, so the creator never has to open the
+// options screen just to find out what the defaults were.
+function settingsSummary(meta) {
+  const { pollSettings = [], showResults = DEFAULT_SHOW_RESULTS, closeAt, orderByVotes = false } = meta;
+  const parts = [
+    showResults === 'realtime' ? '📊 Live results'
+      : showResults === 'on_close' ? '👁 Results after close'
+      : '👁 Results for creator only',
+    pollSettings.includes('anonymous') ? '🔒 Anonymous' : '👤 Named votes',
+    ...(pollSettings.includes('allow_revote') ? ['🔄 Vote changes allowed'] : []),
+    ...(orderByVotes ? ['↕️ Sorted by votes'] : []),
+    ...(closeAt ? [`⏰ Closes ${new Date(closeAt).toLocaleString()}`] : [])
   ];
-  const activeSettings = pollSettings.filter(v => settingsOptions.some(o => o.value === v));
-  const orderOpt = [{ text: { type: 'mrkdwn', text: '*Sort by vote count* — most-voted option first' }, value: 'yes' }];
+  return `${parts.join('  ·  ')}  —  change these under *⚙️ More options*`;
+}
+
+// The whole poll on one screen, in the order it is thought of: the question
+// first, then what it is called, then where it goes. Everything else has a
+// working default and lives behind *More options*, so the ordinary poll - one
+// question, a few choices, posted here - is a single submit.
+//
+// The three buttons are what keep it to one screen. Each is a block action, so
+// each arrives with this view's full state: whatever has been typed, including
+// the destination picks, is captured into private_metadata before another screen
+// is pushed. That is why going back no longer resets the pickers.
+function buildComposeModal(meta, currentType = 'multiple_choice', restore = {}, errorMsg = null) {
+  const { savedQuestions = [], pollTitle = '', pollDescription = '', channelId } = meta;
+  const qNum = savedQuestions.length + 1;
+  const hasSaved = savedQuestions.length > 0;
+  // ?? not ||, so a creator who clears the channel picker stays cleared.
+  const destChannels = meta.destChannels ?? prefillableChannel(channelId);
+  const destUsers    = meta.destUsers ?? [];
 
   return {
     type: 'modal',
-    callback_id: 'poll_submit',
-    title: { type: 'plain_text', text: 'Create Poll' },
-    submit: { type: 'plain_text', text: meta.savedQuestions?.length ? `＋  Add Questions  (${meta.savedQuestions.length} added)` : '＋  Add Questions' },
+    callback_id: 'poll_compose_submit',
+    title: { type: 'plain_text', text: hasSaved ? `New Poll  (${savedQuestions.length})` : 'New Poll' },
+    submit: { type: 'plain_text', text: '🚀  Post Poll' },
     close: { type: 'plain_text', text: 'Cancel' },
-    notify_on_close: true,
     private_metadata: JSON.stringify(meta),
     blocks: [
       ...(errorMsg ? [{ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *${errorMsg}*` } }] : []),
-      // ── Questions summary (progressive disclosure) ────
-      ...((meta.savedQuestions?.length) ? [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*Questions added (${meta.savedQuestions.length}):*\n` +
-              meta.savedQuestions.map((q, i) => `${i + 1}. ${getTypeIcon(q.type)} ${q.text}`).join('\n')
-          }
-        },
-        { type: 'divider' }
+      // ── Questions already added ──────────────────────
+      ...(hasSaved ? [
+        ...savedQuestionsBlocks(savedQuestions),
+        { type: 'section', text: { type: 'mrkdwn', text: '*Add another question* — or leave this blank and post what you have.' } }
       ] : []),
-      // ── Content ──────────────────────────────────────
+      // ── The question ─────────────────────────────────
+      ...questionFormBlocks(qNum, currentType, restore, { optional: hasSaved }),
+      { type: 'divider' },
+      // ── What it is called ────────────────────────────
       {
         type: 'input', block_id: 'poll_title',
         label: { type: 'plain_text', text: 'Poll title' },
+        optional: true,
+        hint: { type: 'plain_text', text: 'Optional — a poll with no title is named after its first question' },
         element: {
           type: 'plain_text_input', action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Give your poll a name...' },
+          placeholder: { type: 'plain_text', text: 'Only needed if it should differ from the question...' },
           ...(pollTitle ? { initial_value: pollTitle } : {})
         }
       },
@@ -775,14 +789,55 @@ function buildCreationModal(meta, errorMsg = null) {
         }
       },
       { type: 'divider' },
+      // ── Where it goes ────────────────────────────────
+      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
+      ...destinationBlocks({
+        channels: destChannels,
+        users: destUsers,
+        peopleHint: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.'
+      }),
+      {
+        type: 'actions', block_id: 'compose_actions',
+        elements: [
+          { type: 'button', text: { type: 'plain_text', text: '＋  Add another question' }, action_id: 'add_another_question' },
+          { type: 'button', text: { type: 'plain_text', text: '⚙️  More options', emoji: true }, action_id: 'compose_options' },
+          { type: 'button', text: { type: 'plain_text', text: '👁  Preview', emoji: true }, action_id: 'compose_preview' }
+        ]
+      },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: settingsSummary(meta) }] }
+    ]
+  };
+}
+
+// Everything that has a sensible default, kept off the compose screen so it
+// cannot make writing a question feel like filling in a form. Reached by a
+// button, saved back into private_metadata, and summarised in one line on the
+// screen it came from - so nothing here is hidden, only out of the way.
+function buildOptionsModal(meta, draftDropped = false) {
+  const { pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false } = meta;
+  const activeSettings = pollSettings.filter(v => VOTING_SETTINGS_OPTIONS.some(o => o.value === v));
+
+  return {
+    type: 'modal',
+    callback_id: 'poll_options_submit',
+    title: { type: 'plain_text', text: 'Poll Options' },
+    submit: { type: 'plain_text', text: 'Save' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    private_metadata: JSON.stringify(meta),
+    blocks: [
+      ...(draftDropped ? [{
+        type: 'section',
+        text: { type: 'mrkdwn', text: '⚠️ *The question you were part-way through typing will not be here when you go back* — this poll is long enough that the draft no longer fits. Cancel, add that question first, then come back.' }
+      }] : []),
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'All of these have a working default — change only what you need.' }] },
       {
         type: 'input', block_id: 'poll_settings',
         label: { type: 'plain_text', text: 'Voting' },
         optional: true,
         element: {
           type: 'checkboxes', action_id: 'value',
-          options: settingsOptions,
-          ...(activeSettings.length ? { initial_options: activeSettings.map(v => settingsOptions.find(o => o.value === v)) } : {})
+          options: VOTING_SETTINGS_OPTIONS,
+          ...(activeSettings.length ? { initial_options: activeSettings.map(v => VOTING_SETTINGS_OPTIONS.find(o => o.value === v)) } : {})
         }
       },
       {
@@ -800,11 +855,10 @@ function buildCreationModal(meta, errorMsg = null) {
         optional: true,
         element: {
           type: 'checkboxes', action_id: 'value',
-          options: orderOpt,
-          ...(orderByVotes ? { initial_options: orderOpt } : {})
+          options: ORDER_BY_VOTES_OPTIONS,
+          ...(orderByVotes ? { initial_options: ORDER_BY_VOTES_OPTIONS } : {})
         }
       },
-      { type: 'divider' },
       {
         type: 'input', block_id: 'poll_close_at',
         label: { type: 'plain_text', text: 'Auto-close date & time' },
@@ -882,11 +936,25 @@ function savedQuestionsBlocks(savedQuestions) {
   ];
 }
 
+// Where the poll is about to go, in words, for a screen that no longer carries
+// the pickers themselves.
+function describeDestinations(meta) {
+  const channels = meta.destChannels ?? prefillableChannel(meta.channelId);
+  const users    = meta.destUsers ?? [];
+  const parts = [
+    ...channels.map(c => `<#${c}>`),
+    ...users.map(u => `<@${u}>`)
+  ];
+  return parts.length
+    ? `*Posting to:* ${parts.join(', ')}`
+    : '*Posting to:* the conversation you started from';
+}
+
+// Opt-in, not a toll booth. The pickers live on the compose screen now, so this
+// screen only shows - which is all a preview was ever for, and means ← Back
+// returns to a compose screen that still has everything on it.
 function buildPreviewModal(meta) {
   const { savedQuestions = [], pollTitle, pollDescription, pollSettings = [], showResults, closeAt } = meta;
-  // ?? not ||, so a creator who clears the channel picker stays cleared.
-  const destChannels = meta.destChannels ?? prefillableChannel(meta.channelId);
-  const destUsers    = meta.destUsers ?? [];
   const tags = [];
   if (pollSettings.includes('anonymous'))    tags.push('🔒 Anonymous');
   if (pollSettings.includes('allow_revote')) tags.push('🔄 Vote changes allowed');
@@ -924,31 +992,26 @@ function buildPreviewModal(meta) {
       ...(pollDescription ? [{ type: 'section', text: { type: 'mrkdwn', text: pollDescription } }] : []),
       ...(tags.length ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: tags.join('  ·  ') }] }] : []),
       { type: 'divider' },
-      // A long poll can run past Slack's limit of 100 blocks in a view, and the
-      // pickers below are the point of this screen - so the preview is what
-      // gives way, not the thing you came here to do.
+      // A long poll can run past Slack's limit of 100 blocks in a view, so the
+      // preview is what gives way - the destination line below it is the part
+      // that has to survive.
       ...capBlocks(questionBlocks, 100 - FIXED_PREVIEW_BLOCKS),
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*Where to post*' } },
-      ...destinationBlocks({
-        channels: destChannels,
-        users: destUsers,
-        peopleHint: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.'
-      }),
+      { type: 'section', text: { type: 'mrkdwn', text: describeDestinations(meta) } },
       {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · Leave both pickers empty to post in the conversation you started from`
+          text: `${savedQuestions.length} question${savedQuestions.length === 1 ? '' : 's'} · ← Back to change anything`
         }]
       }
     ]
   };
 }
 
-// Header, description, tags, three dividers, the Where to post heading, two
-// pickers and the footer - what the preview modal spends before any question.
-const FIXED_PREVIEW_BLOCKS = 10;
+// Header, description, tags, two dividers, the destination line and the footer -
+// what the preview modal spends before any question.
+const FIXED_PREVIEW_BLOCKS = 8;
 
 // Slack rejects a message over 100 blocks outright. A long poll therefore has
 // to be summarised rather than trimmed: cutting the tail off a ballot would
@@ -1424,7 +1487,7 @@ function buildPostVoteModal(poll, viewerId = null) {
 // ==================== POLL CREATION HELPER ====================
 
 async function createAndPostPoll(client, meta, teamId = null) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = 'creator_only', orderByVotes = false, destChannels = [], destUsers = [] } = meta;
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false, destChannels = [], destUsers = [] } = meta;
 
   // The submission has already been acked, so nothing here is racing Slack's
   // 3-second deadline and this wait costs nothing once the bot is up.
@@ -1531,16 +1594,66 @@ function readCurrentQuestion(values, qNum) {
   };
 }
 
-function readMainModalSettings(values, meta) {
+// What came back from the options screen. Absent blocks fall through to what the
+// metadata already carried, so saving the screen without touching it is a no-op.
+function readOptionsSettings(values, meta) {
   const closeAtRaw = values.poll_close_at?.value?.selected_date_time;
   return {
-    pollTitle:       (values.poll_title?.value?.value       ?? meta.pollTitle       ?? '').trim(),
-    pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
-    pollSettings:    values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
-    closeAt:         closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : (meta.closeAt || null),
-    showResults:     values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? 'creator_only',
-    orderByVotes:    (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0 || (meta.orderByVotes ?? false)
+    pollSettings: values.poll_settings?.value?.selected_options?.map(o => o.value) ?? meta.pollSettings ?? [],
+    closeAt:      closeAtRaw ? new Date(closeAtRaw * 1000).toISOString() : null,
+    showResults:  values.poll_show_results?.value?.selected_option?.value ?? meta.showResults ?? DEFAULT_SHOW_RESULTS,
+    // Read straight from the checkbox rather than OR-ed with the metadata: this
+    // screen is the only place it is set, so unticking it has to be able to turn
+    // it off again.
+    orderByVotes: (values.poll_order_by_votes?.value?.selected_options?.length ?? 0) > 0
   };
+}
+
+// Everything on the compose screen, folded back into the metadata. Every button
+// on that screen calls this first: a block action arrives with the whole view
+// state, so nothing typed is lost when another screen is pushed on top - the
+// destination picks included, which is what used to be reset by ← Back.
+function readComposeState(view) {
+  const meta = JSON.parse(view.private_metadata);
+  const values = view.state?.values || {};
+  const qNum = (meta.savedQuestions || []).length + 1;
+  return {
+    meta: {
+      ...meta,
+      pollTitle:       (values.poll_title?.value?.value       ?? meta.pollTitle       ?? '').trim(),
+      pollDescription: (values.poll_description?.value?.value ?? meta.pollDescription ?? '').trim(),
+      ...readDestinations(values)
+    },
+    qNum,
+    question: readCurrentQuestion(values, qNum)
+  };
+}
+
+// Slack rejects a view whose private_metadata runs past 3000 characters, and
+// the whole draft poll travels in it - so questions long enough hit that ceiling
+// well before the 50 the validator allows. A rejected view is a silent failure,
+// which is the worst kind, so the draft is measured where it grows and the limit
+// is said out loud instead.
+const MAX_VIEW_METADATA = 3000;
+const METADATA_FULL = 'This draft is as long as the builder can carry — Slack limits how much a half-finished poll can hold. Post what you have, or shorten a question.';
+
+function metadataSize(meta) {
+  return JSON.stringify(meta).length;
+}
+
+// A question as read off a form, in the shape the form builder wants it back.
+function restoreQuestion(q = {}) {
+  return { text: q.text || '', options: q.optionsRaw || '', allowMultiple: !!q.allowMultiple };
+}
+
+// Rebuild the compose screen from metadata alone, half-typed question and all.
+// Used when a pushed screen has to refresh the screen underneath it, which is
+// the only time the live view state is out of reach. The keys dropped here are
+// carried for exactly that trip - a view id and a draft are about the journey,
+// not about the poll - so they do not belong in the rebuilt view's metadata.
+function rebuildComposeView(meta) {
+  const { draft = {}, composeViewId, questionPageViewId, editingIndex, ...rest } = meta;
+  return buildComposeModal(rest, draft.type || 'multiple_choice', restoreQuestion(draft));
 }
 
 function buildQuestion(text, type, optionsRaw, allowMultiple) {
@@ -1559,17 +1672,34 @@ const WAKE_UP_MESSAGE = '⏳ The bot was waking up and missed the 3-second windo
 // stays good for 30 minutes, long after the 3-second trigger_id died. So the
 // apology can land in the channel they typed in, carrying a button - and a
 // button click arrives with a fresh trigger_id, which is the whole point.
-function wakeUpPrompt(channelId) {
+function wakeUpPrompt(channelId, commandText) {
   return {
     response_type: 'ephemeral',
     text: WAKE_UP_MESSAGE,
     blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: '⏳ I was asleep and missed the 3-second window Slack allows. Press the button - it opens straight away.' } },
       { type: 'actions', elements: [
-        { type: 'button', text: { type: 'plain_text', text: '📊  Open poll builder', emoji: true }, action_id: 'open_poll_creator', value: channelId || '', style: 'primary' }
+        {
+          type: 'button', text: { type: 'plain_text', text: '📊  Open poll builder', emoji: true },
+          action_id: 'open_poll_creator', style: 'primary',
+          // Carries the command's own text as well as its channel, so anything
+          // typed on the command line survives the nap too.
+          value: JSON.stringify({ channelId: channelId || '', text: (commandText || '').slice(0, 1500) })
+        }
       ] }
     ]
   };
+}
+
+// The button on that prompt used to carry a bare channel id. Read both shapes so
+// a prompt posted before this change still opens.
+function readWakeUpValue(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return typeof parsed === 'object' && parsed ? parsed : {};
+  } catch {
+    return { channelId: value || '' };
+  }
 }
 
 function isExpiredTrigger(err) {
@@ -1585,15 +1715,20 @@ async function handleNewPoll({ ack, body, client, respond }) {
     if (!canCreatePoll(body.user_id)) {
       return await dmUser(client, body.user_id, `⏳ ${pollCreationLimitMessage()}`);
     }
+    const prefill = parseComposeArgs(body.text);
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildCreationModal({ channelId: body.channel_id, userId: body.user_id, savedQuestions: [] })
+      view: buildComposeModal(
+        { channelId: body.channel_id, userId: body.user_id, savedQuestions: [] },
+        'multiple_choice',
+        prefill
+      )
     });
   } catch (err) {
     console.error('/newpoll error:', err);
     if (isExpiredTrigger(err)) {
       try {
-        return await respond(wakeUpPrompt(body.channel_id));
+        return await respond(wakeUpPrompt(body.channel_id, body.text));
       } catch (e) {
         // response_url can fail too (30 minutes gone, or five uses spent). The
         // DM is the floor: they hear something either way.
@@ -1615,9 +1750,14 @@ app.action('open_poll_creator', async ({ ack, body, client, action, respond }) =
     if (!canCreatePoll(userId)) {
       return await dmUser(client, userId, `⏳ ${pollCreationLimitMessage()}`);
     }
+    const { channelId, text } = readWakeUpValue(action.value);
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildCreationModal({ channelId: action.value || body.channel?.id || userId, userId, savedQuestions: [] })
+      view: buildComposeModal(
+        { channelId: channelId || body.channel?.id || userId, userId, savedQuestions: [] },
+        'multiple_choice',
+        parseComposeArgs(text)
+      )
     });
     // The prompt has done its job; clear it so the channel is not left with a
     // stale apology and a button that now opens a second modal.
@@ -1639,7 +1779,7 @@ app.shortcut('create_poll', async ({ ack, shortcut, client }) => {
     }
     await client.views.open({
       trigger_id: shortcut.trigger_id,
-      view: buildCreationModal({ channelId: shortcut.channel?.id || shortcut.user.id, userId: shortcut.user.id, savedQuestions: [] })
+      view: buildComposeModal({ channelId: shortcut.channel?.id || shortcut.user.id, userId: shortcut.user.id, savedQuestions: [] })
     });
   } catch (err) {
     console.error('create_poll shortcut error:', err);
@@ -1690,6 +1830,51 @@ app.command('/poll-share', async ({ ack, body, client }) => {
   }
 });
 
+// A row per poll: what it is, then everything you can do with it.
+//
+// The buttons are the whole point. Every one of these actions used to mean
+// copying the poll's id out of this very list and pasting it into a slash
+// command - which is a worse interaction than any number of clicks, because it
+// is a transcription job. The id stays on the row, quietly, because `/poll-edit`
+// has no button of its own yet.
+function pollListBlocks(polls, { closed = false } = {}) {
+  const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
+  const button = (text, action_id, value) => ({
+    type: 'button', text: { type: 'plain_text', text, emoji: true }, action_id, value
+  });
+
+  return [
+    { type: 'header', text: { type: 'plain_text', text: closed ? 'Closed Polls' : 'Active Polls' } },
+    ...shown.flatMap((p, i) => {
+      const participants = getAllVoters(p).size;
+      const tags = [
+        `${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}`,
+        `${participants} participant${participants !== 1 ? 's' : ''}`,
+        `by <@${p.creator}>`,
+        ...(p.anonymous   ? ['🔒 Anonymous'] : []),
+        ...(p.allowRevote ? ['🔄 Revote on'] : []),
+        ...(!closed && p.closeAt ? [`⏰ Closes ${new Date(p.closeAt).toLocaleString()}`] : [])
+      ];
+      return [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\n${tags.join('  ·  ')}  ·  \`${p.id}\`` }
+        },
+        {
+          type: 'actions',
+          elements: [
+            button('📊  Results', 'list_poll_results', p.id),
+            button('📤  Send', 'share_poll', p.id),
+            ...(closed ? [] : [button('🔒  Close', 'close_poll', p.id)]),
+            button('⬇️  Export', 'list_poll_export', p.id)
+          ]
+        }
+      ];
+    }),
+    ...truncationNote(polls.length, shown.length)
+  ];
+}
+
 app.command('/polls-list', async ({ ack, body, client }) => {
   await ack();
   try {
@@ -1697,32 +1882,11 @@ app.command('/polls-list', async ({ ack, body, client }) => {
     const channel = await resolveChannel(client, body.channel_id, userId);
     const polls = await getAllPolls('active');
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now. Use `/polls-archive` to see closed polls.' });
-    const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
-    const listBlocks = [
-      { type: 'header', text: { type: 'plain_text', text: 'Active Polls' } },
-      ...shown.map((p, i) => {
-        const participants = getAllVoters(p).size;
-        const tags = [
-          `${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}`,
-          `${participants} participant${participants !== 1 ? 's' : ''}`,
-          ...(p.anonymous   ? ['🔒 Anonymous'] : []),
-          ...(p.allowRevote ? ['🔄 Revote on'] : []),
-          ...(p.closeAt     ? [`⏰ Closes ${new Date(p.closeAt).toLocaleString()}`] : [])
-        ];
-        return {
-          type: 'section',
-          text: { type: 'mrkdwn', text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${tags.join('  ·  ')}` },
-          accessory: {
-            type: 'button',
-            text: { type: 'plain_text', text: '📤  Send', emoji: true },
-            action_id: 'share_poll',
-            value: p.id
-          }
-        };
-      }),
-      ...truncationNote(polls.length, shown.length)
-    ];
-    await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+    await client.chat.postEphemeral({
+      channel, user: userId,
+      text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`,
+      blocks: pollListBlocks(polls)
+    });
   } catch (err) {
     console.error('/polls-list error:', err);
     await dmUser(client, body.user_id, `❌ /polls-list failed: ${err.message}`);
@@ -1736,28 +1900,58 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     const channel = await resolveChannel(client, body.channel_id, userId);
     const polls = await getAllPolls('closed');
     if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls yet.' });
-    const shown = polls.slice(0, POLL_LIST_PAGE_SIZE);
-    const listBlocks = [
-      { type: 'header', text: { type: 'plain_text', text: 'Closed Polls' } },
-      ...shown.map((p, i) => {
-        const participants = getAllVoters(p).size;
-        return {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*${i + 1}. ${p.title}*\nID: \`${p.id}\`  ·  ${participants} participant${participants !== 1 ? 's' : ''}  ·  ${p.questions.length} question${p.questions.length !== 1 ? 's' : ''}  ·  Created by <@${p.creator}>`
-          }
-        };
-      }),
-      ...truncationNote(polls.length, shown.length),
-      { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results POLL_ID\` to view full results` }] }
-    ];
-    await client.chat.postEphemeral({ channel, user: userId, text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`, blocks: listBlocks });
+    await client.chat.postEphemeral({
+      channel, user: userId,
+      text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`,
+      blocks: pollListBlocks(polls, { closed: true })
+    });
   } catch (err) {
     console.error('/polls-archive error:', err);
     await dmUser(client, body.user_id, `❌ /polls-archive failed: ${err.message}`);
   }
 });
+
+// 📊 Results, from a poll list. The button on the poll message can assume the
+// poll is closed and readable; this one cannot, so it checks the poll's own
+// results setting and says why when the answer is no.
+app.action('list_poll_results', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) return await deny('❌ That poll no longer exists.');
+    if (!canViewResults(poll, userId)) return await deny(`🔒 ${resultsHiddenReason(poll)}.`);
+    await client.views.open({ trigger_id: body.trigger_id, view: buildResultsModal(poll, userId) });
+  } catch (err) {
+    console.error('list_poll_results error:', err);
+    await dmUser(client, userId, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open those results: ${err.message}`);
+  }
+});
+
+// ⬇️ Export, from a poll list. The CSV goes to the creator's own DM rather than
+// wherever they pressed it: a file upload does not honour chat:write.public, so
+// a channel the bot has not been invited to would simply fail - and per-voter
+// rows are the creator's business anyway.
+app.action('list_poll_export', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) return await deny('❌ That poll no longer exists.');
+    if (!isCreatorOrCoCreator(poll, userId)) return await deny(`❌ Only <@${poll.creator}> can export this poll.`);
+    const own = await client.conversations.open({ users: userId });
+    await uploadPollCsv(client, poll, own.channel.id);
+    await deny(`⬇️ The CSV for *${poll.title}* is in your DM with me.`);
+  } catch (err) {
+    console.error('list_poll_export error:', err);
+    await dmUser(client, userId, `❌ Could not export that poll: ${err.message}`);
+  }
+});
+
 
 // Losing votes by accident cannot be undone, so closing a poll that has any is
 // confirmed first. channelId travels in private_metadata because the final
@@ -1845,6 +2039,70 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
   }
 });
 
+// The CSV a poll exports, shared by the slash command and the Export button on
+// the poll lists - the button being the reason it is a function now.
+function buildPollCsv(poll) {
+  // A cell starting with any of these is executed as a formula by Excel and
+  // Sheets, so prefix it with an apostrophe before quoting.
+  const FORMULA_PREFIXES = ['=', '+', '-', '@', String.fromCharCode(9), String.fromCharCode(13)];
+  const esc = v => {
+    const raw = String(v == null ? '' : v);
+    const safe = FORMULA_PREFIXES.includes(raw[0]) ? "'" + raw : raw;
+    return '"' + safe.split('"').join('""') + '"';
+  };
+  const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
+
+  poll.questions.forEach((q, qi) => {
+    const qVotes = poll.votes[qi] || {};
+    if (q.type === 'open_ended') {
+      Object.entries(qVotes).forEach(([uid, text]) => {
+        const ts = poll.voteTimestamps?.[uid] || '';
+        rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
+      });
+      if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
+    } else if (q.type === 'ranking') {
+      const allRankings = Object.values(qVotes);
+      q.options.forEach((opt, oi) => {
+        const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
+        const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
+        rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
+      });
+    } else if (q.type === 'likert') {
+      q.options.forEach((stmt, si) => {
+        const ratings = qVotes[si] || {};
+        const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
+        LIKERT_SCALE.forEach(({ label, value }) => {
+          const cnt = (ratings[value] || []).length;
+          const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
+          rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
+        });
+      });
+    } else {
+      const total = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
+      q.options.forEach((opt, oi) => {
+        const voters = qVotes[oi] || [];
+        const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
+        rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
+      });
+    }
+  });
+
+  return rows.map(r => r.map(esc).join(',')).join('\n');
+}
+
+// Upload that CSV wherever the request came from. File uploads do not honour
+// chat:write.public, so this only works in a DM or a channel the bot is in -
+// hence the failure being reported rather than swallowed.
+async function uploadPollCsv(client, poll, channel) {
+  await client.files.uploadV2({
+    channel_id: channel,
+    filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
+    content: buildPollCsv(poll),
+    title: `Results: ${poll.title}`,
+    initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
+  });
+}
+
 app.command('/poll-export', async ({ ack, body, client }) => {
   await ack();
   try {
@@ -1854,81 +2112,37 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
-
-    // A cell starting with any of these is executed as a formula by Excel and
-    // Sheets, so prefix it with an apostrophe before quoting.
-    const FORMULA_PREFIXES = ['=', '+', '-', '@', String.fromCharCode(9), String.fromCharCode(13)];
-    const esc = v => {
-      const raw = String(v == null ? '' : v);
-      const safe = FORMULA_PREFIXES.includes(raw[0]) ? "'" + raw : raw;
-      return '"' + safe.split('"').join('""') + '"';
-    };
-    const rows = [['Question', 'Type', 'Option / Statement', 'Votes / Response', 'Percentage', 'Voted At']];
-
-    poll.questions.forEach((q, qi) => {
-      const qVotes = poll.votes[qi] || {};
-      if (q.type === 'open_ended') {
-        Object.entries(qVotes).forEach(([uid, text]) => {
-          const ts = poll.voteTimestamps?.[uid] || '';
-          rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
-        });
-        if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
-      } else if (q.type === 'ranking') {
-        const allRankings = Object.values(qVotes);
-        q.options.forEach((opt, oi) => {
-          const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
-          const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
-          rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
-        });
-      } else if (q.type === 'likert') {
-        q.options.forEach((stmt, si) => {
-          const ratings = qVotes[si] || {};
-          const total = Object.values(ratings).reduce((s, v) => s + v.length, 0);
-          LIKERT_SCALE.forEach(({ label, value }) => {
-            const cnt = (ratings[value] || []).length;
-            const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
-            rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
-          });
-        });
-      } else {
-        const total = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
-        q.options.forEach((opt, oi) => {
-          const voters = qVotes[oi] || [];
-          const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
-          rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
-        });
-      }
-    });
-
-    const csv = rows.map(r => r.map(esc).join(',')).join('\n');
-    await client.files.uploadV2({
-      channel_id: channel,
-      filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
-      content: csv,
-      title: `Results: ${poll.title}`,
-      initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
-    });
+    await uploadPollCsv(client, poll, channel);
   } catch (err) {
     console.error('/poll-export error:', err);
     await dmUser(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
   }
 });
 
-// ==================== MAIN MODAL ACTIONS ====================
+// ==================== COMPOSE SCREEN ACTIONS ====================
+
+// Every button here runs readComposeState first. A block action arrives with
+// the whole view state, so whatever has been typed - the question, the title,
+// the destination picks - is folded into the metadata before another screen is
+// pushed on top or this one is rebuilt underneath. That is what lets the flow
+// be one screen with side trips, instead of a corridor of screens.
 
 app.action('question_action', async ({ ack, body, client }) => {
   await ack();
-  const meta = JSON.parse(body.view.private_metadata);
+  const { meta, question } = readComposeState(body.view);
   const [action, idxStr] = body.actions[0].selected_option.value.split(':');
   const idx = parseInt(idxStr);
-  let qs = [...meta.savedQuestions];
+  let qs = [...(meta.savedQuestions || [])];
 
   if (action === 'edit') {
     const q = qs[idx];
+    if (!q) return;
     qs.splice(idx, 1);
-    const editMeta = { ...meta, savedQuestions: qs, editingIndex: idx, questionPageViewId: body.view.id };
+    const editMeta = {
+      ...meta, savedQuestions: qs, editingIndex: idx,
+      draft: question, questionPageViewId: body.view.id
+    };
     try {
       await client.views.push({
         trigger_id: body.trigger_id,
@@ -1949,130 +2163,227 @@ app.action('question_action', async ({ ack, body, client }) => {
     case 'delete':    qs.splice(idx, 1); break;
   }
 
-  const updatedMeta = { ...meta, savedQuestions: qs };
-  await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
+  try {
+    await client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal({ ...meta, savedQuestions: qs }, question.type, restoreQuestion(question))
+    });
+  } catch (err) { console.warn('compose refresh failed:', err.message); }
 });
 
-// ==================== QUESTION MODAL ACTIONS ====================
-
+// The type picker rewrites the form beneath it - a rating scale needs no choices
+// typed, a ranking needs items rather than options. It lives on both the compose
+// screen and the edit screen, so which one is being rebuilt is read off the view.
 app.action('question_type_changed', async ({ ack, body, client }) => {
   await ack();
-  const meta = JSON.parse(body.view.private_metadata);
-  const values = body.view.state.values;
-  const qNum = meta.savedQuestions.length + 1;
   const newType = body.actions[0].selected_option.value;
-  const currentText    = values[`q_text_${qNum}`]?.value?.value || '';
-  const currentOptions = values[`q_options_${qNum}`]?.value?.value || '';
-  const allowMultiple  = (values[`q_multiple_${qNum}`]?.value?.selected_options?.length || 0) > 0;
 
+  if (body.view.callback_id === 'poll_compose_submit') {
+    const { meta, question } = readComposeState(body.view);
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, newType, restoreQuestion(question))
+    });
+  }
+
+  const meta = JSON.parse(body.view.private_metadata);
+  const question = readCurrentQuestion(body.view.state.values, (meta.savedQuestions || []).length + 1);
   await client.views.update({
     view_id: body.view.id,
-    view: buildQuestionModal(meta, newType, { text: currentText, options: currentOptions, allowMultiple })
+    view: buildQuestionModal(meta, newType, restoreQuestion(question))
   });
 });
 
 app.action('add_another_question', async ({ ack, body, client }) => {
   await ack();
-  const meta = JSON.parse(body.view.private_metadata);
-  const values = body.view.state.values;
-  const qNum = meta.savedQuestions.length + 1;
-  const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
+  const { meta, question } = readComposeState(body.view);
 
-  if (!text) {
+  const problem = questionFormError(question);
+  if (problem) {
     return client.views.update({
       view_id: body.view.id,
-      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter a question.')
-    });
-  }
-  if (!AUTO_OPTION_TYPES.includes(type) && parseOptions(optionsRaw).length < 2) {
-    return client.views.update({
-      view_id: body.view.id,
-      view: buildQuestionModal(meta, type, { text, options: optionsRaw, allowMultiple }, 'Please enter at least 2 options.')
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), problem === 'text'
+        ? 'Write this question before adding another.'
+        : 'Give this question at least 2 choices before adding another.')
     });
   }
 
   const updatedMeta = {
     ...meta,
-    savedQuestions: [...meta.savedQuestions, buildQuestion(text, type, optionsRaw, allowMultiple)],
+    savedQuestions: [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple)],
     editingIndex: null
   };
 
-  await client.views.update({ view_id: body.view.id, view: buildQuestionModal(updatedMeta) });
-  try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
+  // Refused here rather than accepted and then silently dropped by Slack: the
+  // question still in the form is what would be lost, and it is still on screen
+  // to be posted or shortened.
+  if (metadataSize(updatedMeta) > MAX_VIEW_METADATA) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), METADATA_FULL)
+    });
+  }
+
+  await client.views.update({ view_id: body.view.id, view: buildComposeModal(updatedMeta) });
+});
+
+app.action('compose_options', async ({ ack, body, client }) => {
+  await ack();
+  const { meta, question } = readComposeState(body.view);
+
+  // The settings have to stay reachable however long the poll is, so when the
+  // draft will not fit alongside it the half-typed question is what gives way -
+  // and the screen says so, rather than losing it quietly.
+  let carried = { ...meta, draft: question, composeViewId: body.view.id };
+  const draftDropped = metadataSize(carried) > MAX_VIEW_METADATA;
+  if (draftDropped) carried = { ...meta, composeViewId: body.view.id };
+
+  try {
+    await client.views.push({
+      trigger_id: body.trigger_id,
+      view: buildOptionsModal(carried, draftDropped)
+    });
+  } catch (err) {
+    console.error('compose_options push error:', err);
+    await dmUser(client, body.user.id, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open the poll options: ${err.message}`);
+  }
+});
+
+app.action('compose_preview', async ({ ack, body, client }) => {
+  await ack();
+  const { meta, question } = readComposeState(body.view);
+
+  // A question still sitting in the form counts. A preview that left it out
+  // would be a preview of a different poll from the one the button next to it
+  // would post.
+  const staged = questionFormError(question)
+    ? [...(meta.savedQuestions || [])]
+    : [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple)];
+
+  if (!staged.length) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), 'Write a question first — there is nothing to preview yet.')
+    });
+  }
+
+  // Unlike the options screen there is nothing here worth dropping to make it
+  // fit: a preview of part of the poll would be worse than none. Post Poll is
+  // right next to this button and does not go through a view at all.
+  const carried = { ...meta, savedQuestions: staged };
+  if (metadataSize(carried) > MAX_VIEW_METADATA) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), `${METADATA_FULL} Posting still works — it is only the preview that cannot carry this much.`)
+    });
+  }
+
+  try {
+    await client.views.push({ trigger_id: body.trigger_id, view: buildPreviewModal(carried) });
+  } catch (err) {
+    console.error('compose_preview push error:', err);
+    await dmUser(client, body.user.id, isExpiredTrigger(err)
+      ? WAKE_UP_MESSAGE
+      : `❌ Could not open the preview: ${err.message}`);
+  }
 });
 
 // ==================== VIEW SUBMISSIONS ====================
 
-app.view('poll_submit', async ({ ack, body, view }) => {
-  const meta = JSON.parse(view.private_metadata);
-  const values = view.state.values;
-  const settings = readMainModalSettings(values, meta);
-  const mergedMeta = { ...meta, ...settings };
+// 🚀 Post Poll, straight from the compose screen. This is the whole of the
+// ordinary path: one screen, one submit.
+app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => {
+  const { meta, qNum, question } = readComposeState(view);
+  const alreadyHas = (meta.savedQuestions || []).length > 0;
 
-  await ack({
-    response_action: 'push',
-    view: buildQuestionModal(mergedMeta)
-  });
-});
-
-app.view('question_submit', async ({ ack, body, view, client }) => {
-  const meta = JSON.parse(view.private_metadata);
-  const values = view.state.values;
-  const qNum = meta.savedQuestions.length + 1;
-  const isEditing = meta.editingIndex !== undefined && meta.editingIndex !== null;
-  const { text, type, optionsRaw, allowMultiple } = readCurrentQuestion(values, qNum);
-
-  if (!text && !isEditing) {
-    if (!meta.savedQuestions?.length) {
+  // Validated before the ack, because response_action:'errors' *is* the ack and
+  // cannot follow one. A blank form is only an error when it is the only
+  // question there is - with questions already added it means "no more". But a
+  // form with choices and no question is a slip, not a decision, so it is
+  // caught rather than quietly dropped along with what was typed in it.
+  if (question.text || question.optionsRaw || !alreadyHas) {
+    const problem = questionFormError(question);
+    if (problem === 'text') {
       return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please enter a question.' } });
     }
-    return await ack({ response_action: 'push', view: buildPreviewModal(meta) });
-  }
-
-  if (text) {
-    if (!AUTO_OPTION_TYPES.includes(type) && parseOptions(optionsRaw).length < 2) {
+    if (problem === 'options') {
       return await ack({ response_action: 'errors', errors: { [`q_options_${qNum}`]: 'Please enter at least 2 options.' } });
     }
   }
 
-  const newQ = text ? buildQuestion(text, type, optionsRaw, allowMultiple) : null;
-  let updatedQuestions = [...meta.savedQuestions];
-  if (isEditing && newQ) {
-    updatedQuestions.splice(meta.editingIndex, 0, newQ);
-  } else if (newQ) {
-    updatedQuestions.push(newQ);
-  }
+  const savedQuestions = question.text
+    ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple)]
+    : [...(meta.savedQuestions || [])];
 
-  if (!updatedQuestions.length) {
-    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please add at least one question.' } });
-  }
-
-  const updatedMeta = { ...meta, savedQuestions: updatedQuestions, editingIndex: null };
-
-  if (isEditing) {
-    await ack();
-    const questionPageViewId = meta.questionPageViewId;
-    if (questionPageViewId) {
-      try { await client.views.update({ view_id: questionPageViewId, view: buildQuestionModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
-    }
-    try { await client.views.update({ view_id: body.view.root_view_id, view: buildCreationModal(updatedMeta) }); } catch (err) { console.warn('modal refresh failed:', err.message); }
-  } else {
-    await ack({ response_action: 'push', view: buildPreviewModal(updatedMeta) });
-  }
+  // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll is
+  // several database and API round trips, and on a cold host that overran the
+  // deadline, so the creator got "we had trouble connecting" on a poll that had
+  // in fact been created.
+  await ack({ response_action: 'clear' });
+  await postComposedPoll(client, { ...meta, savedQuestions }, body, view, context);
 });
 
+app.view('poll_options_submit', async ({ ack, body, view, client }) => {
+  const meta = JSON.parse(view.private_metadata);
+  const merged = { ...meta, ...readOptionsSettings(view.state.values, meta) };
+  await ack();
+
+  // Acking pops this screen off and reveals the compose screen, which is then
+  // rebuilt so its summary line reflects what was just saved. Rebuilding from
+  // the captured metadata is what keeps the question, title and picks intact.
+  const composeViewId = meta.composeViewId || view.root_view_id;
+  if (!composeViewId) return;
+  try {
+    await client.views.update({ view_id: composeViewId, view: rebuildComposeView(merged) });
+  } catch (err) { console.warn('compose refresh failed:', err.message); }
+});
+
+// Only ever an edit now - adding a question happens on the compose screen.
+app.view('question_submit', async ({ ack, body, view, client }) => {
+  const meta = JSON.parse(view.private_metadata);
+  const qNum = (meta.savedQuestions || []).length + 1;
+  const question = readCurrentQuestion(view.state.values, qNum);
+
+  const problem = questionFormError(question);
+  if (problem === 'text') {
+    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: 'Please enter a question.' } });
+  }
+  if (problem === 'options') {
+    return await ack({ response_action: 'errors', errors: { [`q_options_${qNum}`]: 'Please enter at least 2 options.' } });
+  }
+
+  // Put back where it was taken from: question_action removes the question being
+  // edited, so the index it was at is where the edited version belongs.
+  const questions = [...(meta.savedQuestions || [])];
+  const at = Number.isInteger(meta.editingIndex) ? meta.editingIndex : questions.length;
+  questions.splice(at, 0, buildQuestion(question.text, question.type, question.optionsRaw, question.allowMultiple));
+
+  await ack();
+  const composeViewId = meta.questionPageViewId || view.root_view_id;
+  if (!composeViewId) return;
+  try {
+    await client.views.update({
+      view_id: composeViewId,
+      view: rebuildComposeView({ ...meta, savedQuestions: questions, editingIndex: null })
+    });
+  } catch (err) { console.warn('compose refresh failed:', err.message); }
+});
+
+// 🚀 Post Poll from the preview screen. The destinations were captured on the
+// compose screen, so unlike before they arrive in the metadata rather than in
+// this submission - which is why ← Back no longer resets them.
 app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
-  // The destinations are picked on this modal, so they arrive in the submission
-  // rather than in the metadata that has been carried since the first screen.
-  const meta = { ...JSON.parse(view.private_metadata), ...readDestinations(view.state?.values) };
-
-  // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll
-  // is several database and API round trips, and on a cold host that overran
-  // the deadline, so the user got "we had trouble connecting" on a poll that
-  // had in fact been created. Clearing the stack leaves no stale modal behind.
+  const meta = JSON.parse(view.private_metadata);
   await ack({ response_action: 'clear' });
+  await postComposedPoll(client, meta, body, view, context);
+});
 
+// Shared by both Post Poll buttons: create it, post it, and report where it
+// went. The modal stack is already cleared by the time this runs, so every
+// outcome has to be reported in a message.
+async function postComposedPoll(client, meta, body, view, context) {
   try {
     // Same key authorize() resolved this request with, so the auto-close
     // sweeper can find the token again later.
@@ -2126,11 +2437,12 @@ app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => 
       await client.chat.postEphemeral({ channel: confirmChannel, user: meta.userId, text, blocks });
     }
   } catch (err) {
-    console.error('poll_preview_submit error:', err);
+    console.error('postComposedPoll error:', err);
     // The modal is already gone, so the only way left to report this is a DM.
     await dmUser(client, meta.userId, `❌ ${err.message || 'Failed to create poll.'}`);
   }
-});
+}
+
 
 app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
   const { pollId } = JSON.parse(view.private_metadata);
@@ -2544,26 +2856,40 @@ app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
 });
 
 // "📊 View Results" button on closed poll message
+// Shared by the View Results button on a closed poll and the Results button on
+// the poll lists, so an active poll no longer gets a modal that calls itself
+// closed. Slack caps a header at 150 characters where a title may run to 200,
+// so the heading is trimmed rather than left to be rejected.
+function buildResultsModal(poll, viewerId) {
+  const participants = getAllVoters(poll).size;
+  return {
+    type: 'modal',
+    title: { type: 'plain_text', text: 'Poll Results' },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [
+      { type: 'header', text: { type: 'plain_text', text: poll.title.slice(0, 150) } },
+      ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
+      {
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: `${poll.status === 'closed' ? '🔒 Closed' : '🟢 Active'}  ·  *${participants}* participant${participants !== 1 ? 's' : ''}  ·  Created by <@${poll.creator}>`
+        }]
+      },
+      { type: 'divider' },
+      ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, viewerId))
+    ]
+  };
+}
+
 app.action('view_results_modal', async ({ ack, body, client, action }) => {
   await ack();
   try {
     const poll = await getPoll(action.value);
     if (!poll) return;
-    const participants = getAllVoters(poll).size;
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        title: { type: 'plain_text', text: 'Poll Results' },
-        close: { type: 'plain_text', text: 'Close' },
-        blocks: [
-          { type: 'header', text: { type: 'plain_text', text: poll.title } },
-          ...(poll.description ? [{ type: 'section', text: { type: 'mrkdwn', text: poll.description } }] : []),
-          { type: 'context', elements: [{ type: 'mrkdwn', text: `🔒 Closed  ·  *${participants}* participant${participants !== 1 ? 's' : ''}  ·  Created by <@${poll.creator}>` }] },
-          { type: 'divider' },
-          ...(poll.questions || []).flatMap((q, qi) => buildQuestionResultBlock(q, qi, poll, body.user.id))
-        ]
-      }
+      view: buildResultsModal(poll, body.user.id)
     });
   } catch (err) {
     console.error('view_results_modal error:', err);
@@ -2586,8 +2912,13 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
     if (poll.status === 'closed') return await deny('⚠️ This poll is already closed.');
 
     // Final results belong where the poll was being read, not necessarily where
-    // it was first posted - the same poll can be in several channels.
-    const channel = body.channel?.id || poll.channelId;
+    // it was first posted - the same poll can be in several channels. But this
+    // button is on the poll lists now as well, and those can be run anywhere:
+    // a click from a channel the poll was never posted to falls back to the
+    // poll's own channel rather than dropping its results into a bystander.
+    const from = body.channel?.id;
+    const showsThisPoll = from && (poll.messageRefs || []).some(r => r.channelId === from);
+    const channel = showsThisPoll ? from : (poll.channelId || from);
     const participants = getAllVoters(poll).size;
     if (participants > 0) {
       return await client.views.open({

@@ -83,8 +83,8 @@ In your Slack app, go to **Slash Commands** and create each one with this Reques
 
 | Command          | Description             | Hint                          |
 |-----------------|-------------------------|-------------------------------|
-| `/newpoll`       | Create a new poll       | Opens interactive modal       |
-| `/poll`          | Alias for `/newpoll`    | Opens interactive modal       |
+| `/newpoll`       | Create a new poll       | `Lunch? Thai, Sushi, Pizza`   |
+| `/poll`          | Alias for `/newpoll`    | `Lunch? Thai, Sushi, Pizza`   |
 | `/poll-results`  | View results privately  | `POLL_ID`                     |
 | `/poll-share`    | Post results to channel (creator only) | `POLL_ID`      |
 | `/polls-list`    | List all active polls   |                               |
@@ -103,13 +103,35 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 ## Usage
 
 ```
-/newpoll
+/poll
 ```
-→ Opens an interactive modal. Add a title, questions (multiple choice, yes/no, rating scales, open-ended, and more), set options like anonymous voting or auto-close time, then post.
+→ Opens **New Poll**: one screen, and posting is one click from it.
 
-**Where to post.** The last screen, *Preview & Confirm*, shows the poll as it
-will look and then asks where it goes - two pickers, right above **🚀 Post
-Poll**:
+The screen asks in the order a poll is actually thought of - the question and
+its choices first, then what the poll is called, then where it goes. Question
+types are multiple choice, yes/no, agree/disagree, 1-to-5 and 1-to-10 scales,
+NPS, Likert matrix, ranking and open-ended.
+
+Everything else has a working default and lives behind **⚙️ More options** -
+anonymous voting, whether votes can be changed, who sees the results and when,
+result ordering, and an auto-close time. A line at the bottom of the screen
+says what those defaults currently are, so nothing is hidden, only out of the
+way. Two more buttons sit next to it: **＋ Add another question** for a
+multi-question poll, and **👁 Preview** to see the poll as it will look. Neither
+is a step you have to take.
+
+**The title is optional.** A poll with no title is named after its first
+question, which for a single-question poll is what you would have typed anyway.
+
+**Straight from the command line.** `/poll Lunch? Thai, Sushi, Pizza` opens the
+screen with the question and all three choices already filled in - the question
+mark is the divider, so everything before it is the question and the rest are
+the choices. `/poll Ship on Friday?` fills in the question and leaves the
+choices to you (or pick **Yes / No** and it needs none). This prefills rather
+than posting outright, because a typo that goes straight to a channel is not a
+saving.
+
+**Where to post.** Two pickers, above the buttons:
 
 | Picker | What it reaches |
 |--------|-----------------|
@@ -119,11 +141,11 @@ Poll**:
 Fill in both if you like: unlike most poll apps this is not a choice between a
 channel and people, and there is no radio button to flip. Leave both empty and
 the poll goes to the conversation you ran the command from; the channel you ran
-it in is prefilled, so posting where you are stays one click.
+it in is prefilled, so posting where you are needs no picking at all.
 
-Going **← Back** from this screen to edit a question resets the pickers to that
-default - Slack discards the state of a view it pops, and the picks are only sent
-when the poll is posted.
+Because the pickers are on the compose screen rather than a later one, going
+back from **More options** or **Preview** no longer resets them - the picks are
+captured when you press the button, not only when the poll is posted.
 
 Votes cast anywhere the poll appears count toward the same poll, and every copy
 of the message updates on every vote.
@@ -149,11 +171,15 @@ On a multi-select question a press toggles that option, so you can pick several
 and take one back. Adding a choice is allowed even when the creator turned vote
 changes off - taking one back is not, since that is changing your mind.
 
-Hiding the tally no longer hides the ballot. With **Show results** set to *Only
-to creator* or *After close*, the options and their buttons are still listed;
-only the counts, bars and voter names are withheld. Previously the whole option
-list went with them, which left a question in the channel with no visible
-answers.
+**Results are live by default.** A poll whose point is a visible tally should
+show one, so **Show results** starts at *In real-time* - the setting most people
+were reaching for, and two clicks in a dropdown to get to. Change it under
+**⚙️ More options** if this poll should be quieter.
+
+Hiding the tally does not hide the ballot. With **Show results** set to *Only to
+creator* or *After close*, the options and their buttons are still listed; only
+the counts, bars and voter names are withheld. Previously the whole option list
+went with them, which left a question in the channel with no visible answers.
 
 **You always get a ballot.** Pick only people and you get your own copy of the
 poll too, so you can vote in it and watch the results come in - a poll its
@@ -183,9 +209,22 @@ set when the poll was created still closes it on its own.
 ```
 /polls-list
 ```
-→ Lists all open polls, each with a **📤 Send** button. That button is the way
-back to a poll you cannot see - one sent only to somebody else, say: send it to
-yourself and you can vote in it and follow the results.
+→ Lists all open polls, each with its own row of buttons: **📊 Results**,
+**📤 Send**, **🔒 Close** and **⬇️ Export**. `/polls-archive` does the same for
+closed polls, without the Close.
+
+Those buttons are the point. Every one of these actions used to mean copying the
+poll's id out of this very list and pasting it into a slash command, which is a
+worse job than any number of clicks - it is transcription. The id is still on
+the row, quietly, because `/poll-edit` has no button of its own yet.
+
+**📤 Send** is also the way back to a poll you cannot see - one sent only to
+somebody else, say: send it to yourself and you can vote in it and follow the
+results. **📊 Results** honours the poll's own results setting and says so when
+it will not show them. **⬇️ Export** puts the CSV in your DM with the bot rather
+than wherever you pressed it: file uploads do not honour `chat:write.public`, so
+a channel the bot has not been invited to would simply fail, and per-voter rows
+are the creator's business anyway.
 
 ```
 /poll-share poll_1706234567_abc12345
@@ -195,13 +234,13 @@ yourself and you can vote in it and follow the results.
 ```
 /poll-export poll_1706234567_abc12345
 ```
-→ Exports results as a CSV file, with per-voter rows for non-anonymous polls. Creator and co-creators only.
+→ Exports results as a CSV file, with per-voter rows for non-anonymous polls. Creator and co-creators only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
 
 ```
 /poll-close poll_1706234567_abc12345
 ```
 → Closes the poll (creator only). Usually unnecessary: use the **🔒 Close**
-button on the poll itself.
+button on the poll itself, or the one on its row in `/polls-list`.
 
 ---
 
@@ -235,9 +274,10 @@ That is survivable rather than silent: a slash command also hands the app a
 `response_url` good for **30 minutes**, long after the `trigger_id` is dead. So
 `/newpoll` answers the nap in the channel you typed in, with an **Open poll
 builder** button - a button click carries a fresh `trigger_id`, so it opens
-immediately and no question has to be retyped. One extra click, not a lost
-command. Only `/newpoll` and `/poll` get this; the global shortcut has no
-`response_url`, so it falls back to a DM.
+immediately and no question has to be retyped. The button carries the command's
+own text too, so `/poll Lunch? Thai, Sushi` still arrives prefilled after a nap.
+One extra click, not a lost command. Only `/newpoll` and `/poll` get this; the
+global shortcut has no `response_url`, so it falls back to a DM.
 
 Better still is not to nap at all. Two layers, and you want both:
 
