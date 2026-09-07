@@ -23,80 +23,11 @@ const {
 } = views;
 const { MULTI_SELECT_FORM_TYPE } = require('./lib/compose');
 const { MAX_VIEW_METADATA, draftFitsInView, MAX_QUESTIONS_PER_POLL } = require('./lib/validation');
+const { LIMITS, EMOJI, auditView, auditBlocks } = require('./test-lib/audit');
 
-// ==================== Slack's documented view limits ====================
-
-const LIMITS = {
-  blocksPerView: 100,
-  viewTitle: 24,
-  buttonText: 75,
-  headerText: 150,
-  sectionText: 3000,
-  contextElements: 10,
-  actionElements: 25,
-  privateMetadata: 3000
-};
-
-// Pictographs, dingbats, arrows and the variation selector - the ranges Slack
-// has a :shortcode: for and will therefore escape in a view's chrome.
-const EMOJI = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/u;
-
-function auditView(view, label) {
-  assert.ok(view.blocks.length <= LIMITS.blocksPerView,
-    `${label}: ${view.blocks.length} blocks exceeds ${LIMITS.blocksPerView}`);
-
-  for (const key of ['title', 'submit', 'close']) {
-    if (view[key]) {
-      assert.ok(view[key].text.length <= LIMITS.viewTitle,
-        `${label}: ${key} "${view[key].text}" is ${view[key].text.length} chars, over ${LIMITS.viewTitle}`);
-      // A modal's chrome is not block content: Slack escapes an emoji here back
-      // into its :shortcode:, so "🚀 Post Poll" reaches the user reading
-      // literally ":rocket: Post Poll". It renders fine inside a block, which
-      // is what made this look like a mystery rather than a rule - the same
-      // character worked three blocks further down the same screen.
-      assert.doesNotMatch(view[key].text, EMOJI,
-        `${label}: ${key} "${view[key].text}" carries an emoji, which Slack will show as a :shortcode:`);
-    }
-  }
-
-  const meta = view.private_metadata || '';
-  assert.ok(meta.length <= LIMITS.privateMetadata,
-    `${label}: private_metadata is ${meta.length} chars, over ${LIMITS.privateMetadata}`);
-
-  auditBlocks(view.blocks, label);
-
-  // Slack rejects a view whose input blocks collide on block_id, and the error
-  // does not say which one.
-  const ids = view.blocks.filter(b => b.block_id).map(b => b.block_id);
-  assert.strictEqual(new Set(ids).size, ids.length, `${label}: duplicate block_id among ${ids.join(', ')}`);
-}
-
-function auditBlocks(blocks, label) {
-  for (const b of blocks) {
-    if (b.type === 'header') {
-      assert.ok(b.text.text.length <= LIMITS.headerText,
-        `${label}: header is ${b.text.text.length} chars, over ${LIMITS.headerText}`);
-    }
-    if (b.type === 'section' && b.text) {
-      assert.ok(b.text.text.length <= LIMITS.sectionText,
-        `${label}: section is ${b.text.text.length} chars, over ${LIMITS.sectionText}`);
-    }
-    if (b.type === 'context') {
-      assert.ok(b.elements.length <= LIMITS.contextElements, `${label}: too many context elements`);
-    }
-    if (b.type === 'actions') {
-      assert.ok(b.elements.length <= LIMITS.actionElements, `${label}: too many action elements`);
-      for (const e of b.elements) {
-        if (e.type === 'button') {
-          assert.ok(e.text.text.length <= LIMITS.buttonText, `${label}: button text too long`);
-        }
-      }
-    }
-    if (b.type === 'input') {
-      assert.ok(!!b.block_id, `${label}: an input block has no block_id, so its value cannot be read back`);
-    }
-  }
-}
+// The audit itself lives in test-lib/audit.js, shared with test-hostile.js. A
+// rule kept in one test file protects the screens that file happens to check; a
+// rule kept there protects every screen, including ones not written yet.
 
 // ==================== fixtures ====================
 
@@ -136,7 +67,10 @@ test('the compose screen is a valid view', () => {
 test('the compose screen posts the poll itself, with no screen in between', () => {
   const v = buildComposeModal(draft());
   assert.strictEqual(v.callback_id, 'poll_compose_submit');
-  assert.match(v.submit.text, /Post Poll/);
+  // A modal with no submit cannot be submitted, whatever the button says.
+  assert.ok(v.submit?.text, 'the compose screen must be submittable');
+  // And it must not be a step towards another screen: nothing on it pushes.
+  assert.ok(!v.blocks.some(b => b.type === 'input' && b.block_id === 'poll_confirm'));
 });
 
 test('the compose screen holds the question, and where it goes, and nothing else', () => {
@@ -163,7 +97,11 @@ test('a further question is optional, so Post works with the form left blank', (
 test('the channel the command came from is prefilled, so posting here needs no picking', () => {
   const picker = findBlock(buildComposeModal(draft()), 'poll_dest_channels');
   assert.deepStrictEqual(picker.element.initial_conversations, ['C0123456789']);
-  assert.strictEqual(picker.label.text, 'Where to post');
+  // Two pickers stacked together have to be distinguishable, which is a rule
+  // about the pair rather than about either label's wording.
+  const people = findBlock(buildComposeModal(draft()), 'poll_dest_users');
+  assert.notStrictEqual(picker.label.text, people.label.text,
+    'the channel and people pickers must not read the same');
 });
 
 test('a DM is not a channel the app can post to, so it is left unprefilled', () => {
@@ -212,8 +150,14 @@ test('types that supply their own answers ask for no choices', () => {
 });
 
 test('multi-select says what it means where the choices are typed', () => {
-  const v = buildComposeModal(draft(), MULTI_SELECT_FORM_TYPE);
-  assert.match(findBlock(v, 'q_options_1').label.text, /pick several/);
+  // The type picker's own labels were shortened until they no longer said what
+  // the difference between the two was, so the choices field has to carry it.
+  // What matters is that the two screens do not read identically - not which
+  // words are used, which is a design decision and should stay free to change.
+  const one  = findBlock(buildComposeModal(draft(), 'multiple_choice'), 'q_options_1');
+  const many = findBlock(buildComposeModal(draft(), MULTI_SELECT_FORM_TYPE), 'q_options_1');
+  assert.notStrictEqual(many.label.text, one.label.text,
+    'a voter picking several must be told so somewhere on the screen');
 });
 
 test('every question type in the picker builds a valid screen', () => {
@@ -336,12 +280,17 @@ test('the preview carries no pickers, so going back cannot reset them', () => {
 test('the preview says where the poll is about to go', () => {
   const named = buildPreviewModal(draft({ savedQuestions: [question()], destChannels: ['C9'], destUsers: ['U9'] }));
   const line = named.blocks.map(b => b.text?.text || '').join(' ');
-  assert.match(line, /Posting to/);
+  // <#C9> and <@U9> are Slack's mention syntax, not our copy: get these wrong
+  // and the reader sees a raw id instead of a channel name.
   assert.match(line, /<#C9>/);
   assert.match(line, /<@U9>/);
 
+  // With nothing picked the poll still goes somewhere, so the screen still has
+  // to say where. The rule is that it is never silent - not what it says.
   const fallback = buildPreviewModal(draft({ savedQuestions: [question()], destChannels: [], destUsers: [] }));
-  assert.match(fallback.blocks.map(b => b.text?.text || '').join(' '), /the conversation you started from/);
+  const fallbackLine = fallback.blocks.map(b => b.text?.text || '').join(' ');
+  assert.notStrictEqual(fallbackLine.trim(), '', 'a preview must always say where the poll goes');
+  assert.notStrictEqual(fallbackLine, line, 'and must not claim a destination nobody picked');
 });
 
 test('a long poll gives up its preview rather than its destination line', () => {
@@ -353,7 +302,12 @@ test('a long poll gives up its preview rather than its destination line', () => 
   const v = buildPreviewModal(draft({ savedQuestions: Array(n).fill(question()), pollTitle: 'Long' }));
   assert.ok(n * 4 > LIMITS.blocksPerView, `${n} questions should overflow 100 blocks unaided`);
   auditView(v, `preview/${n}-questions`);
-  assert.match(v.blocks.map(b => b.text?.text || '').join(' '), /Posting to/);
+  // The destination line is the point of this screen, so it is what has to
+  // survive the capping - compare against a short draft rather than a phrase.
+  const short = buildPreviewModal(draft({ savedQuestions: [question()], pollTitle: 'Long' }));
+  const lineOf = view => view.blocks.map(b => b.text?.text || '').filter(t => t.includes('<#')).join(' ');
+  assert.notStrictEqual(lineOf(v).trim(), '', 'the capped preview dropped its destination line');
+  assert.strictEqual(lineOf(v), lineOf(short), 'the destination line should not change with length');
 });
 
 // ==================== the draft ceiling ====================
@@ -399,7 +353,8 @@ test('a half-typed question survives a trip to the options screen and back', () 
 
   assert.strictEqual(findBlock(rebuilt, 'q_text_1').element.initial_value, 'Half typed?');
   assert.strictEqual(findBlock(rebuilt, 'q_options_1').element.initial_value, 'A\nB');
-  assert.match(findBlock(rebuilt, 'q_options_1').label.text, /pick several/,
+  const multiLabel = findBlock(buildComposeModal(draft(), MULTI_SELECT_FORM_TYPE), 'q_options_1').label.text;
+  assert.strictEqual(findBlock(rebuilt, 'q_options_1').label.text, multiLabel,
     'the type of the half-typed question has to survive too');
   assert.deepStrictEqual(findBlock(rebuilt, 'poll_dest_channels').element.initial_conversations, ['C999']);
   assert.deepStrictEqual(findBlock(rebuilt, 'poll_dest_users').element.initial_users, ['U9']);
@@ -433,15 +388,38 @@ test('the compose screen drops the summary block when there is no summary', () =
   assert.strictEqual(configured.blocks.length, plain.blocks.length + 1);
 });
 
-test('the summary line reports only what was actually changed', () => {
+test('the summary line reports every changed setting, and each one distinctly', () => {
+  // The previous version of this test pinned the exact phrases the line used,
+  // which meant it could only fail when someone deliberately reworded them -
+  // and it duly passed while the line itself was the thing that needed to go.
+  // What a reader actually needs is that a change is reported, and that two
+  // different changes do not read the same. Both are checkable without naming
+  // a single word, so a rewrite is free and a regression is not.
+  const CHANGES = [
+    ['a title',        { pollTitle: 'Q3 planning' }],
+    ['results later',  { showResults: 'on_close' }],
+    ['results hidden', { showResults: 'creator_only' }],
+    ['anonymous',      { pollSettings: ['anonymous'] }],
+    ['revoting',       { pollSettings: ['allow_revote'] }],
+    ['sorted',         { orderByVotes: true }]
+  ];
+
+  const seen = new Map();
+  for (const [name, meta] of CHANGES) {
+    const line = settingsSummary(meta);
+    assert.ok(line, `${name} was changed but the summary reported nothing`);
+    // One change, one thing said about it: no separator means no second part.
+    assert.ok(!line.includes('·'), `${name} produced more than one part: "${line}"`);
+    assert.ok(!seen.has(line), `${name} reads the same as ${seen.get(line)}: "${line}"`);
+    seen.set(line, name);
+  }
+
+  // And the count tracks: three changes, three parts.
+  const three = settingsSummary({ pollTitle: 'Q3', pollSettings: ['anonymous'], orderByVotes: true });
+  assert.strictEqual(three.split('·').length, 3, `expected three parts, got "${three}"`);
+
+  // A title the creator typed has to appear, or it is not a report of it.
   assert.match(settingsSummary({ pollTitle: 'Q3 planning' }), /Q3 planning/);
-  assert.match(settingsSummary({ showResults: 'on_close' }), /after close/);
-  assert.match(settingsSummary({ showResults: 'creator_only' }), /creator only/);
-  assert.match(settingsSummary({ pollSettings: ['anonymous'] }), /Anonymous/);
-  assert.match(settingsSummary({ pollSettings: ['allow_revote'] }), /Vote changes/);
-  assert.match(settingsSummary({ orderByVotes: true }), /Sorted by votes/);
-  // The default never appears, or the line is back to reporting non-news.
-  assert.doesNotMatch(settingsSummary({ pollSettings: ['anonymous'] }), /Live results/);
 });
 
 test('restoreQuestion carries only what the form can restore', () => {
@@ -459,7 +437,10 @@ test('the edit screen is a valid view and only ever edits', () => {
     { text: 'Lunch?', options: 'Thai\nSushi' });
   auditView(v, 'edit-question');
   assert.strictEqual(v.callback_id, 'question_submit');
-  assert.strictEqual(v.title.text, 'Edit Question');
+  // Two screens that look alike need different titles or nobody knows which
+  // one they are on. That is the rule; the wording is a design choice.
+  assert.notStrictEqual(v.title.text, buildComposeModal(draft()).title.text,
+    'editing a question must not be titled the same as writing a new poll');
   assert.ok(!v.blocks.some(b => b.type === 'actions'), 'no Add another question on an edit');
 });
 
@@ -469,9 +450,17 @@ test('a question is named the way it was chosen, wherever it is shown', () => {
   const one = buildQuestion('Pick one', 'multiple_choice', 'A\nB');
   const many = buildQuestion('Pick any', MULTI_SELECT_FORM_TYPE, 'A\nB');
 
-  assert.strictEqual(questionTypeLabel(one), 'Multiple choice');
-  assert.strictEqual(questionTypeLabel(many), 'Multi-select');
+  // Both halves of how a question presents itself have to differ, or the
+  // creator picks one entry and sees the other described back.
+  assert.notStrictEqual(questionTypeLabel(many), questionTypeLabel(one));
   assert.notStrictEqual(questionTypeIcon(many), questionTypeIcon(one));
+  // And each must match what the picker offered, whatever that says.
+  const entry = value => QUESTION_TYPE_GROUPS
+    .flatMap(g => g.options).find(o => o.value === value).text.text;
+  assert.ok(entry('multiple_select').includes(questionTypeLabel(many)),
+    `the picker and the poll disagree: "${entry('multiple_select')}" vs "${questionTypeLabel(many)}"`);
+  assert.ok(entry('multiple_choice').includes(questionTypeLabel(one)),
+    `the picker and the poll disagree: "${entry('multiple_choice')}" vs "${questionTypeLabel(one)}"`);
 
   // The stored shape is unchanged, which is what keeps existing polls working.
   assert.deepStrictEqual(many, { text: 'Pick any', type: 'multiple_choice', options: ['A', 'B'], allowMultiple: true });
@@ -599,7 +588,12 @@ test('the vote, share, edit and close screens are valid views', () => {
 test('a voter sees which option they picked', () => {
   const v = buildVoteModal(poll(), { 0: ['0'] });
   assert.ok(JSON.stringify(v).includes('Thai'));
-  assert.match(v.title.text, /Vote/);
+  // Coming back to change a vote is a different situation from casting one, and
+  // the screen has to say so - in the title and on the button both.
+  const fresh = buildVoteModal(poll());
+  assert.notStrictEqual(v.title.text, fresh.title.text,
+    'changing a vote should not be titled the same as casting one');
+  assert.notStrictEqual(v.submit.text, fresh.submit.text);
 });
 
 // ==================== the poll lists ====================

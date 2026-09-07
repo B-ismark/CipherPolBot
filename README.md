@@ -398,18 +398,53 @@ Postgres — so anything left in there can only be checked by hand.
 | `lib/validation.js` | Input limits, the draft-size ceiling, rate limiting. | `test-security.js` |
 | `lib/policy.js` | Who may manage a poll, and who may see its results. | `test-security.js` |
 | `lib/destinations.js` | Resolving and de-duplicating where a poll goes. | `test-destinations.js` |
-| `lib/poll.js` | Pure reads over a poll's data — its voters, its messages. | `test-views.js` |
+| `lib/poll.js` | Pure reads over a poll's data — its voters, its title, its messages. | `test-views.js` |
 | `lib/install.js`, `lib/db.js`, `lib/health.js` | OAuth keys, SSL options, the readiness probe. | `test-security.js` |
 
 `npm test` runs all of it (`node --test`, no dependencies).
 
 The reason `lib/views.js` exists as its own module is worth knowing before
 moving anything back: **Slack does not partially render a bad view.** A view
-over 100 blocks, with a header past 150 characters, with duplicate `block_id`s
-or with `private_metadata` past 3000 characters is rejected whole — the person
-who pressed the button sees nothing and is told nothing. Those limits are
-asserted in `test-views.js` against the same functions the bot calls, which is
+over 100 blocks, with a header past 150 characters, an option label past 75,
+duplicate `block_id`s or `private_metadata` past 3000 characters is rejected
+whole — the person who pressed the button sees nothing and is told nothing.
+Those limits are asserted against the same functions the bot calls, which is
 the only way to find out before a user does.
+
+### How the tests are arranged
+
+| File | Holds |
+|------|-------|
+| `test-lib/audit.js` | The limits, the platform rules, and the hostile-input corpus. Not a test file — a shared module. |
+| `test-hostile.js` | Every builder × every corpus entry × every question type, plus the numeric limits walked. |
+| `test-views.js` | What each individual screen is supposed to contain. |
+
+Three habits are worth keeping, because each one was bought with a defect that
+shipped:
+
+**A rule learned goes in `test-lib/audit.js`, never in a single test.** A rule
+kept in one test protects one screen; a rule in the shared audit protects every
+screen that passes through it, including screens nobody has written yet. Both
+rules in there now — no emoji in a modal's chrome, no trim that cuts an emoji
+in half — were added after a real screen shipped broken, and both immediately
+turned up the same fault on screens nobody was looking at.
+
+**Assert the rule, not the wording.** A test written by reading the code back
+(`assert.match(summary({}), /Live results/)`) can only fail when someone
+deliberately changes that string, which is exactly when they mean to. It
+defends a decision instead of testing one. The useful assertions are the ones
+you could write without opening the implementation: this screen's title differs
+from that one's, two changed settings never read the same, a picker's two
+labels are distinguishable.
+
+**Walk limits, don't sample them.** The half-emoji fault fired at exactly one
+character offset out of forty. A hand-picked case sits in the middle of a
+range; faults live at its edges.
+
+None of this finds a platform rule nobody knows yet — `:rocket: Post Poll`
+shipped past 133 passing tests and was spotted in one screenshot. Look at the
+screen on a real device after any visible change, then put whatever it teaches
+into the audit so it cannot come back.
 
 ## Database
 
