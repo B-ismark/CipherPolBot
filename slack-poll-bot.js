@@ -236,7 +236,7 @@ const {
   buildQuestion, buildVoteModal, isInlineVotable, pollAdminHint, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
   buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv,
-  PEOPLE_LABEL
+  dmRedirectNotice
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
@@ -1208,11 +1208,9 @@ async function postComposedPoll(client, meta, body, view, context) {
     // and only when the command came from a DM between two people.
     const explainRedirect = usedFallback && redirected;
     if (explainRedirect) {
-      // Names the picker it actually means, and takes the name from the picker
-      // itself: this sentence pointed at *Where to post* - the channel picker -
-      // while telling you to pick people, and a hardcoded copy of a label is a
-      // sentence that goes stale the first time the label is reworded.
-      lines.push(`Slack does not let an app post into a DM between two people, so it could not go into the conversation you ran the command from. Send it on with the button below, or pick them under *${PEOPLE_LABEL}* next time.`);
+      // The copy lives in lib/views.js with the picker it names, so a test can
+      // read it. See dmRedirectNotice.
+      lines.push(dmRedirectNotice());
     }
     if (failures.length) lines.push(`⚠️ ${describeFailures(failures)}`);
     if (posted.length > 1) lines.push('Votes cast in any of them count toward this one poll.');

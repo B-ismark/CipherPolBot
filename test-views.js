@@ -23,7 +23,7 @@ const {
 } = views;
 const { MULTI_SELECT_FORM_TYPE } = require('./lib/compose');
 const { MAX_VIEW_METADATA, draftFitsInView, MAX_QUESTIONS_PER_POLL } = require('./lib/validation');
-const { LIMITS, EMOJI, auditView, auditBlocks } = require('./test-lib/audit');
+const { LIMITS, EMOJI, TEMPLATE_HOLE, auditView, auditBlocks } = require('./test-lib/audit');
 
 // The audit itself lives in test-lib/audit.js, shared with test-hostile.js. A
 // rule kept in one test file protects the screens that file happens to check; a
@@ -112,40 +112,71 @@ const screensCarryingDestinations = () => [
   ['share', buildShareModal(poll())]
 ];
 
-// Small grey type under a field. Two lines on a phone is about this much, and
-// past two lines it stops being a hint and becomes something to read.
+// A working budget, not a measurement: Slack's hint type is small and grey, a
+// phone gives it roughly thirty characters a line, and two lines is where a
+// hint stops being glanced at and starts being read. Nobody has held a ruler
+// to it, so treat the number as the decision it is.
 const HINT_BUDGET = 60;
 
-test('the people picker names who does the sending, not just who receives', () => {
-  // Labelled "People" it read as "send this to them" - a thing Slack has no
-  // verb for. An app can only post in its own DM with someone, so what
-  // actually happens is that this app knocks on their door carrying a poll
-  // they did not ask for. The label has to carry the sender or the mechanism
-  // is a surprise waiting on the far side of the pick.
-  //
-  // The rule is the first-person voice, not the wording: the copy can still be
-  // improved without this test having an opinion about it.
-  for (const [name, view] of screensCarryingDestinations()) {
-    const label = findBlock(view, 'poll_dest_users').label.text;
-    assert.match(label, /\b(me|I|my)\b/i,
-      `${name}: the people picker must say who sends the DM, but reads "${label}"`);
-  }
-});
+// Slack caps its own chrome - a modal title, a submit button - at 24
+// characters, which is a fair outside estimate of how long a piece of
+// furniture can be before it stops reading as one. Borrowed rather than
+// invented, and it is the same 24 the audit already checks views against.
+const LABEL_BUDGET = LIMITS.viewTitle;
 
-test('a label and its hint do not both explain the same thing', () => {
-  // Saying it twice is the clutter that got the settings summary cut. The
-  // label owns the mechanism; the hint owns who ends up with a ballot, which
-  // is the half nobody guesses.
+test('the DM mechanism is stated on the field, exactly once', () => {
+  // Two rules that only make sense together.
+  //
+  // Stated: "People" on its own does not tell you that picking someone has
+  // this app open a DM with them - Slack has no way for it to post as you - so
+  // the word has to appear on the field or the mechanism is a surprise waiting
+  // on the far side of the pick.
+  //
+  // Once: saying it in the label and again in the hint is the clutter that got
+  // the settings summary cut. Whichever slot carries it, the other one is then
+  // free for the part nobody guesses, which is who ends up with a ballot.
+  //
+  // Neither half dictates the wording or which slot does the work, which is
+  // what the pronoun rule this replaced got wrong: it demanded first person,
+  // and first person in a form label is exactly what reads as the person
+  // filling the form in.
   for (const [name, view] of screensCarryingDestinations()) {
     const { label, hint } = findBlock(view, 'poll_dest_users');
     assert.ok(hint, `${name}: the people picker needs its hint - who gets a ballot is not guessable`);
-    assert.doesNotMatch(hint.text, /\bDMs?\b/i,
-      `${name}: the hint repeats the mechanism its label already carries: "${hint.text}"`);
-    assert.ok(hint.text.length <= HINT_BUDGET,
-      `${name}: hint is ${hint.text.length} chars, over the ${HINT_BUDGET} a hint should be: "${hint.text}"`);
-    assert.ok(label.text.length <= HINT_BUDGET,
-      `${name}: label is ${label.text.length} chars, which is a sentence, not a label`);
+    const said = `${label.text}  ${hint.text}`.match(/\bDMs?\b/gi) || [];
+    assert.strictEqual(said.length, 1,
+      `${name}: the field says DM ${said.length} times, and it has to say it once - "${label.text}" / "${hint.text}"`);
   }
+});
+
+test('a label stays furniture and a hint stays a glance', () => {
+  for (const [name, view] of screensCarryingDestinations()) {
+    for (const id of ['poll_dest_channels', 'poll_dest_users']) {
+      const { label, hint } = findBlock(view, id);
+      assert.ok(label.text.length <= LABEL_BUDGET,
+        `${name}/${id}: label is ${label.text.length} chars, over ${LABEL_BUDGET} - that is a sentence, not a label`);
+      if (hint) {
+        assert.ok(hint.text.length <= HINT_BUDGET,
+          `${name}/${id}: hint is ${hint.text.length} chars, over the ${HINT_BUDGET} a hint gets: "${hint.text}"`);
+      }
+    }
+  }
+});
+
+test('the DM redirect points at the picker it means', () => {
+  // This sentence shipped pointing at *Where to post* - the channel picker -
+  // while telling the reader to pick a person. It reads the name off the
+  // picker now, so the rule worth holding is that the two agree.
+  const notice = views.dmRedirectNotice();
+  const compose = buildComposeModal(draft());
+  const people = findBlock(compose, 'poll_dest_users').label.text;
+  const channels = findBlock(compose, 'poll_dest_channels').label.text;
+
+  assert.ok(notice.includes(people),
+    `the redirect must name the people picker, but reads: ${notice}`);
+  assert.ok(!notice.includes(channels),
+    `the redirect points at the channel picker "${channels}", which is not where you pick a person`);
+  assert.doesNotMatch(notice, TEMPLATE_HOLE, `the redirect leaked a template hole: ${notice}`);
 });
 
 test('a DM is not a channel the app can post to, so it is left unprefilled', () => {

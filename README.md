@@ -164,7 +164,13 @@ saving.
 | Picker | What it reaches |
 |--------|-----------------|
 | **Channels** | Public channels (the bot does not need to be a member), and private channels it has been invited to. Up to 10. |
-| **DM from me** | Each person gets the poll in their own DM with the bot. Up to 10. The label names the sender on purpose: Slack has no way for an app to post as you, so the poll arrives from the bot, not from the person who picked them. |
+| **People (I'll DM them)** | Each person gets the poll in their own DM with the bot. Up to 10. |
+
+The second label names the sender because Slack gives an app no way to post as
+you: pick someone and the poll arrives in their DM *with the bot*, not from the
+person who picked them. It is phrased as a promise rather than a description
+for the same reason - in a form, "me" is the person filling the form in, so a
+label reading *DM from me* would state the opposite of what happens.
 
 Fill in both if you like: unlike most poll apps this is not a choice between a
 channel and people, and there is no radio button to flip. Leave both empty and
@@ -212,14 +218,14 @@ went with them, which left a question in the channel with no visible answers.
 **You always get a ballot.** Pick only people and you get your own copy of the
 poll too, so you can vote in it and watch the results come in - a poll its
 creator cannot vote in is broken, not a preference. Pick a channel and you do
-not, because you can read it there. Pick yourself under **DM from me** and you get
+not, because you can read it there. Pick yourself under **People** and you get
 one copy, not two. If the only channel you picked turns the bot away, that
 counts as no copy and you get a DM copy instead, with a note to invite the bot.
 
 **Running `/newpoll` in a DM with another person.** Slack does not let an app
 post into a DM between two people - it has no membership there and cannot be
 given one, and it is never told who the other person is. So pick them under
-**DM from me** and they get the poll directly. If you pick nothing, the poll lands
+**People** and they get the poll directly. If you pick nothing, the poll lands
 in your own DM with the bot with a **Send it on** button.
 
 **Closing a poll.** Active polls carry a **🔒 Close** button next to Vote and
