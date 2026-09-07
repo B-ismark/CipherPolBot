@@ -109,26 +109,43 @@ Request URL: `https://abc123.ngrok-free.app/slack/events`
 
 It holds three things and nothing else: the question, its choices, and where it
 goes. That fits one screen without scrolling, so the whole poll is in view at
-once. Question types are multiple choice - *pick one* or *pick several* -
-yes/no, agree/disagree, 1-to-5 and 1-to-10 scales, NPS, Likert matrix, ranking
-and open-ended. Picking several is an entry in the type picker rather than a
-checkbox underneath, so the decision is made where the kind of question is
-already being chosen.
+once. Question types are **Multiple choice**, **Multi-select**, yes/no,
+agree/disagree, 1-to-5 and 1-to-10 scales, NPS, Likert matrix, ranking and
+open-ended. Multi-select is an entry in the type picker rather than a checkbox
+underneath, so the decision is made where the kind of question is already being
+chosen - and the choices field then says *voters may pick several*, so what it
+means is stated where you type the answers rather than in the picker label.
 
 Everything with a working answer already lives behind **⚙️ More options** - the
 title, a description, anonymous voting, whether votes can be changed, who sees
 the results and when, result ordering, and an auto-close time. A line at the
 bottom of the screen names what the poll is called and what those settings
 currently are, so moving them out of the way is not the same as hiding them.
-Two more buttons sit next to it: **＋ Add another question** for a
-multi-question poll, and **👁 Preview** to see the poll as it will look. Neither
-is a step you have to take.
+Two more buttons sit next to it: **＋ Add question** for a multi-question poll,
+and **👁 Preview** to see the poll as it will look. Neither is a step you have
+to take.
 
 Progressive disclosure in Slack is not free the way it is on the web: there is
 no way to collapse a field, so revealing one costs a click *and* a round trip -
 and on a host that sleeps, that is the last thing you want on the common path.
 So the screen is kept short by leaving things out rather than by folding them
 up, and the only round trips are the ones you ask for.
+
+**On a phone** the modal is a full-screen sheet with the post action in the top
+bar, so it is always in reach, and the question is the first thing under it.
+When the keyboard is up it covers roughly a third of the screen, which still
+leaves the question, its type and its choices visible - the whole of what you
+came to do, with no scrolling.
+
+The screen runs taller on a phone than on a desktop all the same, because
+labels and hints wrap at around 40 characters instead of 90. That is the reason
+the wording here is short: a 115-character hint is one line on a desktop and
+three on a phone, and a picker entry whose distinguishing word sits at the end
+of a 33-character label loses that word to truncation on a narrow screen. The
+long text was cut rather than the fields, so the growth stays below the fold
+where nothing on the critical path lives. Android devices are the narrow case
+(360dp is still common, against 375pt on the smallest current iPhone); the
+modal behaves the same on both.
 
 **The title is optional**, which is why it is in there rather than on the way
 in. A poll with no title is named after its first question - for a

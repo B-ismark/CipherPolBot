@@ -245,7 +245,10 @@ const {
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { AUTO_OPTION_TYPES, parseOptions, parseComposeArgs, questionFormError, resolveQuestionType, formTypeFor } = require('./lib/compose');
+const {
+  AUTO_OPTION_TYPES, MULTI_SELECT_FORM_TYPE, parseOptions, parseComposeArgs,
+  questionFormError, resolveQuestionType, formTypeFor
+} = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 const {
   MAX_DESTINATIONS, normalizeDestinations, assertDestinationLimit, dedupeTargets
@@ -544,8 +547,12 @@ const QUESTION_TYPE_GROUPS = [
   {
     label: { type: 'plain_text', text: 'Basic' },
     options: [
-      { text: { type: 'plain_text', text: '📋 Multiple choice — pick one' },     value: 'multiple_choice' },
-      { text: { type: 'plain_text', text: '☑️ Multiple choice — pick several' }, value: 'multiple_select' },
+      // Two short, distinct words rather than one long phrase with the
+      // difference tacked on the end: on a narrow phone the end is what gets
+      // cut, and "Multiple choice — pick…" twice tells nobody anything. What it
+      // means for voters is spelled out on the choices field below instead.
+      { text: { type: 'plain_text', text: '📋 Multiple choice' }, value: 'multiple_choice' },
+      { text: { type: 'plain_text', text: '☑️ Multi-select' },    value: 'multiple_select' },
       { text: { type: 'plain_text', text: '✅ Yes / No' },        value: 'yes_no' },
       { text: { type: 'plain_text', text: '⚖️ Agree / Disagree' }, value: 'agree_disagree' }
     ]
@@ -613,10 +620,12 @@ function questionFormBlocks(qNum, questionType = 'multiple_choice', restore = {}
   ];
 
   if (needsOptions) {
+    const isMulti   = questionType === MULTI_SELECT_FORM_TYPE;
     const isLikert  = questionType === 'likert';
     const isRanking = questionType === 'ranking';
     const optLabel  = isLikert  ? 'Statements to rate (one per line)'
                     : isRanking ? 'Items to rank (one per line)'
+                    : isMulti   ? 'Answer choices — voters may pick several'
                     : 'Answer choices';
     const optHint   = isLikert  ? 'Each statement will be rated on a 1–5 Strongly Disagree → Strongly Agree scale'
                     : isRanking ? 'Voters will assign a rank to each item (1 = top choice)'
@@ -714,7 +723,7 @@ function settingsSummary(meta) {
     ...(orderByVotes ? ['↕️ Sorted by votes'] : []),
     ...(closeAt ? [`⏰ Closes ${new Date(closeAt).toLocaleString()}`] : [])
   ];
-  return `${parts.join('  ·  ')}  —  title, description and these settings live under *⚙️ More options*`;
+  return `${parts.join('  ·  ')}  ·  edit under *⚙️ More options*`;
 }
 
 // The whole poll on one screen, in the order it is thought of: the question
@@ -758,12 +767,12 @@ function buildComposeModal(meta, currentType = 'multiple_choice', restore = {}, 
         channels: destChannels,
         users: destUsers,
         channelsLabel: 'Where to post',
-        peopleHint: 'Each person gets the poll in their own DM with me. Pick only people and you get your own copy too, so you can vote.'
+        peopleHint: 'Each gets it in their DM with me. Pick only people and you get a copy too, so you can vote.'
       }),
       {
         type: 'actions', block_id: 'compose_actions',
         elements: [
-          { type: 'button', text: { type: 'plain_text', text: '＋  Add another question' }, action_id: 'add_another_question' },
+          { type: 'button', text: { type: 'plain_text', text: '＋  Add question' }, action_id: 'add_another_question' },
           { type: 'button', text: { type: 'plain_text', text: '⚙️  More options', emoji: true }, action_id: 'compose_options' },
           { type: 'button', text: { type: 'plain_text', text: '👁  Preview', emoji: true }, action_id: 'compose_preview' }
         ]
