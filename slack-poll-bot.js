@@ -235,7 +235,8 @@ const {
   readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
   buildQuestion, buildVoteModal, isInlineVotable, pollAdminHint, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
-  buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv
+  buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv,
+  dmRedirectNotice
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
@@ -1207,7 +1208,9 @@ async function postComposedPoll(client, meta, body, view, context) {
     // and only when the command came from a DM between two people.
     const explainRedirect = usedFallback && redirected;
     if (explainRedirect) {
-      lines.push('Slack does not let an app post into a DM between two people, so it could not go into the conversation you ran the command from. Send it on with the button below, or pick the people you want under *Where to post* next time.');
+      // The copy lives in lib/views.js with the picker it names, so a test can
+      // read it. See dmRedirectNotice.
+      lines.push(dmRedirectNotice());
     }
     if (failures.length) lines.push(`⚠️ ${describeFailures(failures)}`);
     if (posted.length > 1) lines.push('Votes cast in any of them count toward this one poll.');

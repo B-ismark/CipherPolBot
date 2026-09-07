@@ -23,7 +23,7 @@ const {
 } = views;
 const { MULTI_SELECT_FORM_TYPE } = require('./lib/compose');
 const { MAX_VIEW_METADATA, draftFitsInView, MAX_QUESTIONS_PER_POLL } = require('./lib/validation');
-const { LIMITS, EMOJI, auditView, auditBlocks } = require('./test-lib/audit');
+const { LIMITS, EMOJI, TEMPLATE_HOLE, auditView, auditBlocks } = require('./test-lib/audit');
 
 // The audit itself lives in test-lib/audit.js, shared with test-hostile.js. A
 // rule kept in one test file protects the screens that file happens to check; a
@@ -102,6 +102,81 @@ test('the channel the command came from is prefilled, so posting here needs no p
   const people = findBlock(buildComposeModal(draft()), 'poll_dest_users');
   assert.notStrictEqual(picker.label.text, people.label.text,
     'the channel and people pickers must not read the same');
+});
+
+// The two pickers are one component, so a rule about them has to hold wherever
+// it appears rather than only on the screen someone happened to test - the
+// component-level version of what test-lib/audit.js does for whole views.
+const screensCarryingDestinations = () => [
+  ['compose', buildComposeModal(draft())],
+  ['share', buildShareModal(poll())]
+];
+
+// A working budget, not a measurement: Slack's hint type is small and grey, a
+// phone gives it roughly thirty characters a line, and two lines is where a
+// hint stops being glanced at and starts being read. Nobody has held a ruler
+// to it, so treat the number as the decision it is.
+const HINT_BUDGET = 60;
+
+// Slack caps its own chrome - a modal title, a submit button - at 24
+// characters, which is a fair outside estimate of how long a piece of
+// furniture can be before it stops reading as one. Borrowed rather than
+// invented, and it is the same 24 the audit already checks views against.
+const LABEL_BUDGET = LIMITS.viewTitle;
+
+test('the DM mechanism is stated on the field, exactly once', () => {
+  // Two rules that only make sense together.
+  //
+  // Stated: "People" on its own does not tell you that picking someone has
+  // this app open a DM with them - Slack has no way for it to post as you - so
+  // the word has to appear on the field or the mechanism is a surprise waiting
+  // on the far side of the pick.
+  //
+  // Once: saying it in the label and again in the hint is the clutter that got
+  // the settings summary cut. Whichever slot carries it, the other one is then
+  // free for the part nobody guesses, which is who ends up with a ballot.
+  //
+  // Neither half dictates the wording or which slot does the work, which is
+  // what the pronoun rule this replaced got wrong: it demanded first person,
+  // and first person in a form label is exactly what reads as the person
+  // filling the form in.
+  for (const [name, view] of screensCarryingDestinations()) {
+    const { label, hint } = findBlock(view, 'poll_dest_users');
+    assert.ok(hint, `${name}: the people picker needs its hint - who gets a ballot is not guessable`);
+    const said = `${label.text}  ${hint.text}`.match(/\bDMs?\b/gi) || [];
+    assert.strictEqual(said.length, 1,
+      `${name}: the field says DM ${said.length} times, and it has to say it once - "${label.text}" / "${hint.text}"`);
+  }
+});
+
+test('a label stays furniture and a hint stays a glance', () => {
+  for (const [name, view] of screensCarryingDestinations()) {
+    for (const id of ['poll_dest_channels', 'poll_dest_users']) {
+      const { label, hint } = findBlock(view, id);
+      assert.ok(label.text.length <= LABEL_BUDGET,
+        `${name}/${id}: label is ${label.text.length} chars, over ${LABEL_BUDGET} - that is a sentence, not a label`);
+      if (hint) {
+        assert.ok(hint.text.length <= HINT_BUDGET,
+          `${name}/${id}: hint is ${hint.text.length} chars, over the ${HINT_BUDGET} a hint gets: "${hint.text}"`);
+      }
+    }
+  }
+});
+
+test('the DM redirect points at the picker it means', () => {
+  // This sentence shipped pointing at *Where to post* - the channel picker -
+  // while telling the reader to pick a person. It reads the name off the
+  // picker now, so the rule worth holding is that the two agree.
+  const notice = views.dmRedirectNotice();
+  const compose = buildComposeModal(draft());
+  const people = findBlock(compose, 'poll_dest_users').label.text;
+  const channels = findBlock(compose, 'poll_dest_channels').label.text;
+
+  assert.ok(notice.includes(people),
+    `the redirect must name the people picker, but reads: ${notice}`);
+  assert.ok(!notice.includes(channels),
+    `the redirect points at the channel picker "${channels}", which is not where you pick a person`);
+  assert.doesNotMatch(notice, TEMPLATE_HOLE, `the redirect leaked a template hole: ${notice}`);
 });
 
 test('a DM is not a channel the app can post to, so it is left unprefilled', () => {

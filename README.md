@@ -164,7 +164,13 @@ saving.
 | Picker | What it reaches |
 |--------|-----------------|
 | **Channels** | Public channels (the bot does not need to be a member), and private channels it has been invited to. Up to 10. |
-| **People** | Each person gets the poll in their own DM with the bot. Up to 10. |
+| **People (I'll DM them)** | Each person gets the poll in their own DM with the bot. Up to 10. |
+
+The second label names the sender because Slack gives an app no way to post as
+you: pick someone and the poll arrives in their DM *with the bot*, not from the
+person who picked them. It is phrased as a promise rather than a description
+for the same reason - in a form, "me" is the person filling the form in, so a
+label reading *DM from me* would state the opposite of what happens.
 
 Fill in both if you like: unlike most poll apps this is not a choice between a
 channel and people, and there is no radio button to flip. Leave both empty and
