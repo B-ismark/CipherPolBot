@@ -540,6 +540,20 @@ function getTypeIcon(type) {
   return QUESTION_TYPE_ICONS[type] || '❓';
 }
 
+// How a question describes itself. The type picker offers Multi-select as its
+// own entry, so a question that takes several answers has to read that way
+// wherever it is shown - otherwise the creator picks "☑️ Multi-select" and gets
+// back "📋 Multiple choice · multi-select", which is the same fact told in a
+// different vocabulary with a different icon. formTypeFor is the predicate so
+// there is only one definition of what a multi-select question is.
+function questionTypeIcon(q) {
+  return formTypeFor(q) === MULTI_SELECT_FORM_TYPE ? '☑️' : getTypeIcon(q.type);
+}
+
+function questionTypeLabel(q) {
+  return formTypeFor(q) === MULTI_SELECT_FORM_TYPE ? 'Multi-select' : getTypeLabel(q.type);
+}
+
 // ==================== MODAL BUILDERS ====================
 
 // Grouped options for question type picker (Hick's Law — scannable categories)
@@ -921,7 +935,7 @@ function savedQuestionsBlocks(savedQuestions) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${i + 1}.* ${q.text}\n_${getTypeIcon(q.type)} ${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${q.type !== 'open_ended' && q.options.length ? '  —  ' + q.options.slice(0, 4).join(', ') + (q.options.length > 4 ? '…' : '') : ''}_`
+        text: `*${i + 1}.* ${q.text}\n_${questionTypeIcon(q)} ${questionTypeLabel(q)}${q.type !== 'open_ended' && q.options.length ? '  —  ' + q.options.slice(0, 4).join(', ') + (q.options.length > 4 ? '…' : '') : ''}_`
       },
       accessory: {
         type: 'overflow',
@@ -970,7 +984,7 @@ function buildPreviewModal(meta) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${i + 1}. ${q.text}*\n_${getTypeIcon(q.type)} ${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}_`
+        text: `*${i + 1}. ${q.text}*\n_${questionTypeIcon(q)} ${questionTypeLabel(q)}_`
       }
     },
     ...(q.type === 'open_ended'
@@ -1031,7 +1045,7 @@ function clampText(text, limit = 2900) {
 
 function compactQuestionBlocks(poll) {
   const listing = (poll.questions || []).map((q, i) =>
-    `${getTypeIcon(q.type)}  *${i + 1}. ${q.text}*${(q.options || []).length ? `  _${q.options.length} options_` : ''}`
+    `${questionTypeIcon(q)}  *${i + 1}. ${q.text}*${(q.options || []).length ? `  _${q.options.length} options_` : ''}`
   ).join('\n');
   return [
     { type: 'section', text: { type: 'mrkdwn', text: clampText(listing) } },
@@ -1054,7 +1068,7 @@ function buildVoteModal(poll, previousVotes = {}) {
   const hasVoted = Object.keys(previousVotes).length > 0;
   const questionBlocks = poll.questions.flatMap((q, qi) => {
     const prev = previousVotes[qi] || [];
-    const label = `${getTypeIcon(q.type)}  ${qi + 1}. ${q.text}`;
+    const label = `${questionTypeIcon(q)}  ${qi + 1}. ${q.text}`;
 
     if (q.type === 'open_ended') {
       return [{
@@ -1229,7 +1243,7 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = fa
     const head =
       {
         type: 'section',
-        text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${resultsHiddenReason(poll)}_` }
+        text: { type: 'mrkdwn', text: `${questionTypeIcon(q)}  *${qi + 1}. ${q.text}*\n_${resultsHiddenReason(poll)}_` }
       };
     if (!isInlineVotable(q.type)) return [head, { type: 'divider' }];
     return [
@@ -1256,7 +1270,7 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = fa
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${count} response${count !== 1 ? 's' : ''}_\n${body}`
+          text: `${questionTypeIcon(q)}  *${qi + 1}. ${q.text}*\n_${count} response${count !== 1 ? 's' : ''}_\n${body}`
         }
       },
       { type: 'divider' }
@@ -1279,7 +1293,7 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = fa
       }];
     });
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `${questionTypeIcon(q)}  *${qi + 1}. ${q.text}*` } },
       ...stmtBlocks,
       { type: 'divider' }
     ];
@@ -1304,7 +1318,7 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = fa
       }
     }));
     return [
-      { type: 'section', text: { type: 'mrkdwn', text: `${getTypeIcon(q.type)}  *${qi + 1}. ${q.text}*\n_${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `${questionTypeIcon(q)}  *${qi + 1}. ${q.text}*\n_${allRankings.length} response${allRankings.length !== 1 ? 's' : ''}_` } },
       ...optBlocks,
       { type: 'divider' }
     ];
@@ -1312,7 +1326,7 @@ function buildQuestionResultBlock(q, qi, poll, viewerId = null, interactive = fa
 
   const totalVotes = Object.values(qVotes).reduce((s, v) => s + v.length, 0);
   const maxVotes   = totalVotes === 0 ? 0 : Math.max(...Object.values(qVotes).map(v => v.length));
-  const typeHint   = `${getTypeIcon(q.type)} _${getTypeLabel(q.type)}${q.allowMultiple ? ' · multi-select' : ''}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}${interactive ? '  ·  press a number to vote' : ''}_`;
+  const typeHint   = `${questionTypeIcon(q)} _${questionTypeLabel(q)}${totalVotes > 0 ? `  ·  ${totalVotes} vote${totalVotes !== 1 ? 's' : ''}` : ''}${interactive ? '  ·  press a number to vote' : ''}_`;
 
   let displayOptions = q.options.map((option, oi) => ({ option, oi }));
   if (poll.orderByVotes && totalVotes > 0) {
@@ -2061,15 +2075,15 @@ function buildPollCsv(poll) {
     if (q.type === 'open_ended') {
       Object.entries(qVotes).forEach(([uid, text]) => {
         const ts = poll.voteTimestamps?.[uid] || '';
-        rows.push([q.text, getTypeLabel(q.type), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
+        rows.push([q.text, questionTypeLabel(q), poll.anonymous ? '(anonymous)' : uid, text, '', ts]);
       });
-      if (!Object.keys(qVotes).length) rows.push([q.text, getTypeLabel(q.type), '(no responses)', '', '', '']);
+      if (!Object.keys(qVotes).length) rows.push([q.text, questionTypeLabel(q), '(no responses)', '', '', '']);
     } else if (q.type === 'ranking') {
       const allRankings = Object.values(qVotes);
       q.options.forEach((opt, oi) => {
         const ranks = allRankings.map(r => parseInt((r || '').split(',')[oi])).filter(n => !isNaN(n) && n > 0);
         const avg = ranks.length ? (ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(2) : 'N/A';
-        rows.push([q.text, getTypeLabel(q.type), opt, `avg rank: ${avg}`, '', '']);
+        rows.push([q.text, questionTypeLabel(q), opt, `avg rank: ${avg}`, '', '']);
       });
     } else if (q.type === 'likert') {
       q.options.forEach((stmt, si) => {
@@ -2078,7 +2092,7 @@ function buildPollCsv(poll) {
         LIKERT_SCALE.forEach(({ label, value }) => {
           const cnt = (ratings[value] || []).length;
           const pct = total === 0 ? 0 : Math.round((cnt / total) * 100);
-          rows.push([q.text, getTypeLabel(q.type), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
+          rows.push([q.text, questionTypeLabel(q), `${stmt} — ${label}`, cnt, `${pct}%`, '']);
         });
       });
     } else {
@@ -2086,7 +2100,7 @@ function buildPollCsv(poll) {
       q.options.forEach((opt, oi) => {
         const voters = qVotes[oi] || [];
         const pct = total === 0 ? 0 : Math.round((voters.length / total) * 100);
-        rows.push([q.text, getTypeLabel(q.type), opt, voters.length, `${pct}%`, '']);
+        rows.push([q.text, questionTypeLabel(q), opt, voters.length, `${pct}%`, '']);
       });
     }
   });
