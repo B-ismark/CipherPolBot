@@ -104,6 +104,50 @@ test('the channel the command came from is prefilled, so posting here needs no p
     'the channel and people pickers must not read the same');
 });
 
+// The two pickers are one component, so a rule about them has to hold wherever
+// it appears rather than only on the screen someone happened to test - the
+// component-level version of what test-lib/audit.js does for whole views.
+const screensCarryingDestinations = () => [
+  ['compose', buildComposeModal(draft())],
+  ['share', buildShareModal(poll())]
+];
+
+// Small grey type under a field. Two lines on a phone is about this much, and
+// past two lines it stops being a hint and becomes something to read.
+const HINT_BUDGET = 60;
+
+test('the people picker names who does the sending, not just who receives', () => {
+  // Labelled "People" it read as "send this to them" - a thing Slack has no
+  // verb for. An app can only post in its own DM with someone, so what
+  // actually happens is that this app knocks on their door carrying a poll
+  // they did not ask for. The label has to carry the sender or the mechanism
+  // is a surprise waiting on the far side of the pick.
+  //
+  // The rule is the first-person voice, not the wording: the copy can still be
+  // improved without this test having an opinion about it.
+  for (const [name, view] of screensCarryingDestinations()) {
+    const label = findBlock(view, 'poll_dest_users').label.text;
+    assert.match(label, /\b(me|I|my)\b/i,
+      `${name}: the people picker must say who sends the DM, but reads "${label}"`);
+  }
+});
+
+test('a label and its hint do not both explain the same thing', () => {
+  // Saying it twice is the clutter that got the settings summary cut. The
+  // label owns the mechanism; the hint owns who ends up with a ballot, which
+  // is the half nobody guesses.
+  for (const [name, view] of screensCarryingDestinations()) {
+    const { label, hint } = findBlock(view, 'poll_dest_users');
+    assert.ok(hint, `${name}: the people picker needs its hint - who gets a ballot is not guessable`);
+    assert.doesNotMatch(hint.text, /\bDMs?\b/i,
+      `${name}: the hint repeats the mechanism its label already carries: "${hint.text}"`);
+    assert.ok(hint.text.length <= HINT_BUDGET,
+      `${name}: hint is ${hint.text.length} chars, over the ${HINT_BUDGET} a hint should be: "${hint.text}"`);
+    assert.ok(label.text.length <= HINT_BUDGET,
+      `${name}: label is ${label.text.length} chars, which is a sentence, not a label`);
+  }
+});
+
 test('a DM is not a channel the app can post to, so it is left unprefilled', () => {
   // resolveDestinations falls back for these; offering an impossible channel
   // would be worse than offering none.
