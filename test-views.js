@@ -540,6 +540,34 @@ test('headerText trims to Slack\'s limit and shows that it did', () => {
   assert.strictEqual(headerText(undefined), '');
 });
 
+test('no clamp ever cuts an emoji in half', () => {
+  // Slack counts UTF-16 code units and an emoji is two of them, so a title of
+  // exactly the wrong length puts one astride the boundary. Slicing there
+  // leaves a lone surrogate, which reaches the reader as a broken glyph. Every
+  // string these clamps touch is something a person typed, so slide an emoji
+  // across each boundary and check no half of one survives.
+  const { headerText, clampText, settingsSummary, SLACK_HEADER_LIMIT } = views;
+  const halfEmoji = s => [...s].some(ch => {
+    const c = ch.codePointAt(0);
+    return c >= 0xD800 && c <= 0xDFFF;
+  });
+
+  for (let pad = 0; pad < 40; pad++) {
+    const stem = 'x'.repeat(pad) + '🎉' + 'y'.repeat(60);
+
+    const header = headerText('x'.repeat(SLACK_HEADER_LIMIT - 20 + (pad % 20)) + '🎉' + 'y'.repeat(60));
+    assert.ok(!halfEmoji(header), `headerText cut an emoji at pad ${pad}`);
+    assert.ok(header.length <= SLACK_HEADER_LIMIT, `headerText overran at pad ${pad}`);
+
+    const clamped = clampText(stem, 30);
+    assert.ok(!halfEmoji(clamped), `clampText cut an emoji at pad ${pad}`);
+    assert.ok(clamped.length <= 30, `clampText overran at pad ${pad}`);
+
+    const summary = settingsSummary({ pollTitle: stem, pollSettings: ['anonymous'] });
+    assert.ok(!halfEmoji(summary), `settingsSummary cut an emoji at pad ${pad}`);
+  }
+});
+
 test('a title longer than a header allows is trimmed, not rejected', () => {
   // MAX_POLL_TITLE_LENGTH is 200 and a Slack header caps at 150.
   const long = 'T'.repeat(200);
