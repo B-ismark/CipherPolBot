@@ -384,6 +384,33 @@ rather than 10: three chances to miss the 15-minute deadline instead of one.
 
 ---
 
+## Code layout
+
+`slack-poll-bot.js` is the app: the server, the database, the Slack calls and
+every command and button handler. Everything it can be tested without lives in
+`lib/`, because requiring the app module starts a web server and connects to
+Postgres — so anything left in there can only be checked by hand.
+
+| Module | Holds | Tested by |
+|--------|-------|-----------|
+| `lib/views.js` | Every screen and message: data in, Block Kit out. No Slack, no database. | `test-views.js` |
+| `lib/compose.js` | Reading a question out of a form or a command line. | `test-compose.js` |
+| `lib/validation.js` | Input limits, the draft-size ceiling, rate limiting. | `test-security.js` |
+| `lib/policy.js` | Who may manage a poll, and who may see its results. | `test-security.js` |
+| `lib/destinations.js` | Resolving and de-duplicating where a poll goes. | `test-destinations.js` |
+| `lib/poll.js` | Pure reads over a poll's data — its voters, its messages. | `test-views.js` |
+| `lib/install.js`, `lib/db.js`, `lib/health.js` | OAuth keys, SSL options, the readiness probe. | `test-security.js` |
+
+`npm test` runs all of it (`node --test`, no dependencies).
+
+The reason `lib/views.js` exists as its own module is worth knowing before
+moving anything back: **Slack does not partially render a bad view.** A view
+over 100 blocks, with a header past 150 characters, with duplicate `block_id`s
+or with `private_metadata` past 3000 characters is rejected whole — the person
+who pressed the button sees nothing and is told nothing. Those limits are
+asserted in `test-views.js` against the same functions the bot calls, which is
+the only way to find out before a user does.
+
 ## Database
 
 Polls live in PostgreSQL. Set `DATABASE_URL` to a Postgres connection string — the free [Neon](https://neon.tech) tier is enough — and the schema is created and migrated on boot.
