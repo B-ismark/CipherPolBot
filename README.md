@@ -164,7 +164,7 @@ saving.
 | Picker | What it reaches |
 |--------|-----------------|
 | **Channels** | Public channels (the bot does not need to be a member), and private channels it has been invited to. Up to 10. |
-| **People (I'll DM them)** | Each person gets the poll in their own DM with the bot. Up to 10. |
+| **People (I'll DM)** | Each person gets the poll in their own DM with the bot. Up to 10. |
 
 The second label names the sender because Slack gives an app no way to post as
 you: pick someone and the poll arrives in their DM *with the bot*, not from the
@@ -403,7 +403,7 @@ Postgres — so anything left in there can only be checked by hand.
 | `lib/compose.js` | Reading a question out of a form or a command line. | `test-compose.js` |
 | `lib/validation.js` | Input limits, the draft-size ceiling, rate limiting. | `test-security.js` |
 | `lib/policy.js` | Who may manage a poll, and who may see its results. | `test-security.js` |
-| `lib/destinations.js` | Resolving and de-duplicating where a poll goes. | `test-destinations.js` |
+| `lib/destinations.js` | Where a poll goes: resolving picks into channels, posting into them, and saying why one refused. | `test-destinations.js` |
 | `lib/poll.js` | Pure reads over a poll's data — its voters, its title, its messages. | `test-views.js` |
 | `lib/install.js`, `lib/db.js`, `lib/health.js` | OAuth keys, SSL options, the readiness probe. | `test-security.js` |
 
@@ -434,6 +434,16 @@ screen that passes through it, including screens nobody has written yet. Both
 rules in there now — no emoji in a modal's chrome, no trim that cuts an emoji
 in half — were added after a real screen shipped broken, and both immediately
 turned up the same fault on screens nobody was looking at.
+
+**Copy and delivery that only exist in `slack-poll-bot.js` cannot be tested at
+all.** Requiring that file opens a Postgres pool and binds a port, so anything
+kept there ships unread by the suite. Two faults came out of exactly that: a
+sentence pointing the reader at the wrong picker, and the whole path from a
+picked person to a delivered DM — two API calls, four ways to fail, no
+coverage. Both were fixed by moving the logic into a `lib/` module and driving
+it with a stub client that records what Slack was asked to do. If a bug report
+says a feature "just doesn't work" and the code reads correctly, check whether
+anything ever ran it.
 
 **Assert the rule, not the wording.** A test written by reading the code back
 (`assert.match(summary({}), /Live results/)`) can only fail when someone
@@ -484,3 +494,4 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 | Bot exits at boot with a DB error | Check `DATABASE_URL`; the bot retries five times, then exits so the host restarts it |
 | `self signed certificate` on connect | The database is not presenting a trusted certificate. Use managed Postgres, or `sslmode=no-verify` for local dev only |
 | Can't create polls in DMs | Add `im:write` and `im:history` scopes, then reinstall the app |
+| Picked people get no DM | Read the confirmation, which names the reason per person. `missing_scope` means the app predates `im:write` and must be reinstalled to pick it up; a capped recipient clears on its own within the hour |

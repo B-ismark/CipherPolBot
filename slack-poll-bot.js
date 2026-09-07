@@ -228,7 +228,7 @@ const {
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { getAllVoters, pollMessageRefs } = require('./lib/poll');
+const { getAllVoters, pollMessageRefs, pollDisplayTitle } = require('./lib/poll');
 const {
   readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
   buildOptionsModal, buildEditModal, buildPreviewModal, METADATA_FULL, readCurrentQuestion,
@@ -240,7 +240,10 @@ const {
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
-const { normalizeDestinations, assertDestinationLimit, dedupeTargets } = require('./lib/destinations');
+const {
+  resolveChannelInfo, resolveDestinations, postPollTo,
+  reachesCreator, describeFailures, toMessageRefs
+} = require('./lib/destinations');
 
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
@@ -292,114 +295,21 @@ const app = new App({
 
 app.error(async (err) => console.error('Bolt error:', JSON.stringify(err, null, 2)));
 
-// Slack does not let an app post into a DM between two people: it has no
-// membership there and cannot be given one. So a command run in such a DM is
-// answered in the user's own DM with the bot instead. redirected says whether
-// that substitution happened, so the caller can explain itself - a DM with the
-// bot is also a D channel, and that one needs no explanation.
-async function resolveChannelInfo(client, channelId, userId) {
-  if (!channelId.startsWith('D')) return { channel: channelId, redirected: false };
-  const r = await client.conversations.open({ users: userId });
-  return { channel: r.channel.id, redirected: r.channel.id !== channelId };
-}
-
+// resolveChannel stays here because it is what the command handlers reach for;
+// the resolving itself, the posting, and the failure wording all moved to
+// lib/destinations.js so a stub client can drive them. Requiring this file
+// opens a Postgres pool, so nothing in it can be tested, and the path from a
+// picked person to a delivered DM had no coverage at all.
 async function resolveChannel(client, channelId, userId) {
   const { channel } = await resolveChannelInfo(client, channelId, userId);
   return channel;
 }
 
-// Turns the channels and people someone picked into channels this app can
-// actually post in. A person becomes the app's own DM with them - see
-// lib/destinations.js for why that is the only way to reach an individual.
-//
-// Returns a label per target so the confirmation can name where the poll went
-// without a second round of API calls, and the failures separately: one
-// unreachable destination must not stop the others.
-async function resolveDestinations(client, { channelIds, userIds }, fallbackChannelId, actorId) {
-  const { channels, users, usedFallback } = normalizeDestinations({ channelIds, userIds, fallbackChannelId });
-  assertDestinationLimit({ channels, users });
-
-  const targets = [];
-  const failures = [];
-  let redirected = false;
-
-  for (const id of channels) {
-    // Only the fallback can be a DM between two people, because the picker does
-    // not offer those. That one needs substituting; a picked channel does not.
-    if (usedFallback) {
-      const info = await resolveChannelInfo(client, id, actorId);
-      redirected = info.redirected;
-      targets.push({ channel: info.channel, label: info.redirected ? 'our DM' : `<#${info.channel}>` });
-    } else {
-      targets.push({ channel: id, label: `<#${id}>` });
-    }
-  }
-
-  for (const uid of users) {
-    // Anyone in the workspace can share a poll, so this is also what stops one
-    // person being sent a stream of them. The budget is shared with close
-    // notifications, on purpose: it is a cap on DMs this app sends them.
-    if (!await checkNotificationRateLimit(uid)) {
-      failures.push({ label: `<@${uid}>`, reason: 'already had several poll DMs from me this hour' });
-      continue;
-    }
-    try {
-      const r = await client.conversations.open({ users: uid });
-      targets.push({ channel: r.channel.id, label: `<@${uid}>` });
-    } catch (e) {
-      failures.push({ label: `<@${uid}>`, reason: e.data?.error || e.message });
-    }
-  }
-
-  return { targets: dedupeTargets(targets), failures, redirected, usedFallback };
-}
-
-// Posts the poll into every target, keeping the ones that worked. Slack fails a
-// single destination for its own reasons - a private channel the app was never
-// invited to, a deactivated account - and that must not lose the others.
-async function postPollTo(client, poll, targets) {
-  const blocks = buildPollBlocks(poll);
-  const results = await Promise.allSettled(targets.map(t =>
-    client.chat.postMessage({ channel: t.channel, text: `📊 ${poll.title}`, blocks })
-      .then(r => ({ channelId: t.channel, messageTs: r.ts }))
-  ));
-
-  const posted = [];
-  const failures = [];
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled') posted.push({ ...r.value, label: targets[i].label });
-    else failures.push({ label: targets[i].label, reason: r.reason?.data?.error || r.reason?.message });
-  });
-  return { posted, failures };
-}
-
-// message_refs is stored, so it keeps only what a later chat.update needs - a
-// label would be a copy of a channel name that goes stale on the first rename.
-function toMessageRefs(posted) {
-  return posted.map(({ channelId, messageTs }) => ({ channelId, messageTs }));
-}
-
-
-
-
-// Whether the poll landed somewhere its creator can read and vote in.
-//
-// A channel they picked counts - the picker only offers conversations they can
-// open. Their own DM counts, whether they picked themselves or fell back to it.
-// A poll sent only to other people does not: the creator would have a receipt
-// and no ballot.
-function reachesCreator(posted, destUsers, creatorId, usedFallback) {
-  if (usedFallback) return true;
-  if ((destUsers || []).includes(creatorId)) return true;
-  return posted.some(p => /^[CG]/.test(p.channelId));
-}
-
-// Slack returns these when the app cannot post somewhere the picker was willing
-// to offer, and the fix is always the same one sentence.
-function describeFailures(failures) {
-  const list = failures.map(f => `${f.label} (${f.reason})`).join(', ');
-  const needsInvite = failures.some(f => /not_in_channel|channel_not_found/.test(`${f.reason}`));
-  return `Could not post to ${list}.${needsInvite ? ' For a private channel, invite me to it first (\`/invite @Cipher Pol\`).' : ''}`;
+// What a poll looks like as a message. postPollTo takes this rather than the
+// poll, so lib/destinations.js needs no opinion about blocks and the two
+// modules do not have to require each other.
+function pollMessage(poll) {
+  return { text: `📊 ${pollDisplayTitle(poll)}`, blocks: buildPollBlocks(poll) };
 }
 
 // The way to reach one person when there is no channel to answer in, or when
@@ -530,7 +440,7 @@ async function createAndPostPoll(client, meta, teamId = null) {
     throw new Error(failures.length ? describeFailures(failures) : 'There was nowhere to post this poll.');
   }
 
-  const { posted, failures: postFailures } = await postPollTo(client, poll, targets);
+  const { posted, failures: postFailures } = await postPollTo(client, pollMessage(poll), targets);
   const allFailures = [...failures, ...postFailures];
 
   // Nothing landed. The poll is not deleted: every question the creator just
@@ -551,9 +461,7 @@ async function createAndPostPoll(client, meta, teamId = null) {
     try {
       const own = await client.conversations.open({ users: userId });
       if (!posted.some(p => p.channelId === own.channel.id)) {
-        const r = await client.chat.postMessage({
-          channel: own.channel.id, text: `📊 ${poll.title}`, blocks: buildPollBlocks(poll)
-        });
+        const r = await client.chat.postMessage({ channel: own.channel.id, ...pollMessage(poll) });
         posted.push({ channelId: own.channel.id, messageTs: r.ts, label: 'you (so you can vote)' });
       }
     } catch (e) {
@@ -1228,7 +1136,12 @@ async function postComposedPoll(client, meta, body, view, context) {
     // Confirm where the command was run - somewhere the creator can certainly
     // read. A DM between two people is not, so that becomes our own DM.
     const confirmChannel = await resolveChannel(client, meta.channelId, meta.userId);
-    if (explainRedirect) {
+    // A partial failure keeps the message too. Every reason a destination
+    // refuses needs acting on - invite the bot, reinstall for a scope, wait out
+    // a cap - and an ephemeral is gone on the next reload, which is how "it
+    // just doesn't DM them" survives: the poll posts to the channel, the ⚠️
+    // line explaining that the DM did not says so once, and then vanishes.
+    if (explainRedirect || failures.length) {
       // A real message rather than an ephemeral one: the button has to survive a
       // reload, and opening the share modal here instead would race Slack's
       // 3-second trigger_id, which the poll we just posted has already spent.
@@ -1321,7 +1234,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
         : '⚠️ Pick at least one channel or person to send the poll to.');
     }
 
-    const { posted, failures: postFailures } = await postPollTo(client, poll, fresh);
+    const { posted, failures: postFailures } = await postPollTo(client, pollMessage(poll), fresh);
     if (posted.length) {
       const refs = [...(poll.messageRefs || []), ...toMessageRefs(posted)];
       await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(refs), pollId]);
