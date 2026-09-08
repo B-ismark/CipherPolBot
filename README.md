@@ -32,7 +32,7 @@ Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these five:
 | `commands` | The slash commands themselves |
 | `chat:write` | Posting polls, results and every ephemeral reply |
 | `chat:write.public` | Posting to a public channel without being invited to it first |
-| `im:write` | Opening a DM — polls created in DMs, close notifications, error reports |
+| `im:write` | Opening a DM — polls sent to people, polls created in DMs, close notifications, error reports |
 | `files:write` | The CSV from `/poll-export` |
 
 That is the complete set: those are the only Slack methods the bot calls
@@ -494,4 +494,4 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 | Bot exits at boot with a DB error | Check `DATABASE_URL`; the bot retries five times, then exits so the host restarts it |
 | `self signed certificate` on connect | The database is not presenting a trusted certificate. Use managed Postgres, or `sslmode=no-verify` for local dev only |
 | Can't create polls in DMs | Add `im:write` and `im:history` scopes, then reinstall the app |
-| Picked people get no DM | Read the confirmation, which names the reason per person. `missing_scope` means the app predates `im:write` and must be reinstalled to pick it up; a capped recipient clears on its own within the hour |
+| Picked people get no DM | The bot DMs the creator with Slack's own error per person, and logs the same line. `missing_scope` means the app predates `im:write` and must be reinstalled; `user_disabled` or `cannot_dm_bot` means the pick was not a reachable person; a capped recipient clears within the hour |

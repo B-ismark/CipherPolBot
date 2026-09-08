@@ -179,6 +179,26 @@ test('the DM redirect points at the picker it means', () => {
   assert.doesNotMatch(notice, TEMPLATE_HOLE, `the redirect leaked a template hole: ${notice}`);
 });
 
+test('a picker that is not on the screen does not clear what was picked', () => {
+  // readComposeState spreads readDestinations over the metadata, so a picker
+  // returning an empty list where it has no block would wipe picks made on a
+  // screen the reader has already left - and the symptom is the reported one, a
+  // poll that quietly goes nowhere near the people chosen for it.
+  const carried = { channelId: 'C0123456789', userId: 'UME', savedQuestions: [], destUsers: ['UKWAME'], destChannels: ['C9'] };
+  const { meta } = views.readComposeState({ private_metadata: JSON.stringify(carried), state: { values: {} } });
+  assert.deepStrictEqual(meta.destUsers, ['UKWAME'], 'an absent picker is not an empty one');
+  assert.deepStrictEqual(meta.destChannels, ['C9']);
+});
+
+test('a picker that is on the screen and empty does clear', () => {
+  // The other half of the same rule: clearing a picker has to stick, or the
+  // reader cannot undo a pick.
+  const carried = { channelId: 'C0123456789', userId: 'UME', savedQuestions: [], destUsers: ['UKWAME'] };
+  const values = { poll_dest_users: { value: { type: 'multi_users_select', selected_users: [] } } };
+  const { meta } = views.readComposeState({ private_metadata: JSON.stringify(carried), state: { values } });
+  assert.deepStrictEqual(meta.destUsers, [], 'an empty picker is an answer');
+});
+
 test('a DM is not a channel the app can post to, so it is left unprefilled', () => {
   // resolveDestinations falls back for these; offering an impossible channel
   // would be worse than offering none.

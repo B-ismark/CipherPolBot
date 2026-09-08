@@ -19,7 +19,8 @@ const {
   canCreatePoll,
   checkPollCreationRateLimit,
   checkShareRateLimit,
-  checkNotificationRateLimit
+  canNotify,
+  spendNotification
 } = require('./lib/validation');
 
 const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
@@ -148,12 +149,22 @@ test('poll creation rate limit blocks the request after the daily quota', async 
   await assert.rejects(() => checkPollCreationRateLimit(userId), /Rate limit/);
 });
 
-test('notification rate limit stops allowing sends after the hourly quota', async () => {
+test('notification rate limit stops allowing sends after the hourly quota', () => {
   const userId = 'notify-rate-limit-user';
   for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR; i++) {
-    assert.strictEqual(await checkNotificationRateLimit(userId), true);
+    assert.strictEqual(canNotify(userId), true);
+    spendNotification(userId);
   }
-  assert.strictEqual(await checkNotificationRateLimit(userId), false);
+  assert.strictEqual(canNotify(userId), false);
+});
+
+test('asking does not spend the budget, only sending does', () => {
+  // The two are separate calls precisely so a DM that never went out cannot
+  // cost the recipient a slot. Asking a hundred times has to be free.
+  const userId = 'notify-ask-only-user';
+  for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR * 10; i++) {
+    assert.strictEqual(canNotify(userId), true, 'asking is not sending');
+  }
 });
 
 const poll = (showResults, status = 'active', coCreators = []) =>

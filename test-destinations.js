@@ -15,7 +15,8 @@ const {
   resolveDestinations,
   postPollTo,
   reachesCreator,
-  describeFailures
+  describeFailures,
+  logFailures
 } = require('./lib/destinations');
 const { MAX_NOTIFICATIONS_PER_USER_PER_HOUR } = require('./lib/validation');
 
@@ -260,4 +261,49 @@ test('a channel that refused the app counts as no ballot', () => {
   // reachesCreator reads what actually posted, not what was picked, so a
   // private channel the app was never invited to does not stand in for a copy.
   assert.strictEqual(reachesCreator([], ['U9'], 'UME', false), false);
+});
+
+// ==================== a refusal has to be recoverable ====================
+
+test('every refusal names its Slack error verbatim', () => {
+  // The advice is a guess about the cause; Slack's own string is the evidence.
+  // Narrowing this poll's failure took a round of guessing precisely because
+  // the only message carrying that string was thrown away unread.
+  const said = describeFailures([
+    { label: '<@U1>', reason: 'missing_scope' },
+    { label: '<#C2>', reason: 'not_in_channel' }
+  ]);
+  assert.match(said, /missing_scope/, 'the reader cannot report a cause the message hides');
+  assert.match(said, /not_in_channel/);
+});
+
+test('each kind of refusal gets the remedy that fits it, and only that one', () => {
+  const scope  = describeFailures([{ label: '<@U1>', reason: 'missing_scope' }]);
+  const invite = describeFailures([{ label: '<#C1>', reason: 'not_in_channel' }]);
+  const gone   = describeFailures([{ label: '<@U1>', reason: 'user_disabled' }]);
+
+  assert.match(scope, /im:write/);
+  assert.ok(!/invite me to it/.test(scope), 'no invite fixes a missing scope');
+
+  assert.match(invite, /invite me to it/);
+  assert.ok(!/im:write/.test(invite), 'a channel the bot is not in is not a scope problem');
+
+  assert.match(gone, /deactivated account/);
+  assert.ok(!/im:write/.test(gone) && !/invite me to it/.test(gone),
+    'a gone account has no remedy the reader can apply');
+});
+
+test('a refusal is written to the log as well, so it survives being missed', () => {
+  const said = [];
+  const warn = console.warn;
+  console.warn = m => said.push(m);
+  try {
+    logFailures('poll_1', [{ label: '<@U1>', reason: 'missing_scope' }]);
+  } finally {
+    console.warn = warn;
+  }
+  assert.strictEqual(said.length, 1);
+  assert.match(said[0], /poll_1/);
+  assert.match(said[0], /<@U1>/);
+  assert.match(said[0], /missing_scope/, 'the log is the copy that outlives the DM');
 });

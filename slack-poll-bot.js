@@ -224,7 +224,8 @@ const {
   pollCreationLimitMessage,
   checkPollCreationRateLimit,
   checkShareRateLimit,
-  checkNotificationRateLimit,
+  canNotify,
+  spendNotification,
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
@@ -242,7 +243,7 @@ const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/comp
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
 const {
   resolveChannelInfo, resolveDestinations, postPollTo,
-  reachesCreator, describeFailures, toMessageRefs
+  reachesCreator, describeFailures, logFailures, toMessageRefs
 } = require('./lib/destinations');
 
 async function sendCloseNotifications(client, poll) {
@@ -250,8 +251,11 @@ async function sendCloseNotifications(client, poll) {
   if (!notifyUsers.length) return;
   await Promise.allSettled(notifyUsers.map(async uid => {
     try {
-      const allowed = await checkNotificationRateLimit(uid);
-      if (!allowed) return; // User has hit their hourly notification limit
+      // Checked here, charged after the message lands - the same split the
+      // picker path uses. Spending the slot up front meant a DM that failed to
+      // send still cost the recipient one, and this is the caller most likely
+      // to fail: it fires hours later, when an account may be gone.
+      if (!canNotify(uid)) return; // this person has had their fill this hour
       const dm = await client.conversations.open({ users: uid });
       await client.chat.postMessage({
         channel: dm.channel.id,
@@ -261,6 +265,7 @@ async function sendCloseNotifications(client, poll) {
           { type: 'context', elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`` }] }
         ]
       });
+      spendNotification(uid);
     } catch (e) { console.error('notify error:', e.message); }
   }));
 }
@@ -1136,18 +1141,37 @@ async function postComposedPoll(client, meta, body, view, context) {
     // Confirm where the command was run - somewhere the creator can certainly
     // read. A DM between two people is not, so that becomes our own DM.
     const confirmChannel = await resolveChannel(client, meta.channelId, meta.userId);
-    // A partial failure keeps the message too. Every reason a destination
-    // refuses needs acting on - invite the bot, reinstall for a scope, wait out
-    // a cap - and an ephemeral is gone on the next reload, which is how "it
-    // just doesn't DM them" survives: the poll posts to the channel, the ⚠️
-    // line explaining that the DM did not says so once, and then vanishes.
-    if (explainRedirect || failures.length) {
+    if (explainRedirect) {
       // A real message rather than an ephemeral one: the button has to survive a
       // reload, and opening the share modal here instead would race Slack's
       // 3-second trigger_id, which the poll we just posted has already spent.
+      // Only reachable when the command was run in a DM between two people, so
+      // this is never a message in front of an audience.
       await client.chat.postMessage({ channel: confirmChannel, text, blocks });
     } else {
       await client.chat.postEphemeral({ channel: confirmChannel, user: meta.userId, text, blocks });
+    }
+
+    // A refusal is also DM'd, on top of the confirmation above.
+    //
+    // Every reason a destination refuses needs acting on - invite the bot,
+    // reinstall for a scope, wait out a cap - and an ephemeral is gone on the
+    // next reload, which is how "it just doesn't DM them" survives: the poll
+    // posts to the channel, the line explaining that the DM did not says so
+    // once, and then there is no trace of it.
+    //
+    // Not by widening the branch above, which was the first attempt: that
+    // turned the confirmation into a real message in whatever channel the
+    // command was run in, so a failed DM to one person became an announcement
+    // to everyone there, naming them. A refusal belongs to the person who
+    // caused it, in private, and it has to still be there tomorrow.
+    if (failures.length) {
+      logFailures(`poll ${poll.id}`, failures);
+      await dmUser(client, meta.userId, [
+        `⚠️ *${pollDisplayTitle(poll)}* posted, but not everywhere.`,
+        describeFailures(failures),
+        `Everything that did post is live and counts toward the same poll.`
+      ].join('\n\n'));
     }
   } catch (err) {
     console.error('postComposedPoll error:', err);
