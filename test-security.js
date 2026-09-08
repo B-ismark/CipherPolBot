@@ -19,7 +19,9 @@ const {
   canCreatePoll,
   checkPollCreationRateLimit,
   checkShareRateLimit,
-  checkNotificationRateLimit
+  canNotify,
+  claimNotification,
+  releaseNotification
 } = require('./lib/validation');
 
 const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
@@ -148,12 +150,38 @@ test('poll creation rate limit blocks the request after the daily quota', async 
   await assert.rejects(() => checkPollCreationRateLimit(userId), /Rate limit/);
 });
 
-test('notification rate limit stops allowing sends after the hourly quota', async () => {
+test('notification rate limit stops allowing sends after the hourly quota', () => {
   const userId = 'notify-rate-limit-user';
   for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR; i++) {
-    assert.strictEqual(await checkNotificationRateLimit(userId), true);
+    assert.strictEqual(claimNotification(userId), true);
   }
-  assert.strictEqual(await checkNotificationRateLimit(userId), false);
+  assert.strictEqual(claimNotification(userId), false);
+});
+
+test('a claim is atomic, so two sends cannot share the last slot', () => {
+  // Checking and charging as two calls left a window: with one slot left, both
+  // sends passed the check before either charged, and the cap was exceeded.
+  const userId = 'notify-race-user';
+  for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR - 1; i++) {
+    assert.strictEqual(claimNotification(userId), true);
+  }
+  assert.strictEqual(claimNotification(userId), true, 'the last slot goes to the first claimer');
+  assert.strictEqual(claimNotification(userId), false, 'and cannot be granted twice');
+});
+
+test('a claim handed back can be claimed again, so an undelivered DM is free', () => {
+  const userId = 'notify-release-user';
+  for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR; i++) claimNotification(userId);
+  assert.strictEqual(claimNotification(userId), false, 'the budget is spent');
+  releaseNotification(userId);
+  assert.strictEqual(claimNotification(userId), true, 'a DM that never arrived costs nothing');
+});
+
+test('asking is free, and never moves the budget', () => {
+  const userId = 'notify-ask-only-user';
+  for (let i = 0; i < MAX_NOTIFICATIONS_PER_USER_PER_HOUR * 10; i++) {
+    assert.strictEqual(canNotify(userId), true, 'asking is not claiming');
+  }
 });
 
 const poll = (showResults, status = 'active', coCreators = []) =>

@@ -179,6 +179,93 @@ test('the DM redirect points at the picker it means', () => {
   assert.doesNotMatch(notice, TEMPLATE_HOLE, `the redirect leaked a template hole: ${notice}`);
 });
 
+// ==================== what the creator is told afterwards ====================
+//
+// This copy used to live in slack-poll-bot.js, which cannot be required without
+// opening a Postgres pool, so none of it could be tested - and two faults got
+// out that way: a sentence naming the wrong picker, and a confirmation that
+// announced one person's failed DM to a whole channel.
+
+const confirmText = args => views.buildPostConfirmation(args).blocks[0].text.text;
+const FAIL = [{ label: '<@UKWAME>', reason: 'missing_scope' }];
+
+test('the confirmation carries the reason itself, not a pointer to the DM', () => {
+  // The DM is the durable copy, and it is undeliverable in exactly the case
+  // this exists to report - a DM that will not send. So "details are in your
+  // DM" would be a promise broken by the fault it is describing.
+  const said = confirmText({ poll: poll(), posted: [{ label: '<#C1>' }], failures: FAIL });
+  assert.match(said, /missing_scope/, 'the always-deliverable channel has to carry the reason');
+  assert.match(said, /im:write/, 'and the remedy that fits it');
+});
+
+test('a clean post says nothing about failures', () => {
+  const said = confirmText({ poll: poll(), posted: [{ label: '<#C1>' }] });
+  assert.ok(!said.includes('⚠️'), 'nothing went wrong, so nothing is warned about');
+});
+
+test('the durable record says it is a copy, so the repeat reads as a record', () => {
+  // The same reason deliberately appears in two channels that fail
+  // differently. Saying so is what keeps it from reading as a stutter.
+  const record = views.failureRecord(poll(), FAIL);
+  assert.match(record, /missing_scope/);
+  assert.match(record, /Keeping this where you can find it/i);
+});
+
+test('the Send it on button appears only with the redirect that needs it', () => {
+  const withBtn = views.buildPostConfirmation({ poll: poll(), posted: [{ label: 'our DM' }], explainRedirect: true });
+  const without = views.buildPostConfirmation({ poll: poll(), posted: [{ label: '<#C1>' }] });
+  assert.ok(withBtn.blocks.some(b => b.type === 'actions'), 'the redirect is the only case that offers it');
+  assert.ok(!without.blocks.some(b => b.type === 'actions'));
+});
+
+test('every after-the-fact message survives a poll with no title of its own', () => {
+  // A single-question poll is named after its question, and a row written by an
+  // older version may carry no title at all. "undefined has been posted" is the
+  // shape that reaches a screenshot rather than a test.
+  const untitled = poll({ title: '' });
+  const conf = views.buildPostConfirmation({ poll: untitled, posted: [{ label: '<#C1>' }], failures: FAIL });
+  for (const [what, said] of [
+    ['confirmation text', conf.text],
+    ['confirmation body', conf.blocks[0].text.text],
+    ['failure record', views.failureRecord(untitled, FAIL)],
+    ['nowhere record', views.nowhereRecord(untitled, FAIL)]
+  ]) {
+    assert.doesNotMatch(said, TEMPLATE_HOLE, `${what} leaked a template hole: ${said}`);
+    assert.match(said, /Lunch\?/, `${what} should fall back to the question`);
+  }
+});
+
+test('the confirmation is a valid set of blocks whatever it reports', () => {
+  for (const [name, args] of [
+    ['clean',    { poll: poll(), posted: [{ label: '<#C1>' }] }],
+    ['failed',   { poll: poll(), posted: [{ label: '<#C1>' }], failures: FAIL }],
+    ['redirect', { poll: poll(), posted: [{ label: 'our DM' }], explainRedirect: true }],
+    ['many',     { poll: poll(), posted: [{ label: '<#C1>' }, { label: '<@U2>' }] }]
+  ]) {
+    auditBlocks(views.buildPostConfirmation(args).blocks, `confirmation/${name}`);
+  }
+});
+
+test('a picker that is not on the screen does not clear what was picked', () => {
+  // readComposeState spreads readDestinations over the metadata, so a picker
+  // returning an empty list where it has no block would wipe picks made on a
+  // screen the reader has already left - and the symptom is the reported one, a
+  // poll that quietly goes nowhere near the people chosen for it.
+  const carried = { channelId: 'C0123456789', userId: 'UME', savedQuestions: [], destUsers: ['UKWAME'], destChannels: ['C9'] };
+  const { meta } = views.readComposeState({ private_metadata: JSON.stringify(carried), state: { values: {} } });
+  assert.deepStrictEqual(meta.destUsers, ['UKWAME'], 'an absent picker is not an empty one');
+  assert.deepStrictEqual(meta.destChannels, ['C9']);
+});
+
+test('a picker that is on the screen and empty does clear', () => {
+  // The other half of the same rule: clearing a picker has to stick, or the
+  // reader cannot undo a pick.
+  const carried = { channelId: 'C0123456789', userId: 'UME', savedQuestions: [], destUsers: ['UKWAME'] };
+  const values = { poll_dest_users: { value: { type: 'multi_users_select', selected_users: [] } } };
+  const { meta } = views.readComposeState({ private_metadata: JSON.stringify(carried), state: { values } });
+  assert.deepStrictEqual(meta.destUsers, [], 'an empty picker is an answer');
+});
+
 test('a DM is not a channel the app can post to, so it is left unprefilled', () => {
   // resolveDestinations falls back for these; offering an impossible channel
   // would be worse than offering none.
