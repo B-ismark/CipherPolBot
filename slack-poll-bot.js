@@ -224,8 +224,8 @@ const {
   pollCreationLimitMessage,
   checkPollCreationRateLimit,
   checkShareRateLimit,
-  canNotify,
-  spendNotification,
+  claimNotification,
+  releaseNotification,
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
@@ -234,10 +234,10 @@ const {
   readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
   buildOptionsModal, buildEditModal, buildPreviewModal, METADATA_FULL, readCurrentQuestion,
   readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
-  buildQuestion, buildVoteModal, isInlineVotable, pollAdminHint, buildPollBlocks,
+  buildQuestion, buildVoteModal, isInlineVotable, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
   buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv,
-  dmRedirectNotice
+  buildPostConfirmation, failureRecord, nowhereRecord
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
 const { installationKey, installationKeyFromOAuth } = require('./lib/install');
@@ -249,24 +249,27 @@ const {
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
   if (!notifyUsers.length) return;
+  const title = pollDisplayTitle(poll);
   await Promise.allSettled(notifyUsers.map(async uid => {
+    // Claimed before the send and handed back if it fails - the same rule the
+    // picker path follows, and this is the caller likelier to need it: it fires
+    // hours later, when an account may be gone. Spending the slot regardless
+    // meant a DM that never arrived still cost the recipient one.
+    if (!claimNotification(uid)) return; // this person has had their fill this hour
     try {
-      // Checked here, charged after the message lands - the same split the
-      // picker path uses. Spending the slot up front meant a DM that failed to
-      // send still cost the recipient one, and this is the caller most likely
-      // to fail: it fires hours later, when an account may be gone.
-      if (!canNotify(uid)) return; // this person has had their fill this hour
       const dm = await client.conversations.open({ users: uid });
       await client.chat.postMessage({
         channel: dm.channel.id,
-        text: `🔒 Poll closed: *${poll.title}*`,
+        text: `🔒 Poll closed: *${title}*`,
         blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: `🔒 The poll *${poll.title}* has been closed.` } },
+          { type: 'section', text: { type: 'mrkdwn', text: `🔒 The poll *${title}* has been closed.` } },
           { type: 'context', elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`` }] }
         ]
       });
-      spendNotification(uid);
-    } catch (e) { console.error('notify error:', e.message); }
+    } catch (e) {
+      releaseNotification(uid);
+      console.error(`notify error for ${uid}:`, e.data?.error || e.message);
+    }
   }));
 }
 
@@ -380,7 +383,7 @@ async function updatePollMessage(client, poll) {
   const refs = pollMessageRefs(poll);
   const blocks = buildPollBlocks(poll);
   await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
-    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${poll.title}`, blocks })
+    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollDisplayTitle(poll)}`, blocks })
   ));
 }
 
@@ -1108,35 +1111,14 @@ async function postComposedPoll(client, meta, body, view, context) {
     if (nowhere) {
       // A DM, not an ephemeral: this needs acting on later, and an ephemeral is
       // gone on the next reload.
-      return await dmUser(client, meta.userId, [
-        `❌ *${poll.title}* could not be posted anywhere.`,
-        `⚠️ ${describeFailures(failures)}`,
-        `Nothing you typed is lost - the poll is saved. Fix the reason above, then run \`/polls-list\` and press *📤 Send*.`
-      ].join('\n\n'));
+      logFailures(`poll ${poll.id}`, failures);
+      return await dmUser(client, meta.userId, nowhereRecord(poll, failures));
     }
-
-    const lines = [`✅ *${poll.title}* was posted to ${posted.map(p => p.label).join(', ')}.`];
 
     // Only the fallback can land the poll somewhere the creator did not choose,
     // and only when the command came from a DM between two people.
     const explainRedirect = usedFallback && redirected;
-    if (explainRedirect) {
-      // The copy lives in lib/views.js with the picker it names, so a test can
-      // read it. See dmRedirectNotice.
-      lines.push(dmRedirectNotice());
-    }
-    if (failures.length) lines.push(`⚠️ ${describeFailures(failures)}`);
-    if (posted.length > 1) lines.push('Votes cast in any of them count toward this one poll.');
-
-    const blocks = [
-      { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n\n') } },
-      ...(explainRedirect ? [{
-        type: 'actions',
-        elements: [{ type: 'button', text: { type: 'plain_text', text: '📤  Send it on', emoji: true }, style: 'primary', action_id: 'share_poll', value: poll.id }]
-      }] : []),
-      { type: 'context', elements: [{ type: 'mrkdwn', text: pollAdminHint(poll) }] }
-    ];
-    const text = `✅ ${poll.title} has been posted!`;
+    const { text, blocks } = buildPostConfirmation({ poll, posted, failures, explainRedirect });
 
     // Confirm where the command was run - somewhere the creator can certainly
     // read. A DM between two people is not, so that becomes our own DM.
@@ -1146,32 +1128,20 @@ async function postComposedPoll(client, meta, body, view, context) {
       // reload, and opening the share modal here instead would race Slack's
       // 3-second trigger_id, which the poll we just posted has already spent.
       // Only reachable when the command was run in a DM between two people, so
-      // this is never a message in front of an audience.
+      // this is never a message in front of an audience - which is what
+      // widening this branch to cover any failure accidentally made it.
       await client.chat.postMessage({ channel: confirmChannel, text, blocks });
     } else {
       await client.chat.postEphemeral({ channel: confirmChannel, user: meta.userId, text, blocks });
     }
 
-    // A refusal is also DM'd, on top of the confirmation above.
-    //
-    // Every reason a destination refuses needs acting on - invite the bot,
-    // reinstall for a scope, wait out a cap - and an ephemeral is gone on the
-    // next reload, which is how "it just doesn't DM them" survives: the poll
-    // posts to the channel, the line explaining that the DM did not says so
-    // once, and then there is no trace of it.
-    //
-    // Not by widening the branch above, which was the first attempt: that
-    // turned the confirmation into a real message in whatever channel the
-    // command was run in, so a failed DM to one person became an announcement
-    // to everyone there, naming them. A refusal belongs to the person who
-    // caused it, in private, and it has to still be there tomorrow.
+    // The confirmation above already carries the reason, because it is the only
+    // channel that always arrives. These two are what make it outlive a reload:
+    // the DM for the reader, the log for when neither was read - and the log is
+    // the only one left when DMs are the thing that is broken.
     if (failures.length) {
       logFailures(`poll ${poll.id}`, failures);
-      await dmUser(client, meta.userId, [
-        `⚠️ *${pollDisplayTitle(poll)}* posted, but not everywhere.`,
-        describeFailures(failures),
-        `Everything that did post is live and counts toward the same poll.`
-      ].join('\n\n'));
+      await dmUser(client, meta.userId, failureRecord(poll, failures));
     }
   } catch (err) {
     console.error('postComposedPoll error:', err);
@@ -1254,7 +1224,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
 
     if (!fresh.length && !failures.length) {
       return await dmUser(client, actor, targets.length
-        ? `⚠️ *${poll.title}* is already posted in ${targets.map(t => t.label).join(', ')}.`
+        ? `⚠️ *${pollDisplayTitle(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
         : '⚠️ Pick at least one channel or person to send the poll to.');
     }
 
@@ -1265,9 +1235,14 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     }
 
     const parts = [];
-    if (posted.length) parts.push(`✅ *${poll.title}* sent to ${posted.map(p => p.label).join(', ')}.`);
+    if (posted.length) parts.push(`✅ *${pollDisplayTitle(poll)}* sent to ${posted.map(p => p.label).join(', ')}.`);
     const allFailures = [...failures, ...postFailures];
-    if (allFailures.length) parts.push(`⚠️ ${describeFailures(allFailures)}`);
+    if (allFailures.length) {
+      // Same durable record as the create path: a share can refuse for every
+      // reason a create can, and the message can be missed just as easily.
+      logFailures(`share ${pollId}`, allFailures);
+      parts.push(`⚠️ ${describeFailures(allFailures)}`);
+    }
     await dmUser(client, actor, parts.join('\n\n'));
   } catch (err) {
     console.error('share_poll_submit error:', err);

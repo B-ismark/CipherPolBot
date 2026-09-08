@@ -435,6 +435,13 @@ rules in there now — no emoji in a modal's chrome, no trim that cuts an emoji
 in half — were added after a real screen shipped broken, and both immediately
 turned up the same fault on screens nobody was looking at.
 
+**A refusal is reported in three places on purpose.** The confirmation always
+arrives but is gone on the next reload; the DM is durable but undeliverable in
+exactly the case worth reporting, a DM that will not send; the log is durable
+but invisible. So the confirmation carries the whole reason rather than pointing
+at the DM, and the repeat is framed as a record. Redundancy across channels that
+fail differently is not the same fault as saying a thing twice in one place.
+
 **Copy and delivery that only exist in `slack-poll-bot.js` cannot be tested at
 all.** Requiring that file opens a Postgres pool and binds a port, so anything
 kept there ships unread by the suite. Two faults came out of exactly that: a
@@ -494,4 +501,4 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 | Bot exits at boot with a DB error | Check `DATABASE_URL`; the bot retries five times, then exits so the host restarts it |
 | `self signed certificate` on connect | The database is not presenting a trusted certificate. Use managed Postgres, or `sslmode=no-verify` for local dev only |
 | Can't create polls in DMs | Add `im:write` and `im:history` scopes, then reinstall the app |
-| Picked people get no DM | The bot DMs the creator with Slack's own error per person, and logs the same line. `missing_scope` means the app predates `im:write` and must be reinstalled; `user_disabled` or `cannot_dm_bot` means the pick was not a reachable person; a capped recipient clears within the hour |
+| Picked people get no DM | The confirmation names Slack's own error per person, a DM repeats it so it outlives a reload, and the same line goes to the log — which is the one that survives when DMs are themselves the problem. `missing_scope` means the app predates `im:write` and must be reinstalled; `user_disabled` or `cannot_dm_bot` means the pick was not a reachable person; a capped recipient clears within the hour |
