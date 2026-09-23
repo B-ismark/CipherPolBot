@@ -4,9 +4,9 @@ services:
     runtime: node
     buildCommand: npm install
     startCommand: npm start
-    # Render restarts an instance that fails this. /health tolerates a short
-    # database blip before failing, so a cold start does not cost a restart -
-    # see lib/health.js and README (Staying awake).
+    # Render restarts an instance that fails this. /health does not touch the
+    # database - probing it every few seconds kept Neon from ever suspending,
+    # which spent its free compute - see README (The free-tier budget).
     healthCheckPath: /health
     envVars:
       - key: SLACK_BOT_TOKEN
@@ -23,6 +23,9 @@ services:
       - key: SLACK_CLIENT_ID
         sync: false
       - key: SLACK_CLIENT_SECRET
+        sync: false
+      # Signs the OAuth state; installs are refused without it
+      - key: SLACK_STATE_SECRET
         sync: false
       - key: NODE_ENV
         value: production

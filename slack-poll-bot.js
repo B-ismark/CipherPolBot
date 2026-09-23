@@ -2,7 +2,7 @@ require('dotenv').config();
 const { App, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const { sslOptionFor } = require('./lib/db');
-const { healthStatus } = require('./lib/health');
+const { healthStatus, DB_UNHEALTHY_GRACE_MS } = require('./lib/health');
 const { Pool } = require('pg');
 
 // ==================== DATABASE ====================
@@ -117,8 +117,21 @@ async function getPoll(id) {
   return rows.length ? rowToPoll(rows[0]) : null;
 }
 
-async function getAllPolls(status = 'active') {
-  const { rows } = await pool.query("SELECT * FROM polls WHERE status=$1 ORDER BY created_at DESC", [status]);
+// The rows a poll list could show this person: theirs, ones they co-run, and
+// ones posted where they asked. Narrowed here rather than after loading every
+// poll ever made, votes and all, on each list command. The columns are JSON
+// kept as TEXT, hence the casts; channel_id also covers polls from before
+// message_refs existed. listablePolls applies the exact rule to what comes back.
+async function getListablePolls(status, userId, channelId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM polls WHERE status=$1 AND (
+       creator=$2
+       OR co_creators::jsonb ? $2
+       OR channel_id=$3
+       OR message_refs::jsonb @> jsonb_build_array(jsonb_build_object('channelId', $3::text))
+     ) ORDER BY created_at DESC`,
+    [status, userId, channelId || '']
+  );
   return rows.map(rowToPoll);
 }
 
@@ -129,8 +142,16 @@ async function updatePollVotes(pollId, votes, voteTimestamps) {
   );
 }
 
+// The poll as it closed, or null when this call did not close it. Only one of
+// two presses of Close, or of a press racing the auto-close sweeper, gets the
+// row - they used to post the final results twice. And the row is the one the
+// UPDATE wrote, so a vote that committed after the caller read the poll is in
+// the results it announces.
 async function closePoll(pollId) {
-  await pool.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
+  const { rows } = await pool.query(
+    "UPDATE polls SET status='closed' WHERE id=$1 AND status='active' RETURNING *", [pollId]
+  );
+  return rows.length ? rowToPoll(rows[0]) : null;
 }
 
 // The port is bound before the schema is created (Render kills a service that
@@ -185,13 +206,72 @@ async function clientForPoll(poll) {
   return client;
 }
 
+// When the next poll is due to close, in ms, or null for none. The sweeper used
+// to ask the database every minute instead, and that query alone kept Neon's
+// compute from ever suspending - it sleeps after 5 idle minutes - which spent
+// the free plan's monthly compute allowance by the third week. So the answer
+// is held here: read on boot and after every sweep, lowered when a poll is
+// created with an earlier close time. Between those, a tick compares two
+// numbers and the database is left alone. It starts as "now" because unknown
+// has to mean "look", not "nothing due".
+//
+// In memory is enough for one instance, which is what this runs as. The
+// periodic re-read is the backstop for any write this process did not make.
+// A deploy is the one known case: Render runs the old instance beside the new
+// one for a short while, and a poll created on the old one in that window is
+// invisible to the new one's boot read - so the first re-read comes a few
+// minutes after boot rather than hours.
+let nextCloseAt = Date.now();
+let nextRereadAt = 0;
+let firstRead = true;
+const NEXT_CLOSE_REREAD_MS = 6 * 60 * 60 * 1000;
+const BOOT_REREAD_MS = 5 * 60 * 1000;
+
+// A poll noted while the read below is in flight may have committed after the
+// read's snapshot, and overwriting with the result would forget it.
+let readInFlight = false;
+let notedDuringRead = null;
+
+function noteCloseAt(closeAt) {
+  const t = closeAt ? new Date(closeAt).getTime() : NaN;
+  if (!Number.isFinite(t)) return;
+  if (nextCloseAt === null || t < nextCloseAt) nextCloseAt = t;
+  if (readInFlight && (notedDuringRead === null || t < notedDuringRead)) notedDuringRead = t;
+}
+
+async function refreshNextCloseAt() {
+  readInFlight = true;
+  notedDuringRead = null;
+  try {
+    const { rows } = await pool.query(
+      "SELECT MIN(close_at) AS next FROM polls WHERE status='active' AND close_at IS NOT NULL"
+    );
+    const read = rows[0]?.next ? new Date(rows[0].next).getTime() : null;
+    const known = [read, notedDuringRead].filter(t => t !== null);
+    nextCloseAt = known.length ? Math.min(...known) : null;
+    nextRereadAt = Date.now() + (firstRead ? BOOT_REREAD_MS : NEXT_CLOSE_REREAD_MS);
+    firstRead = false;
+  } catch (err) {
+    nextCloseAt = Date.now();
+    console.warn('could not read the next close time:', err.message);
+  } finally {
+    readInFlight = false;
+  }
+}
+
+function sweepIsDue(now = Date.now()) {
+  return now >= nextRereadAt || (nextCloseAt !== null && now >= nextCloseAt);
+}
+
 // close_at used to be honoured only when someone tried to vote after it passed,
 // so a quiet poll stayed "Active" for ever. The UPDATE is atomic, so a vote
 // holding the row lock cannot be closed twice.
 async function sweepOverduePolls() {
+  if (!sweepIsDue()) return 0;
   const { rows } = await pool.query(
     "UPDATE polls SET status='closed' WHERE status='active' AND close_at IS NOT NULL AND close_at <= NOW() RETURNING *"
   );
+  await refreshNextCloseAt();
   if (!rows.length) return 0;
   console.log(`⏰ Auto-closed ${rows.length} overdue poll(s)`);
   for (const row of rows) {
@@ -202,8 +282,7 @@ async function sweepOverduePolls() {
         console.warn(`auto-closed ${poll.id} in the database only: no bot token for team ${poll.teamId || 'unknown'}`);
         continue;
       }
-      await updatePollMessage(client, poll);
-      await sendCloseNotifications(client, poll);
+      await announceClose(client, poll);
     } catch (err) {
       console.warn(`auto-close follow-up failed for ${poll.id}:`, err.message);
     }
@@ -229,18 +308,21 @@ const {
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { getAllVoters, pollMessageRefs, pollDisplayTitle } = require('./lib/poll');
+const { getAllVoters, answeredQuestions, votingState, previousAnswers, pollMessageRefs, pollDisplayTitle } = require('./lib/poll');
 const {
   readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
   buildOptionsModal, buildEditModal, buildPreviewModal, METADATA_FULL, readCurrentQuestion,
   readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
-  buildQuestion, buildVoteModal, isInlineVotable, buildPollBlocks,
+  buildQuestion, buildVoteModal, ballotFits, BALLOT_FULL, isInlineVotable, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
   buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv,
   buildPostConfirmation, failureRecord, nowhereRecord
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
-const { installationKey, installationKeyFromOAuth } = require('./lib/install');
+const {
+  installationKey, installationKeyFromOAuth,
+  createInstallState, verifyInstallState, installUrl, stateCookie, clearedStateCookie, readCookie
+} = require('./lib/install');
 const {
   resolveChannelInfo, resolveDestinations, postPollTo,
   reachesCreator, describeFailures, logFailures, toMessageRefs
@@ -406,6 +488,9 @@ async function createAndPostPoll(client, meta, teamId = null) {
   const title = (pollTitle || savedQuestions[0]?.text || '').trim();
   const description = (pollDescription || '').trim();
   validatePollInputs(title, description, savedQuestions);
+  // The screens above refuse this before it gets here; this is the floor for
+  // any path that does not go through them.
+  if (!ballotFits({ questions: savedQuestions, title, description })) throw new Error(BALLOT_FULL);
 
   const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
   const votes = {};
@@ -440,6 +525,7 @@ async function createAndPostPoll(client, meta, teamId = null) {
   };
 
   await savePoll(poll);
+  noteCloseAt(poll.closeAt);
 
   const { targets, failures, redirected, usedFallback } = await resolveDestinations(
     client, { channelIds: destChannels, userIds: destUsers }, channelId, userId
@@ -537,6 +623,23 @@ function readWakeUpValue(value) {
 
 function isExpiredTrigger(err) {
   return `${err.data?.error || err.message}`.includes('expired_trigger_id');
+}
+
+// The same nap, worded for a button - "run the command again" is wrong advice
+// to someone who pressed one.
+const WAKE_UP_BUTTON_MESSAGE = '⏳ The bot was waking up and missed the 3-second window Slack allows. Press the button again - it will open straight away.';
+
+// For a button whose work failed. In reply to the press, where it was made - a
+// DM is the fallback, not the first choice. A button inside a modal has no
+// response_url to reply through, so there it is the DM.
+async function reportButtonFailure({ respond, client, userId, err, doing }) {
+  const text = isExpiredTrigger(err) ? WAKE_UP_BUTTON_MESSAGE : `❌ Could not ${doing}: ${err.message}`;
+  if (respond) {
+    try {
+      return await respond({ response_type: 'ephemeral', replace_original: false, text });
+    } catch (e) { /* fall through to the DM */ }
+  }
+  await dmUser(client, userId, text);
 }
 
 async function handleNewPoll({ ack, body, client, respond }) {
@@ -664,13 +767,24 @@ app.command('/poll-share', async ({ ack, body, client }) => {
 });
 
 
+// Anyone can run a poll list, anywhere, and every row carries a Results button
+// - which on the default setting shows each answer with a name on it. So a
+// list holds the polls this person runs and the ones posted where they ran it.
+// It used to hold every poll in the database, which made a poll sent to one
+// private channel, or to three people by DM, readable by the whole workspace.
+function listablePolls(polls, userId, channelId) {
+  return polls.filter(p =>
+    isCreatorOrCoCreator(p, userId) || pollMessageRefs(p).some(r => r.channelId === channelId)
+  );
+}
+
 app.command('/polls-list', async ({ ack, body, client }) => {
   await ack();
   try {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
-    const polls = await getAllPolls('active');
-    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls right now. Use `/polls-archive` to see closed polls.' });
+    const polls = listablePolls(await getListablePolls('active', userId, body.channel_id), userId, body.channel_id);
+    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No active polls of yours, and none posted here. Use `/polls-archive` to see closed ones.' });
     await client.chat.postEphemeral({
       channel, user: userId,
       text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`,
@@ -687,8 +801,8 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
   try {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
-    const polls = await getAllPolls('closed');
-    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls yet.' });
+    const polls = listablePolls(await getListablePolls('closed', userId, body.channel_id), userId, body.channel_id);
+    if (!polls.length) return client.chat.postEphemeral({ channel, user: userId, text: '📭 No closed polls of yours, and none posted here.' });
     await client.chat.postEphemeral({
       channel, user: userId,
       text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`,
@@ -714,9 +828,7 @@ app.action('list_poll_results', async ({ ack, body, client, action, respond }) =
     await client.views.open({ trigger_id: body.trigger_id, view: buildResultsModal(poll, userId) });
   } catch (err) {
     console.error('list_poll_results error:', err);
-    await dmUser(client, userId, isExpiredTrigger(err)
-      ? WAKE_UP_MESSAGE
-      : `❌ Could not open those results: ${err.message}`);
+    await reportButtonFailure({ respond, client, userId, err, doing: 'open those results' });
   }
 });
 
@@ -743,20 +855,52 @@ app.action('list_poll_export', async ({ ack, body, client, action, respond }) =>
 
 
 
-// Closing is the same three steps wherever it was triggered from: every copy of
-// the poll message has to stop offering a vote, the final results have to be
-// posted, and everyone who asked to be told has to be told.
-async function finalizePollClose(client, poll, channel) {
-  await closePoll(poll.id);
-  const closed = { ...poll, status: 'closed' };
+// Closing is the same three steps however the poll closed: every copy of the
+// message stops offering a vote, the final results are posted, and everyone
+// who asked to be told is told. The Close button did all three; the auto-close
+// time and a vote arriving after it did only the first and last, so a poll
+// that closed by itself ended without its channel hearing about it.
+//
+// Returns the reason the results could not be posted, if they could not. The
+// poll is closed either way, so that is a thing to report, not to throw.
+async function announceClose(client, closed, channel = closed.channelId) {
   await updatePollMessage(client, closed);
-  await client.chat.postMessage({
-    channel,
-    text: `🔒 Poll closed: ${poll.title}`,
-    blocks: buildResultsBlocks(closed, '🔒 Final Results')
-  });
+  let resultsError = null;
+  if (channel) {
+    try {
+      await client.chat.postMessage({
+        channel,
+        text: `🔒 Poll closed: ${pollDisplayTitle(closed)}`,
+        blocks: buildResultsBlocks(closed, '🔒 Final Results')
+      });
+    } catch (err) {
+      resultsError = err.data?.error || err.message;
+      console.warn(`final results for ${closed.id} not posted in ${channel}:`, resultsError);
+    }
+  }
   await sendCloseNotifications(client, closed);
-  return closed;
+  return resultsError;
+}
+
+// Null when someone else got there first - another press, a co-creator, or
+// the close time - in which case they have already announced it, and the
+// caller says so rather than appearing to do nothing.
+async function finalizePollClose(client, poll, channel) {
+  const closed = await closePoll(poll.id);
+  if (!closed) return null;
+  const resultsError = await announceClose(client, closed, channel);
+  return { closed, resultsError };
+}
+
+// What to tell whoever pressed Close, for each way finalizePollClose can end.
+function closeOutcomeText(poll, outcome, channel) {
+  if (!outcome) return `🔒 *${pollDisplayTitle(poll)}* was already closed - nothing more to do.`;
+  if (outcome.resultsError) {
+    // A DM id renders as a broken channel link, so only channels are named.
+    const where = /^[CG]/.test(channel || '') ? ` in <#${channel}>` : '';
+    return `🔒 *${pollDisplayTitle(poll)}* is closed, but I could not post its final results${where} (\`${outcome.resultsError}\`). \`/poll-results ${poll.id}\` shows them.`;
+  }
+  return null;
 }
 
 app.command('/poll-close', async ({ ack, body, client }) => {
@@ -780,7 +924,8 @@ app.command('/poll-close', async ({ ack, body, client }) => {
       });
     }
 
-    await finalizePollClose(client, poll, channel);
+    const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channel), channel);
+    if (said) await client.chat.postEphemeral({ channel, user: userId, text: said });
   } catch (err) {
     console.error('/poll-close error:', err);
     await dmUser(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
@@ -937,6 +1082,12 @@ app.action('add_another_question', async ({ ack, body, client }) => {
       view: buildComposeModal(meta, question.type, restoreQuestion(question), METADATA_FULL)
     });
   }
+  if (!ballotFits({ questions: updatedMeta.savedQuestions, title: meta.pollTitle, description: meta.pollDescription })) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), BALLOT_FULL)
+    });
+  }
 
   await client.views.update({ view_id: body.view.id, view: buildComposeModal(updatedMeta) });
 });
@@ -959,9 +1110,7 @@ app.action('compose_options', async ({ ack, body, client }) => {
     });
   } catch (err) {
     console.error('compose_options push error:', err);
-    await dmUser(client, body.user.id, isExpiredTrigger(err)
-      ? WAKE_UP_MESSAGE
-      : `❌ Could not open the poll options: ${err.message}`);
+    await reportButtonFailure({ client, userId: body.user.id, err, doing: 'open the poll options' });
   }
 });
 
@@ -993,14 +1142,18 @@ app.action('compose_preview', async ({ ack, body, client }) => {
       view: buildComposeModal(meta, question.type, restoreQuestion(question), `${METADATA_FULL} Posting still works — it is only the preview that cannot carry this much.`)
     });
   }
+  if (!ballotFits({ questions: staged, title: meta.pollTitle, description: meta.pollDescription })) {
+    return client.views.update({
+      view_id: body.view.id,
+      view: buildComposeModal(meta, question.type, restoreQuestion(question), BALLOT_FULL)
+    });
+  }
 
   try {
     await client.views.push({ trigger_id: body.trigger_id, view: buildPreviewModal(carried) });
   } catch (err) {
     console.error('compose_preview push error:', err);
-    await dmUser(client, body.user.id, isExpiredTrigger(err)
-      ? WAKE_UP_MESSAGE
-      : `❌ Could not open the preview: ${err.message}`);
+    await reportButtonFailure({ client, userId: body.user.id, err, doing: 'open the preview' });
   }
 });
 
@@ -1030,6 +1183,11 @@ app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => 
   const savedQuestions = question.text
     ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)]
     : [...(meta.savedQuestions || [])];
+
+  // Still the ack, so still an inline error, on the field where cutting starts.
+  if (!ballotFits({ questions: savedQuestions, title: meta.pollTitle, description: meta.pollDescription })) {
+    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: BALLOT_FULL } });
+  }
 
   // Ack inside Slack's 3-second window BEFORE doing any work: posting a poll is
   // several database and API round trips, and on a cold host that overran the
@@ -1185,14 +1343,15 @@ app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
   }
 });
 
-app.action('share_poll', async ({ ack, body, client, action }) => {
+app.action('share_poll', async ({ ack, body, client, action, respond }) => {
   await ack();
   try {
     const poll = await getPoll(action.value);
-    if (!poll) return;
+    if (!poll) throw new Error('that poll no longer exists');
     await client.views.open({ trigger_id: body.trigger_id, view: buildShareModal(poll) });
   } catch (err) {
     console.error('share_poll error:', err);
+    await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the send screen' });
   }
 });
 
@@ -1250,10 +1409,21 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   }
 });
 
-app.action('open_vote_modal', async ({ ack, body, client, action }) => {
+app.action('open_vote_modal', async ({ ack, body, client, action, respond }) => {
   await ack();
+  // This used to have no error handling at all, so after a nap the Vote button
+  // simply did nothing - the one button every voter presses.
+  try {
+    await openVoteModal({ body, client, action });
+  } catch (err) {
+    console.error('open_vote_modal error:', err);
+    await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the ballot' });
+  }
+});
+
+async function openVoteModal({ body, client, action }) {
   const poll = await getPoll(action.value);
-  if (!poll) return;
+  if (!poll) throw new Error('that poll no longer exists');
 
   if (poll.status === 'closed') {
     return client.views.open({
@@ -1271,27 +1441,14 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
   }
 
   const userId = body.user.id;
-  const previousVotes = {};
-  poll.questions.forEach((q, qi) => {
-    const qv = poll.votes[qi] || {};
-    if (q.type === 'open_ended') {
-      if (qv[userId]) previousVotes[qi] = [qv[userId]];
-    } else if (q.type === 'ranking' || q.type === 'likert') {
-      if (qv[userId] || Object.values(qv).some(r => typeof r === 'object' && Object.values(r).some(v => v.includes && v.includes(userId)))) {
-        previousVotes[qi] = true;
-      }
-    } else {
-      Object.entries(qv).forEach(([oi, voters]) => {
-        if (voters.includes(userId)) {
-          if (!previousVotes[qi]) previousVotes[qi] = [];
-          previousVotes[qi].push(parseInt(oi));
-        }
-      });
-    }
-  });
 
-  const hasVoted = Object.keys(previousVotes).length > 0;
-  if (hasVoted && !poll.allowRevote) {
+  // With vote changes off, what is answered stays answered - but only the
+  // questions that are. Turning someone away for having answered anything was
+  // right while the modal answered every question at once; since the message's
+  // buttons answer one at a time, it locked people out of the rest of the poll,
+  // straight after the reply to their press told them to use this button.
+  const { locked, finished } = votingState(poll, userId);
+  if (finished) {
     return client.views.open({
       trigger_id: body.trigger_id,
       view: {
@@ -1308,9 +1465,25 @@ app.action('open_vote_modal', async ({ ack, body, client, action }) => {
 
   await client.views.open({
     trigger_id: body.trigger_id,
-    view: buildVoteModal(poll, hasVoted ? previousVotes : {})
+    view: poll.allowRevote
+      ? buildVoteModal(poll, previousAnswers(poll, userId))
+      : buildVoteModal(poll, {}, { locked })
   });
-});
+}
+
+// Slack allows 3 seconds for the ack. A vote is normally written well inside
+// that, and its result goes in the ack, as it always has. One that is not - a
+// database waking from sleep, a boot still running its migrations - is acked
+// at this mark with a holding screen instead, and the result replaces it once
+// the vote is written. Past 3 seconds the voter used to see "trouble
+// connecting" on a vote that had in fact been recorded.
+const VOTE_ACK_DEADLINE_MS = 2000;
+
+// Between that holding ack and the update that replaces it. They travel
+// separately - one as our HTTP response, one as an API call - and nothing
+// promises Slack applies them in the order they were sent. An update that
+// landed first would be overwritten by "Recording your vote…" for good.
+const VOTE_UPDATE_SPACING_MS = 1000;
 
 app.view('vote_submit', async ({ ack, body, view, client }) => {
   const { pollId } = JSON.parse(view.private_metadata);
@@ -1318,30 +1491,72 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
   const values = view.state.values;
   const wantsNotify = (values.vote_notify?.value?.selected_options || []).some(o => o.value === 'notify');
 
-  // Unlike poll creation, this handler still has to ack within Slack's 3
-  // seconds (its results view has to be part of the ack), so the wait is short.
-  // It costs nothing once the bot is up, and a vote cast during a boot is told
-  // to retry rather than hitting a half-migrated schema.
-  if (!await awaitSchema(2000)) {
-    return ack({
-      response_action: 'update',
-      view: buildNoticeModal('Starting Up', '⏳ The bot is still starting up and did not record your vote. Try again in a few seconds.')
-    });
+  // Two items both ranked #1 is not a ranking, and averaged in it quietly bends
+  // everyone else's result. Checked on what was submitted, so it needs no
+  // database and can still be an inline error on the fields concerned.
+  const rankErrors = {};
+  Object.keys(values).forEach(blockId => {
+    const m = /^vote_q(\d+)_r(\d+)$/.exec(blockId);
+    const rank = m && values[blockId].rank?.selected_option?.value;
+    if (!rank) return;
+    const clash = Object.keys(values).find(other => other !== blockId &&
+      other.startsWith(`vote_q${m[1]}_r`) && values[other].rank?.selected_option?.value === rank);
+    if (clash) rankErrors[blockId] = `#${rank} is already given to another item - use each rank once.`;
+  });
+  if (Object.keys(rankErrors).length) {
+    return ack({ response_action: 'errors', errors: rankErrors });
   }
 
-  const dbClient = await pool.connect();
-  let finalPoll = null;
+  const work = recordVote({ pollId, userId, values, wantsNotify });
+  let timer;
+  const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), VOTE_ACK_DEADLINE_MS); });
+  let outcome = await Promise.race([work, deadline]);
+  clearTimeout(timer);
+
+  if (outcome) {
+    await ack({ response_action: 'update', view: outcome.view });
+  } else {
+    await ack({ response_action: 'update', view: buildNoticeModal('Recording Vote', '⏳ Recording your vote…') });
+    const ackedAt = Date.now();
+    outcome = await work;
+    const gap = VOTE_UPDATE_SPACING_MS - (Date.now() - ackedAt);
+    if (gap > 0) await new Promise(resolve => setTimeout(resolve, gap));
+    try {
+      await client.views.update({ view_id: view.id, view: outcome.view });
+    } catch (err) {
+      console.warn('vote result view failed:', err.data?.error || err.message);
+    }
+  }
+  if (outcome.after) await outcome.after(client);
+});
+
+// Writes one modal submission. Never throws: every ending is a screen for the
+// voter, plus whatever has to happen once they have seen it.
+async function recordVote({ pollId, userId, values, wantsNotify }) {
+  const notice = (title, text) => ({ view: buildNoticeModal(title, text) });
+  const notSaved = () => notice('Vote Not Saved', '⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
+
+  // A vote cast while the bot is booting waits for the schema rather than
+  // being turned away - the deadline above covers the ack meanwhile.
+  if (!await awaitSchema(20000)) {
+    return notice('Starting Up', '⏳ The bot is still starting up and did not record your vote. Try again in a few seconds.');
+  }
+
+  let dbClient;
+  try {
+    dbClient = await pool.connect();
+  } catch (err) {
+    console.error('vote_submit connect error:', err.message);
+    return notSaved();
+  }
+
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
 
     if (!rows.length || rows[0].status === 'closed') {
       await dbClient.query('ROLLBACK');
-      await ack({
-        response_action: 'update',
-        view: buildNoticeModal('Poll Closed', '🔒 This poll is closed - your vote was *not* recorded.')
-      });
-      return;
+      return notice('Poll Closed', '🔒 This poll is closed - your vote was *not* recorded.');
     }
 
     const poll = rowToPoll(rows[0]);
@@ -1349,35 +1564,31 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
     if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
       await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
       await dbClient.query('COMMIT');
-      await ack({
-        response_action: 'update',
-        view: buildNoticeModal('Poll Closed', '⏰ This poll reached its close time - your vote was *not* recorded.')
-      });
-      await updatePollMessage(client, { ...poll, status: 'closed' });
-      await sendCloseNotifications(client, { ...poll, status: 'closed' });
-      return;
+      const closed = { ...poll, status: 'closed' };
+      return {
+        ...notice('Poll Closed', '⏰ This poll reached its close time - your vote was *not* recorded.'),
+        after: c => announceClose(c, closed)
+      };
     }
 
-    const hasVoted = poll.questions.some((q, qi) => {
-      const qv = poll.votes[qi] || {};
-      if (q.type === 'open_ended' || q.type === 'ranking') return !!qv[userId];
-      if (q.type === 'likert') return Object.values(qv).some(r => typeof r === 'object' && Object.values(r).some(v => Array.isArray(v) && v.includes(userId)));
-      return Object.values(qv).some(v => Array.isArray(v) && v.includes(userId));
-    });
-
-    if (hasVoted && !poll.allowRevote) {
+    // Per question, as on the Vote button: with changes off, an answered
+    // question keeps its answer and only the unanswered ones are taken.
+    const { answered, locked, finished } = votingState(poll, userId);
+    if (finished) {
       await dbClient.query('ROLLBACK');
-      await ack({
-        response_action: 'update',
-        view: buildNoticeModal('Already Voted', 'You have already voted in this poll, and the creator turned off vote changes.')
-      });
-      return;
+      return notice('Already Voted', 'You have already voted in this poll, and the creator turned off vote changes.');
     }
 
-    if (hasVoted) {
+    // A locked question can still arrive with an answer: the modal was opened
+    // before the person pressed a button on the message. The press stands, but
+    // saying nothing would leave them believing the form's answer counted.
+    const overruled = [...locked].filter(qi =>
+      Object.keys(values).some(id => id === `vote_q${qi}` || id.startsWith(`vote_q${qi}_`)));
+
+    if (poll.allowRevote && answered.size) {
       poll.questions.forEach((q, qi) => {
         if (q.type === 'open_ended' || q.type === 'ranking') {
-          delete poll.votes[qi][userId];
+          if (poll.votes[qi]) delete poll.votes[qi][userId];
         } else if (q.type === 'likert') {
           Object.values(poll.votes[qi] || {}).forEach(ratings => {
             Object.keys(ratings).forEach(ri => { ratings[ri] = (ratings[ri] || []).filter(id => id !== userId); });
@@ -1394,8 +1605,9 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
     voteTimestamps[userId] = new Date().toISOString();
 
     poll.questions.forEach((q, qi) => {
+      if (locked.has(qi)) return;
+      if (!poll.votes[qi]) poll.votes[qi] = {};
       if (q.type === 'likert') {
-        if (!poll.votes[qi]) poll.votes[qi] = {};
         q.options.forEach((_, si) => {
           const block = values[`vote_q${qi}_s${si}`];
           const rating = block?.rating?.selected_option?.value;
@@ -1445,31 +1657,37 @@ app.view('vote_submit', async ({ ack, body, view, client }) => {
     );
     await dbClient.query('COMMIT');
     poll.voteTimestamps = voteTimestamps;
-    finalPoll = poll;
+
+    const note = overruled.length
+      ? `${overruled.length === 1 ? 'Question' : 'Questions'} ${overruled.map(qi => qi + 1).join(', ')} ${overruled.length === 1 ? 'was' : 'were'} already answered from the poll message, and vote changes are off - so ${overruled.length === 1 ? 'that answer stands' : 'those answers stand'}, not the ones in this form.`
+      : null;
+    return {
+      view: buildPostVoteModal(poll, userId, { note }),
+      after: c => updatePollMessage(c, poll)
+    };
   } catch (err) {
-    await dbClient.query('ROLLBACK');
+    // Guarded: on a dropped connection the ROLLBACK throws too, and the screen
+    // returned here is the only thing that tells the voter their vote did not
+    // count.
+    try { await dbClient.query('ROLLBACK'); } catch (e) { /* transaction already gone */ }
     console.error('vote_submit transaction error:', err.message);
-    await ack({
-      response_action: 'update',
-      view: buildNoticeModal('Vote Not Saved', '⚠️ Something went wrong recording your vote. Nothing was saved - please try again.')
-    });
-    return;
+    return notSaved();
   } finally {
     dbClient.release();
   }
-
-  await ack({ response_action: 'update', view: buildPostVoteModal(finalPoll, userId) });
-  await updatePollMessage(client, finalPoll);
-});
+}
 
 // The ballot on the poll message itself. One press is one answer, which is why
 // only list questions carry buttons - see isInlineVotable. Multi-question polls
 // still work: every list question gets its own row, and anything that needs the
 // modal is called out in the reply.
-app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
+// Both the per-option buttons of the full layout and the per-question dropdown
+// of the condensed one - see fitQuestionBlocks - carry the same value, so one
+// handler serves both.
+app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond }) => {
   await ack();
   const userId = body.user.id;
-  const [pollId, qiRaw, oiRaw] = `${action.value}`.split('::');
+  const [pollId, qiRaw, oiRaw] = `${action.value ?? action.selected_option?.value}`.split('::');
   const qi = Number(qiRaw), oi = Number(oiRaw);
 
   // Everything this handler says is ephemeral. A shared message cannot address
@@ -1480,8 +1698,14 @@ app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
     catch (err) { console.warn('inline vote reply failed:', err.message); }
   };
 
-  const dbClient = await pool.connect();
-  let finalPoll = null, note = null;
+  let dbClient;
+  try {
+    dbClient = await pool.connect();
+  } catch (err) {
+    console.error('vote_option connect error:', err.message);
+    return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
+  }
+  let finalPoll = null, note = null, lapsed = null, seen = null;
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
@@ -1489,6 +1713,9 @@ app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
       await dbClient.query('ROLLBACK');
       return await tell('❌ This poll no longer exists.');
     }
+    // The row, not the poll: the poll's votes are changed in place below, and a
+    // write that then fails must not be shown as if it had counted.
+    seen = rows[0];
     const poll = rowToPoll(rows[0]);
 
     if (poll.status === 'closed') {
@@ -1498,9 +1725,9 @@ app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
     if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
       await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
       await dbClient.query('COMMIT');
-      await tell('⏰ This poll reached its close time - your vote was *not* recorded.');
-      await updatePollMessage(client, { ...poll, status: 'closed' });
-      await sendCloseNotifications(client, { ...poll, status: 'closed' });
+      // Announced as every other close is, final results included - once the
+      // connection is back in the pool, below.
+      lapsed = { ...poll, status: 'closed' };
       return;
     }
 
@@ -1558,27 +1785,38 @@ app.action(/^vote_option_/, async ({ ack, body, client, action, respond }) => {
     return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
   } finally {
     dbClient.release();
+    if (lapsed) {
+      await tell('⏰ This poll reached its close time - your vote was *not* recorded.');
+      await announceClose(client, lapsed);
+    } else if (!finalPoll && seen && action.type === 'static_select') {
+      // A refused pick still shows in the dropdown as if it counted. Posting
+      // the message again resets it to the placeholder.
+      await updatePollMessage(client, rowToPoll(seen));
+    }
   }
 
   // A press answers one question. If the poll has any that a button cannot
-  // express, say so rather than letting someone think they are done.
-  const needsModal = (finalPoll.questions || []).some(qq => !isInlineVotable(qq.type));
+  // express, and this person has not answered them yet, say so rather than
+  // letting them think they are done - or nagging someone who already is.
+  const done = answeredQuestions(finalPoll, userId);
+  const needsModal = (finalPoll.questions || []).some((qq, i) => !isInlineVotable(qq.type) && !done.has(i));
   await tell(`✅ ${note}${needsModal ? '  This poll also has questions that need the *🗳️ Vote* button.' : ''}`);
   await updatePollMessage(client, finalPoll);
 });
 
 
-app.action('view_results_modal', async ({ ack, body, client, action }) => {
+app.action('view_results_modal', async ({ ack, body, client, action, respond }) => {
   await ack();
   try {
     const poll = await getPoll(action.value);
-    if (!poll) return;
+    if (!poll) throw new Error('that poll no longer exists');
     await client.views.open({
       trigger_id: body.trigger_id,
       view: buildResultsModal(poll, body.user.id)
     });
   } catch (err) {
     console.error('view_results_modal error:', err);
+    await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the results' });
   }
 });
 
@@ -1612,12 +1850,11 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
         view: buildCloseConfirmModal(poll, channel, participants)
       });
     }
-    await finalizePollClose(client, poll, channel);
+    const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channel), channel);
+    if (said) await deny(said);
   } catch (err) {
     console.error('close_poll error:', err);
-    await dmUser(client, userId, isExpiredTrigger(err)
-      ? WAKE_UP_MESSAGE
-      : `❌ Could not close poll: ${err.message}`);
+    await reportButtonFailure({ respond, client, userId, err, doing: 'close the poll' });
   }
 });
 
@@ -1629,13 +1866,16 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
   const userId = body.user.id;
   try {
     const poll = await getPoll(pollId);
-    if (!poll || poll.status === 'closed') return;
+    if (!poll) return await dmUser(client, userId, '❌ That poll no longer exists.');
     // Checked again here, not only where the modal was opened: co-creators can
     // be removed, and this is the step that actually ends the poll.
     if (!isCreatorOrCoCreator(poll, userId)) {
       return await dmUser(client, userId, `❌ Only <@${poll.creator}> can close this poll.`);
     }
-    await finalizePollClose(client, poll, channelId);
+    // The close time, or a co-creator, can beat this confirmation to it, and
+    // pressing Close Poll with nothing coming back read as the button failing.
+    const said = closeOutcomeText(poll, poll.status === 'closed' ? null : await finalizePollClose(client, poll, channelId), channelId);
+    if (said) await dmUser(client, userId, said);
   } catch (err) {
     console.error('poll_close_confirm error:', err);
     await dmUser(client, userId, `❌ Failed to close poll: ${err.message}`);
@@ -1644,9 +1884,15 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
 
 // ==================== HEALTH CHECK ====================
 
-// / is liveness: the process is answering. /health is readiness: it also
-// reaches the database, so a monitor pointed at it catches an instance that is
-// up but useless, not just one that is asleep.
+// / is liveness: the process is answering. /health is readiness: the process is
+// up and its schema is in place. /health?db=1 also reaches the database.
+//
+// The database probe used to be on every /health hit. Render's own health check
+// calls that path every few seconds, and even cached for 15 seconds that was a
+// query often enough that Neon's compute never got to suspend - so the health
+// check alone ran the free compute allowance out. Nor did it buy anything: the
+// point of failing it was a restart, and restarting this process does not
+// bring back a database. So the probe is there to ask for, not on by default.
 receiver.router.get('/', (req, res) => res.send('Slack Poll Bot is running ✓'));
 
 const HEALTH_CACHE_MS = 15000;
@@ -1666,13 +1912,32 @@ async function checkDatabase() {
     // Logged, not returned: a pg error can name the database host and user,
     // and this endpoint is public.
     console.warn('health check: database unreachable:', err.message);
-    if (dbFailingSince === null) dbFailingSince = Date.now();
+    // The grace window is for a run of failures. With the probe now asked for
+    // rarely, the last failure can be an hour old and says nothing about the
+    // gap since - counting from it made one cold start look like an hour-long
+    // outage. So a run only continues across probes close enough to be one.
+    const previousAt = lastDbCheck.at;
+    if (dbFailingSince === null || Date.now() - previousAt > DB_UNHEALTHY_GRACE_MS) dbFailingSince = Date.now();
     lastDbCheck = { at: Date.now(), ok: false, latencyMs: null };
   }
   return lastDbCheck;
 }
 
+// Asked for by name, not by presence: `?db=0` meaning "yes, probe" would put
+// back exactly the constant querying this endpoint stopped doing.
+function wantsDatabaseProbe(query) {
+  return ['1', 'true', 'yes'].includes(String(query?.db ?? '').toLowerCase());
+}
+
 receiver.router.get('/health', async (req, res) => {
+  if (!wantsDatabaseProbe(req.query)) {
+    const { httpStatus, status } = healthStatus({ schemaReady, dbOk: true });
+    return res.status(httpStatus).json({
+      status,
+      uptime: Math.round(process.uptime()),
+      schema: schemaReady ? 'ready' : 'initialising'
+    });
+  }
   const db = await checkDatabase();
   const dbFailingForMs = dbFailingSince === null ? 0 : Date.now() - dbFailingSince;
   const { httpStatus, status } = healthStatus({ schemaReady, dbOk: db.ok, dbFailingForMs });
@@ -1686,10 +1951,46 @@ receiver.router.get('/health', async (req, res) => {
   });
 });
 
+// Anything from the query string or an error message goes into HTML, and
+// `?error=<script>…` is a link anyone can send - so it is escaped, always.
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+// Whether other workspaces can install the bot, and if not, why not. With a
+// static SLACK_BOT_TOKEN, authorize() never reads an installation, so an
+// install would be stored and ignored - there is nothing to offer. Without a
+// state secret there is no way to tell our installs from a forged one, so
+// that fails closed rather than open.
+function oauthUnavailable() {
+  if (process.env.SLACK_BOT_TOKEN) return { status: 404, text: 'Not found.' };
+  if (!process.env.SLACK_CLIENT_ID || !process.env.SLACK_CLIENT_SECRET || !process.env.SLACK_STATE_SECRET) {
+    return { status: 503, text: '❌ Installing is not configured: set SLACK_CLIENT_ID, SLACK_CLIENT_SECRET and SLACK_STATE_SECRET.' };
+  }
+  return null;
+}
+
+// Where an install starts - the link to share. It is what makes the state
+// check below possible: the nonce in the cookie and the one in the state must
+// both come from here.
+receiver.router.get('/slack/install', (req, res) => {
+  const off = oauthUnavailable();
+  if (off) return res.status(off.status).send(off.text);
+  const { nonce, state } = createInstallState(process.env.SLACK_STATE_SECRET);
+  res.setHeader('Set-Cookie', stateCookie(nonce));
+  res.redirect(installUrl(process.env.SLACK_CLIENT_ID, state));
+});
+
 receiver.router.get('/slack/oauth_redirect', async (req, res) => {
-  const { code, error } = req.query;
-  if (error) return res.status(400).send(`❌ OAuth error: ${error}`);
+  const off = oauthUnavailable();
+  if (off) return res.status(off.status).send(off.text);
+  const { code, error, state } = req.query;
+  if (error) return res.status(400).send(`❌ OAuth error: ${escapeHtml(error)}`);
   if (!code) return res.status(400).send('❌ Missing authorization code.');
+  if (!verifyInstallState(process.env.SLACK_STATE_SECRET, state, readCookie(req.headers?.cookie))) {
+    return res.status(400).send('<h2>❌ This install link has expired or did not start here.</h2><p>Start again from <a href="/slack/install">/slack/install</a>.</p>');
+  }
+  res.setHeader('Set-Cookie', clearedStateCookie());
   try {
     const result = await app.client.oauth.v2.access({
       client_id: process.env.SLACK_CLIENT_ID,
@@ -1707,8 +2008,12 @@ receiver.router.get('/slack/oauth_redirect', async (req, res) => {
     console.log(`✅ Installed for ${key}${result.is_enterprise_install ? ' (org-wide)' : ''}`);
     res.send('<h2>✅ CipherPol Bot installed!</h2><p>You can close this window and return to Slack.</p>');
   } catch (e) {
-    console.error('OAuth redirect error:', e.message);
-    res.status(500).send(`<h2>❌ Installation failed</h2><p>${e.message}</p>`);
+    console.error('OAuth redirect error:', e.data?.error || e.message);
+    // Slack's own error code is safe to show and says what to fix. Anything
+    // else may be a database error, which can name the host - logged only, as
+    // on /health.
+    const detail = e.data?.error ? ` (<code>${escapeHtml(e.data.error)}</code>)` : '';
+    res.status(500).send(`<h2>❌ Installation failed${detail}</h2><p>Start again from <a href="/slack/install">/slack/install</a>.</p>`);
   }
 });
 

@@ -25,7 +25,10 @@ const {
 } = require('./lib/validation');
 
 const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
-const { installationKey, installationKeyFromOAuth } = require('./lib/install');
+const {
+  installationKey, installationKeyFromOAuth, BOT_SCOPES, STATE_TTL_MS, STATE_COOKIE,
+  createInstallState, verifyInstallState, installUrl, stateCookie, readCookie
+} = require('./lib/install');
 const { sslOptionFor } = require('./lib/db');
 const { healthStatus, DB_UNHEALTHY_GRACE_MS } = require('./lib/health');
 
@@ -244,6 +247,44 @@ test('an oauth response maps to the same key, with team null for org-wide', () =
   assert.strictEqual(installationKeyFromOAuth({ team: { id: 'T1' } }), 'T1');
   assert.strictEqual(installationKeyFromOAuth({ is_enterprise_install: true, enterprise: { id: 'E1' }, team: null }), 'E1');
   assert.strictEqual(installationKeyFromOAuth({}), null);
+});
+
+// ==================== OAuth state ====================
+
+const SECRET = 'state-secret-for-tests';
+
+test('an install state from our own page verifies in the same browser', () => {
+  const { nonce, state } = createInstallState(SECRET);
+  assert.strictEqual(verifyInstallState(SECRET, state, nonce), true);
+});
+
+test('a forged, tampered, stale or cross-browser state is refused', () => {
+  const now = 1_800_000_000_000;
+  const { nonce, state } = createInstallState(SECRET, now);
+  assert.strictEqual(verifyInstallState('another-secret', state, nonce, now), false, 'wrong key');
+  assert.strictEqual(verifyInstallState(SECRET, state.replace(/.$/, c => (c === '0' ? '1' : '0')), nonce, now), false, 'altered MAC');
+  assert.strictEqual(verifyInstallState(SECRET, `${now}.${'a'.repeat(32)}.${state.split('.')[2]}`, 'a'.repeat(32), now), false, 'swapped nonce');
+  assert.strictEqual(verifyInstallState(SECRET, state, nonce, now + STATE_TTL_MS + 1), false, 'expired');
+  assert.strictEqual(verifyInstallState(SECRET, state, 'f'.repeat(32), now), false, 'cookie from another browser');
+  assert.strictEqual(verifyInstallState(SECRET, state, null, now), false, 'no cookie at all');
+  assert.strictEqual(verifyInstallState(SECRET, undefined, nonce, now), false, 'no state at all');
+  assert.strictEqual(verifyInstallState('', state, nonce, now), false, 'no secret configured');
+});
+
+test('the install link asks for the five scopes and carries the state', () => {
+  const url = new URL(installUrl('123.456', 'the-state'));
+  assert.strictEqual(url.origin + url.pathname, 'https://slack.com/oauth/v2/authorize');
+  assert.strictEqual(url.searchParams.get('state'), 'the-state');
+  assert.deepStrictEqual(url.searchParams.get('scope').split(','), BOT_SCOPES);
+  assert.strictEqual(BOT_SCOPES.length, 5);
+});
+
+test('the state cookie is private, https-only, and survives the redirect back', () => {
+  const c = stateCookie('abc');
+  for (const flag of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/slack']) assert.ok(c.includes(flag), flag);
+  assert.strictEqual(readCookie(`other=1; ${STATE_COOKIE}=abc; x=y`), 'abc');
+  assert.strictEqual(readCookie('other=1'), null);
+  assert.strictEqual(readCookie(undefined), null);
 });
 
 test('a remote database with no sslmode still gets verified TLS', () => {

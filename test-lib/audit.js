@@ -18,8 +18,13 @@ const assert = require('node:assert');
 // the user nothing and says nothing, so these are the difference between a
 // screen and a silent failure.
 
+// "You can include up to 50 blocks in each message, and 100 blocks in modals or
+// Home tabs." Only the second was here, and the poll message was capped at 100
+// on the strength of it - so a message between 51 and 100 blocks passed every
+// test and was refused by Slack.
 const LIMITS = {
   blocksPerView: 100,
+  blocksPerMessage: 50,
   viewTitle: 24,
   buttonText: 75,
   headerText: 150,
@@ -110,6 +115,14 @@ function auditView(view, label) {
   // does not say which one.
   const ids = view.blocks.filter(b => b.block_id).map(b => b.block_id);
   assert.strictEqual(new Set(ids).size, ids.length, `${label}: duplicate block_id among ${ids.join(', ')}`);
+}
+
+// For block lists that are sent as a message rather than shown in a view.
+function auditMessage(blocks, label) {
+  assert.ok(Array.isArray(blocks), `${label}: not a block list`);
+  assert.ok(blocks.length <= LIMITS.blocksPerMessage,
+    `${label}: ${blocks.length} blocks exceeds ${LIMITS.blocksPerMessage} for a message`);
+  auditBlocks(blocks, label);
 }
 
 function auditBlocks(blocks, label) {
@@ -259,5 +272,5 @@ const EXTREME = [
 
 module.exports = {
   LIMITS, EMOJI, HOSTILE, EXTREME, TEMPLATE_HOLE,
-  halfEmoji, textNodes, auditText, auditView, auditBlocks
+  halfEmoji, textNodes, auditText, auditView, auditBlocks, auditMessage
 };

@@ -23,7 +23,8 @@ const {
 } = views;
 const { MULTI_SELECT_FORM_TYPE } = require('./lib/compose');
 const { MAX_VIEW_METADATA, draftFitsInView, MAX_QUESTIONS_PER_POLL } = require('./lib/validation');
-const { LIMITS, EMOJI, TEMPLATE_HOLE, auditView, auditBlocks } = require('./test-lib/audit');
+const { LIMITS, EMOJI, TEMPLATE_HOLE, auditView, auditBlocks, auditMessage } = require('./test-lib/audit');
+const { answeredQuestions, previousAnswers } = require('./lib/poll');
 
 // The audit itself lives in test-lib/audit.js, shared with test-hostile.js. A
 // rule kept in one test file protects the screens that file happens to check; a
@@ -242,7 +243,7 @@ test('the confirmation is a valid set of blocks whatever it reports', () => {
     ['redirect', { poll: poll(), posted: [{ label: 'our DM' }], explainRedirect: true }],
     ['many',     { poll: poll(), posted: [{ label: '<#C1>' }, { label: '<@U2>' }] }]
   ]) {
-    auditBlocks(views.buildPostConfirmation(args).blocks, `confirmation/${name}`);
+    auditMessage(views.buildPostConfirmation(args).blocks, `confirmation/${name}`);
   }
 });
 
@@ -643,7 +644,7 @@ test('auto-option types get their answers without any being typed', () => {
 // ==================== the poll message ====================
 
 test('the posted poll is a valid message', () => {
-  auditBlocks(buildPollBlocks(poll()), 'poll-message');
+  auditMessage(buildPollBlocks(poll()), 'poll-message');
 });
 
 test('an active poll offers a vote, a send and a close', () => {
@@ -667,14 +668,81 @@ test('hiding the tally does not hide the ballot', () => {
   }
 });
 
+// ==================== message size ====================
+//
+// A message holds 50 blocks, not 100. Between the two a poll passed every test
+// here and was refused by Slack - and with a block per option that is eight
+// ordinary questions, not an edge case.
+
+const mc = (n, opts = 5) => Array.from({ length: n }, (_, i) =>
+  question(`Question ${i + 1}?`, Array.from({ length: opts }, (_, j) => `Choice ${j + 1}`).join('\n')));
+const noVotes = qs => Object.fromEntries(qs.map((q, i) => [i, Object.fromEntries(q.options.map((_, j) => [j, []]))]));
+
+test('a mid-sized poll fits a message and can still be voted on from it', () => {
+  const qs = mc(8);
+  const blocks = buildPollBlocks(poll({ questions: qs, votes: noVotes(qs) }));
+  auditMessage(blocks, 'poll-message/8x5');
+  const selects = blocks.filter(b => b.accessory?.type === 'static_select');
+  assert.strictEqual(selects.length, 8, 'every question should carry its own dropdown');
+  const ids = selects.map(b => b.accessory.action_id);
+  assert.strictEqual(new Set(ids).size, ids.length, 'action_ids must be unique within a message');
+  assert.strictEqual(selects[7].accessory.options[4].value, 'poll_1706234567_abc12345::7::4');
+  assert.ok(JSON.stringify(blocks).includes('Choice 5'), 'every option is still listed');
+});
+
+test('a small poll keeps a button per option', () => {
+  const blocks = buildPollBlocks(poll());
+  assert.ok(blocks.some(b => b.accessory?.action_id === 'vote_option_0_1'));
+  assert.ok(!blocks.some(b => b.accessory?.type === 'static_select'));
+});
+
+test('condensing keeps a hidden tally hidden', () => {
+  const qs = mc(8);
+  const votes = noVotes(qs); votes[0][0] = ['U1', 'U2', 'U3'];
+  const text = JSON.stringify(buildPollBlocks(poll({ questions: qs, votes, showResults: 'creator_only' })));
+  assert.ok(!text.includes('100%'), 'a condensed message must not show counts the setting hides');
+  assert.ok(text.includes('Results visible only to the poll creator'));
+});
+
+test('the largest poll the caps allow still posts, and names what it left out', () => {
+  const qs = mc(50, 10).map((q, i) => ({ ...q, text: `${'Q'.repeat(280)} ${i + 1}?`, options: q.options.map(o => o + 'x'.repeat(150)) }));
+  const blocks = buildPollBlocks(poll({ questions: qs, votes: noVotes(qs) }));
+  auditMessage(blocks, 'poll-message/50x10-long');
+  const text = JSON.stringify(blocks);
+  assert.ok(/more question/.test(text) || text.includes(' 50?'), 'the tail must be shown or counted');
+  assert.ok(text.includes('Vote'), 'the reader is sent to the ballot');
+});
+
+test('final results and the results screens fit their limits too', () => {
+  const qs = mc(50, 10);
+  const p = poll({ questions: qs, votes: noVotes(qs), status: 'closed' });
+  auditMessage(buildResultsBlocks(p, '🔒 Final Results'), 'results-message/50x10');
+  auditView(buildResultsModal(p, 'U1'), 'results-modal/50x10');
+  auditView(views.buildPostVoteModal({ ...p, status: 'active' }, 'U1', { note: 'n' }), 'post-vote/50x10');
+});
+
+test('a ballot too big for one modal is refused while it is being written', () => {
+  const grid = n => ({ text: 'Rate', type: 'likert', options: Array.from({ length: n }, (_, i) => `Statement ${i + 1}`) });
+  // Each grid of 10 is 11 blocks (a heading and a field per statement), on top
+  // of the ballot's own header, context, dividers and notify field: 8 grids is
+  // 93 blocks and fits, 9 is 104 and does not.
+  assert.strictEqual(views.ballotFits({ questions: Array(8).fill(grid(10)) }), true);
+  assert.strictEqual(views.ballotFits({ questions: Array(9).fill(grid(10)) }), false);
+  // Whatever it approves really does open.
+  auditView(buildVoteModal(poll({ questions: Array(8).fill(grid(10)), votes: {} })), 'vote/8-grids');
+  // Fifty plain questions are one field each, so the caps alone are fine.
+  assert.strictEqual(views.ballotFits({ questions: mc(50, 10) }), true);
+  assert.ok(views.BALLOT_FULL.length < 300, 'it is shown as an inline field error');
+});
+
 test('a poll too long for one message is summarised, never truncated', () => {
   // Cutting the tail off a ballot would drop questions people could otherwise
   // answer, with no way for them to tell.
   const many = Array.from({ length: 60 }, (_, i) => question(`Question ${i + 1}?`, 'A\nB\nC'));
   const votes = Object.fromEntries(many.map((_, i) => [i, { 0: [], 1: [], 2: [] }]));
   const blocks = buildPollBlocks(poll({ questions: many, votes }));
-  auditBlocks(blocks, 'poll-message/60-questions');
-  assert.ok(blocks.length <= LIMITS.blocksPerView, `${blocks.length} blocks`);
+  auditMessage(blocks, 'poll-message/60-questions');
+  assert.ok(blocks.length <= LIMITS.blocksPerMessage, `${blocks.length} blocks`);
   const rendered = JSON.stringify(blocks);
   assert.ok(rendered.includes('Question 60?'), 'the last question must still be accounted for');
 });
@@ -726,8 +794,8 @@ test('a title longer than a header allows is trimmed, not rejected', () => {
   auditView(buildResultsModal({ ...p, status: 'closed' }, 'U1'), 'results/long-title');
   auditView(buildEditModal(p), 'edit-poll/long-title');
   auditView(buildPreviewModal(draft({ savedQuestions: [question()], pollTitle: long })), 'preview/long-title');
-  auditBlocks(buildPollBlocks(p), 'poll-message/long-title');
-  auditBlocks(buildResultsBlocks(p, `Results: ${long}`, 'U1'), 'results-blocks/long-title');
+  auditMessage(buildPollBlocks(p), 'poll-message/long-title');
+  auditMessage(buildResultsBlocks(p, `Results: ${long}`, 'U1'), 'results-blocks/long-title');
 });
 
 // ==================== results, voting and sharing ====================
@@ -758,11 +826,73 @@ test('a voter sees which option they picked', () => {
   assert.notStrictEqual(v.submit.text, fresh.submit.text);
 });
 
+// ==================== answering part of a poll ====================
+
+const likert = { text: 'Rate', type: 'likert', options: ['Pace', 'Food'], allowMultiple: false };
+
+test('answered questions are counted one by one, whatever their type', () => {
+  const p = poll({
+    questions: [question(), likert, { text: 'Order', type: 'ranking', options: ['X', 'Y'] }],
+    votes: { 0: { 0: ['U1'], 1: [] }, 1: { 0: { 4: ['U2'] } }, 2: { U1: '1,2' } }
+  });
+  assert.deepStrictEqual([...answeredQuestions(p, 'U1')], [0, 2]);
+  assert.deepStrictEqual([...answeredQuestions(p, 'U2')], [1]);
+  assert.strictEqual(answeredQuestions(p, 'U9').size, 0);
+  assert.strictEqual(answeredQuestions(poll({ votes: null }), 'U1').size, 0, 'a null votes column must not throw');
+});
+
+// With vote changes off, a press on the message answers one question. The
+// modal then has to finish the poll rather than refuse it or re-ask what is
+// already answered - re-asking would be a vote change by another name.
+test('a locked question is shown as done and has no input', () => {
+  const p = poll({ questions: [question(), likert] });
+  const v = buildVoteModal(p, {}, { locked: new Set([0]) });
+  auditView(v, 'vote/locked');
+  assert.ok(!blockIds(v).includes('vote_q0'), 'an answered question must not be asked again');
+  assert.ok(blockIds(v).includes('vote_q1_s0'), 'an unanswered one still is');
+  assert.ok(JSON.stringify(v).includes('Already answered'));
+});
+
+// "Change Your Vote" has to open on the answers being changed. A Likert grid
+// or a ranking that came back blank meant re-entering every rating to alter
+// one - and, all fields being required, it could not be skipped either.
+test('changing a vote opens on every earlier answer, grids and rankings included', () => {
+  const ranking = { text: 'Order', type: 'ranking', options: ['X', 'Y', 'Z'] };
+  const p = poll({
+    allowRevote: true,
+    questions: [question(), likert, ranking],
+    votes: { 0: { 0: [], 1: ['U1'] }, 1: { 0: { 3: ['U1'] }, 1: { 0: ['U1', 'U2'] } }, 2: { U1: '2,3,1' } }
+  });
+  const prev = previousAnswers(p, 'U1');
+  assert.deepStrictEqual(prev, { 0: [1], 1: { ratings: { 0: '3', 1: '0' } }, 2: { ranks: ['2', '3', '1'] } });
+  const v = buildVoteModal(p, prev);
+  auditView(v, 'vote/prefilled');
+  const initial = id => findBlock(v, id).element.initial_option?.value;
+  assert.strictEqual(initial('vote_q0'), '1');
+  assert.strictEqual(initial('vote_q1_s0'), '3');
+  assert.strictEqual(initial('vote_q1_s1'), '0', 'a rating of 0 is a rating, not an absence');
+  assert.deepStrictEqual(['vote_q2_r0', 'vote_q2_r1', 'vote_q2_r2'].map(initial), ['2', '3', '1']);
+  assert.deepStrictEqual(previousAnswers(p, 'U9'), {}, 'someone who has not voted gets a blank ballot');
+});
+
+test('an unranked item from an old vote is left blank, not ranked #0', () => {
+  const ranking = { text: 'Order', type: 'ranking', options: ['X', 'Y'] };
+  const p = poll({ questions: [ranking], votes: { 0: { U1: '1,0' } } });
+  const v = buildVoteModal(p, previousAnswers(p, 'U1'));
+  assert.strictEqual(findBlock(v, 'vote_q0_r0').element.initial_option.value, '1');
+  assert.strictEqual(findBlock(v, 'vote_q0_r1').element.initial_option, undefined);
+});
+
+test('a locked question with an enormous text is still a valid view', () => {
+  const p = poll({ questions: [question('Why? '.repeat(700)), likert] });
+  auditView(buildVoteModal(p, {}, { locked: new Set([0]) }), 'vote/locked-long');
+});
+
 // ==================== the poll lists ====================
 
 test('every poll on a list carries buttons rather than an id to copy', () => {
   const blocks = pollListBlocks([poll(), poll()]);
-  auditBlocks(blocks, 'polls-list');
+  auditMessage(blocks, 'polls-list');
   const rows = blocks.filter(b => b.type === 'actions');
   assert.strictEqual(rows.length, 2, 'one button row per poll');
   assert.deepStrictEqual(rows[0].elements.map(e => e.action_id),
@@ -771,14 +901,14 @@ test('every poll on a list carries buttons rather than an id to copy', () => {
 
 test('a closed poll cannot be closed again', () => {
   const blocks = pollListBlocks([poll({ status: 'closed' })], { closed: true });
-  auditBlocks(blocks, 'polls-archive');
+  auditMessage(blocks, 'polls-archive');
   assert.ok(!blocks.find(b => b.type === 'actions').elements.some(e => e.action_id === 'close_poll'));
 });
 
 test('a full page of polls still fits one message', () => {
   const blocks = pollListBlocks(Array.from({ length: 20 }, () => poll()));
-  assert.ok(blocks.length <= LIMITS.blocksPerView, `${blocks.length} blocks`);
-  auditBlocks(blocks, 'polls-list/20');
+  assert.ok(blocks.length <= LIMITS.blocksPerMessage, `${blocks.length} blocks`);
+  auditMessage(blocks, 'polls-list/20');
 });
 
 // ==================== the export ====================

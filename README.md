@@ -87,8 +87,8 @@ In your Slack app, go to **Slash Commands** and create each one with this Reques
 | `/poll`          | Alias for `/newpoll`    | `Lunch? Thai, Sushi, Pizza`   |
 | `/poll-results`  | View results privately  | `POLL_ID`                     |
 | `/poll-share`    | Post results to channel (creator only) | `POLL_ID`      |
-| `/polls-list`    | List all active polls   |                               |
-| `/polls-archive` | List closed polls       |                               |
+| `/polls-list`    | List active polls — yours, and this channel's |          |
+| `/polls-archive` | List closed polls — yours, and this channel's |          |
 | `/poll-close`    | Close a poll            | `POLL_ID`                     |
 | `/poll-edit`     | Edit poll title/desc    | `POLL_ID`                     |
 | `/poll-export`   | Export results as CSV (creator only) | `POLL_ID`        |
@@ -205,6 +205,26 @@ On a multi-select question a press toggles that option, so you can pick several
 and take one back. Adding a choice is allowed even when the creator turned vote
 changes off - taking one back is not, since that is changing your mind.
 
+**Long polls change shape to fit.** Slack refuses any message over 50 blocks
+outright - nothing is posted - and the usual layout spends a block per option.
+So the message steps down, keeping the richest layout that fits:
+
+| Layout | When | Voting from the message |
+|---|---|---|
+| A block per option | Most polls | A numbered button on each option |
+| A block per question | Longer polls (options across all questions past ~40) | One **Vote…** dropdown per question - same rules as the buttons |
+| Questions packed into text | Very large polls | None - the message says to press **🗳️ Vote** |
+
+Tallies still show in the first two (voter names are dropped to save room). The
+results message and screens follow the same steps. Only if even packed text
+will not fit is the tail cut, and then the message says how many questions it
+left out; every question is still in the poll and on the ballot.
+
+The voting form has its own limit - 100 fields, where each Likert statement and
+each ranked item is one. A poll whose form would be over that is refused while
+it is being written, with an error on the form saying what to cut, rather than
+posting a poll that nobody can vote on.
+
 **Results are live by default.** A poll whose point is a visible tally should
 show one, so **Show results** starts at *In real-time* - the setting most people
 were reaching for, and two clicks in a dropdown to get to. Change it under
@@ -243,9 +263,14 @@ set when the poll was created still closes it on its own.
 ```
 /polls-list
 ```
-→ Lists all open polls, each with its own row of buttons: **📊 Results**,
-**📤 Send**, **🔒 Close** and **⬇️ Export**. `/polls-archive` does the same for
-closed polls, without the Close.
+→ Lists the open polls you run, plus any posted in the conversation you ran it
+in, each with its own row of buttons: **📊 Results**, **📤 Send**, **🔒 Close**
+and **⬇️ Export**. `/polls-archive` does the same for closed polls, without the
+Close.
+
+It used to list every poll in the workspace, to anyone. On the default results
+setting the Results button shows each answer with a name on it, so a poll sent
+to one private channel, or to a few people by DM, was readable by everybody.
 
 Those buttons are the point. Every one of these actions used to mean copying the
 poll's id out of this very list and pasting it into a slash command, which is a
@@ -320,40 +345,35 @@ can wake a sleeping instance. Point [cron-job.org](https://cron-job.org) or
 [UptimeRobot](https://uptimerobot.com) at `https://<your-service>.onrender.com/health`
 every **10 minutes** — under the 15-minute limit, with room for one missed run.
 
-Use `/health`, not `/`. The two answer different questions:
+The three paths answer different questions:
 
-| Path | Answers | Fails when |
-|------|---------|-----------|
-| `/` | Is the process alive? | Only if the container is down |
-| `/health` | Can it actually serve a poll? | Also if the database is unreachable or the schema is still being created |
+| Path | Answers | Touches the database |
+|------|---------|----------------------|
+| `/` | Is the process alive? | No |
+| `/health` | Is it up, with its schema in place? | No |
+| `/health?db=1` | Can it reach the database right now? | Yes |
 
-`/health` returns `200` with `{"status":"ok","schema":"ready","database":"ok","databaseLatencyMs":…}`,
-or `503` with `"status":"degraded"` and which part is wrong. So a monitor on `/health`
-alerts on an instance that is up but useless, where `/` would report it as fine. The
-database probe is cached for 15 seconds, so a short monitor interval cannot turn the
-endpoint into load, and the response deliberately never echoes the driver error —
-those can name the database host and user, and this endpoint is public.
+`/health` returns `200` with `{"status":"ok","uptime":…,"schema":"ready"}`, or `503`
+while the schema is still being created. `/health?db=1` adds `"database":"ok"` and
+`databaseLatencyMs`, or `"degraded"` when the database is unreachable. The response
+deliberately never echoes the driver error — those can name the database host and
+user, and these endpoints are public.
+
+**Point monitors and `healthCheckPath` at plain `/health`.** It used to probe the
+database on every hit, and that is half of why the free plans ran out in September
+2026 — see **The free-tier budget** below. Use `?db=1` by hand, or from a monitor
+that runs no more than hourly.
 
 ### Automatic restart
 
 `render.yaml` sets `healthCheckPath: /health`, so Render recycles an instance that
-fails the check instead of leaving it up and broken.
+stops answering or never finishes creating its schema.
 
-That makes the endpoint a trigger, not just a report, so it is deliberately slow to
-fail. The database gets a **90-second grace window** (`lib/health.js`): a Neon cold
-start or a brief hiccup rides through, a real outage crosses it and the instance is
-recycled. The body stays honest the whole time — `status` reads `degraded` from the
-first failed probe, even while the HTTP code is still `200`.
-
-So the two consumers want different things:
-
-| Watching | Reacts to | Because |
-|----------|-----------|---------|
-| Render (HTTP code) | `503` only | A restart should cost more than one bad probe |
-| Your monitor (body) | `"status":"degraded"` | You want to know about the blip Render is ignoring |
-
-Point cron-job.org or UptimeRobot at the response body containing `"status":"ok"`
-rather than only the status code, and you see both.
+It deliberately does not restart on a database outage any more. Restarting this
+process cannot bring a database back, and probing it every few seconds to find out
+kept Neon from ever suspending. `?db=1` still has its **90-second grace window**
+(`lib/health.js`): a Neon cold start rides through, a real outage crosses it and
+the code turns `503`, with `status` reading `degraded` from the first failed probe.
 
 Expect a `503` for the first ~10 seconds of every boot: the schema is created before
 the endpoint reports ready, and a cold database connection takes a few seconds. Render
@@ -368,10 +388,16 @@ already there, so reads and votes are unaffected — but the first boot after a 
 that adds a column would hit that column before the `ALTER` had run.
 
 So work that writes polls waits for the migrations instead of failing on them. Poll
-creation is already acked by then, so it can wait up to 20 seconds — the poll appears a
-moment later than usual and that is the whole of it. A vote gets a 2-second wait,
-because its results view has to be part of the ack, and is told to retry if the bot is
-still coming up. Once the bot is up, both waits cost nothing measurable.
+creation and votes are both acked before that wait, so either can wait up to 20
+seconds — the poll appears a moment later than usual, or the vote screen reads
+*Recording your vote…* a moment longer, and that is the whole of it. Once the bot is
+up, the wait costs nothing measurable.
+
+A vote is acked with that holding screen before any database work at all, and the
+result replaces it once the vote is written. The result used to be part of the ack,
+which put a connection, a transaction and a write inside Slack's 3 seconds — tight
+already, and tighter once the database is allowed to sleep, because the first vote
+after a quiet spell also pays for waking it.
 
 **2. `KEEPALIVE_URL` — belt and braces.** Set it to that same `/health` URL and the
 bot pings itself every 5 minutes, no third-party account needed. Leave it unset
@@ -384,9 +410,35 @@ silently no keepalive at all, and the only symptom is the failing first command.
 And because any gap puts the instance to sleep for good, the interval is 5 minutes
 rather than 10: three chances to miss the 15-minute deadline instead of one.
 
-> On the free plan, staying awake all month uses roughly 730 of the 750 free
-> instance-hours. Fine for one service; if you keep several free services warm in
-> the same account, the allowance runs out.
+### The free-tier budget
+
+Both free plans ran out on this bot in September 2026, and each for a reason worth
+knowing before switching anything back on.
+
+**Render: 750 instance-hours a month, per workspace.** A service kept awake around
+the clock uses 720–744 of them on its own. That leaves no room for a second free
+service in the same workspace — its hours come out of the same 750 — and when the
+allowance is gone every free service in the workspace is suspended until the 1st.
+Monitoring services switch off a job that keeps failing (cron-job.org does), so
+"the cron job stopped too" is a symptom of the outage, not its cause.
+
+Pick one:
+
+- **Keep it awake in working hours only.** Schedule the monitor for, say, 07:00–20:00
+  on weekdays: about 290 hours a month. Outside those hours the first command gets
+  the wake-up button above, and the first button press may need a second press.
+- **Keep it awake all the time**, and keep this the only free service in its workspace.
+- **Pay for Render Starter**, which does not sleep, and drop the monitor.
+
+**Neon: a monthly compute allowance, spent while the database is awake.** Neon
+suspends compute after 5 idle minutes and bills nothing while suspended. The bot
+used to prevent that twice over: the auto-close sweeper queried the database every
+minute, and `/health` queried it on every Render health check. So the database was
+awake whenever the bot was, and a bot awake around the clock spends more compute
+than the free plan has. Neither happens now. The sweeper keeps the next close time
+in memory and only touches the database when a poll is due (and every 6 hours as a
+backstop), and `/health` leaves the database alone — so it sleeps whenever nobody is
+using a poll, however long the bot itself stays up.
 
 ---
 
@@ -481,7 +533,9 @@ Use `sslmode=verify-full` for any hosted database, so the certificate is verifie
 
 ### Multi-workspace (OAuth)
 
-A single workspace only needs `SLACK_BOT_TOKEN`. To let other workspaces install the bot, set `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` and point the Slack app redirect URL at `/slack/oauth_redirect`; installations are stored in the `slack_installations` table. Each poll records the installation it belongs to, so scheduled auto-closes update the right channel and notify the right people in every installed workspace.
+A single workspace only needs `SLACK_BOT_TOKEN`, and while it is set both install routes answer `404`: `authorize()` uses that token for every request, so an installation stored from them would never be used.
+
+To let other workspaces install the bot, leave `SLACK_BOT_TOKEN` unset, set `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` and `SLACK_STATE_SECRET` (any long random string — `openssl rand -hex 32`), and point the Slack app redirect URL at `/slack/oauth_redirect`. **Share `https://<your-service>/slack/install` as the install link**, not Slack's own shareable URL: the install has to start there to pass the state check. That page sets a 10-minute cookie and sends Slack a signed state; the redirect accepts only a state signed with your secret, still fresh, and started in the same browser — otherwise anyone could send someone a link that completes an install they never asked for. Without `SLACK_STATE_SECRET` the routes refuse rather than skip the check. Installations are stored in the `slack_installations` table. Each poll records the installation it belongs to, so scheduled auto-closes update the right channel and notify the right people in every installed workspace.
 
 Org-wide (Enterprise Grid) installs work too: one installation covers the org, keyed by enterprise id rather than workspace id (`lib/install.js` decides, and the same rule is used when storing the installation, when authorizing a request, and when recording a poll).
 
@@ -493,8 +547,10 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 |--------|-----|
 | Bot not responding | Check `.env` tokens are correct |
 | First command fails, retry works | The host had gone to sleep — see **Staying awake** |
-| Monitor says up, bot still broken | Point the monitor at `/health`, not `/` — see **Staying awake** |
-| `/health` returns 503 | Read `database` and `schema` in the body; the instance is running but cannot serve polls |
+| Monitor says up, bot still broken | Open `/health?db=1` — the database may be down or out of quota |
+| `/health` returns 503 | The schema is still being created; if it stays that way, check the database |
+| Every request hangs, nothing in the logs | The host's free allowance is spent — see **The free-tier budget** |
+| `exceeded the quota` in the logs | Neon's free compute is spent — see **The free-tier budget** |
 | Commands not found | Verify Slash Commands have the right Request URL |
 | Votes not working | Confirm Interactivity is enabled with the correct URL |
 | ngrok URL changed | Update Request URLs in Slack app settings |
