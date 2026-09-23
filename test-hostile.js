@@ -18,7 +18,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 
 const V = require('./lib/views');
-const { HOSTILE, EXTREME, auditView, auditBlocks, auditText, halfEmoji } = require('./test-lib/audit');
+const { HOSTILE, EXTREME, auditView, auditBlocks, auditMessage, auditText, halfEmoji } = require('./test-lib/audit');
 const {
   MAX_POLL_TITLE_LENGTH, MAX_QUESTIONS_PER_POLL, MAX_OPTIONS_PER_QUESTION,
   MAX_VIEW_METADATA, draftFitsInView
@@ -148,7 +148,7 @@ for (const [name, build] of SURFACES) {
       }
 
       if (out.view) auditView(out.view, label);
-      if (out.blocks) auditBlocks(out.blocks, label);
+      if (out.blocks) auditMessage(out.blocks, label);
       if (out.csv) auditCsv(out.csv, label, value);
     }
   });
@@ -197,7 +197,7 @@ test('a poll title of any length builds valid screens, at every length', () => {
   // one offset, which a hand-picked case would have stepped over.
   for (let n = 0; n <= MAX_POLL_TITLE_LENGTH + 60; n++) {
     const title = 'T'.repeat(n);
-    auditBlocks(V.buildPollBlocks(pollWith(title)), `title-len-${n}/message`);
+    auditMessage(V.buildPollBlocks(pollWith(title)), `title-len-${n}/message`);
     auditView(V.buildResultsModal(pollWith(title), 'U0123456789'), `title-len-${n}/results`);
     auditView(V.buildEditModal(pollWith(title)), `title-len-${n}/edit`);
     auditView(V.buildShareModal(pollWith(title)), `title-len-${n}/share`);
@@ -210,7 +210,7 @@ test('an emoji at every offset near a trim is never cut in half', () => {
   // the whole range - which is why sampling missed this.
   for (let n = 100; n <= 220; n++) {
     const title = 'T'.repeat(n) + '🎉' + 'tail'.repeat(30);
-    auditBlocks(V.buildPollBlocks(pollWith(title)), `emoji-at-${n}/message`);
+    auditMessage(V.buildPollBlocks(pollWith(title)), `emoji-at-${n}/message`);
     auditView(V.buildResultsModal(pollWith(title), 'U0123456789'), `emoji-at-${n}/results`);
     const summary = V.settingsSummary({ pollTitle: title, pollSettings: ['anonymous'] });
     assert.ok(!halfEmoji(summary), `emoji-at-${n}: summary cut an emoji`);
@@ -224,7 +224,7 @@ test('a question of any length keeps every section inside Slack\'s limit', () =>
   for (let n = 0; n <= 600; n += 25) {
     const opts = Array.from({ length: MAX_OPTIONS_PER_QUESTION }, () => 'O'.repeat(Math.min(n, 200)));
     const p = pollWith('t', { questions: [q('Q'.repeat(n), opts)], votes: { 0: {} } });
-    auditBlocks(V.buildPollBlocks(p), `q-len-${n}/message`);
+    auditMessage(V.buildPollBlocks(p), `q-len-${n}/message`);
     auditView(V.buildVoteModal(p), `q-len-${n}/vote`);
     auditView(V.buildResultsModal(p, 'U0123456789'), `q-len-${n}/results`);
   }
@@ -235,7 +235,7 @@ test('every option count from none to the maximum builds a votable screen', () =
     const opts = Array.from({ length: n }, (_, i) => `Option ${i + 1}`);
     const p = pollWith('t', { questions: [q('Pick one', opts)], votes: { 0: {} } });
     auditView(V.buildVoteModal(p), `opts-${n}/vote`);
-    auditBlocks(V.buildPollBlocks(p), `opts-${n}/message`);
+    auditMessage(V.buildPollBlocks(p), `opts-${n}/message`);
   }
 });
 
@@ -265,7 +265,7 @@ test('every question count builds a valid screen, or is refused before it is bui
 test('a poll list of any length stays inside the block limit', () => {
   for (let n = 0; n <= 40; n++) {
     const polls = Array.from({ length: n }, () => pollWith('Team lunch vote'));
-    auditBlocks(V.pollListBlocks(polls), `list-${n}`);
+    auditMessage(V.pollListBlocks(polls), `list-${n}`);
   }
 });
 
@@ -274,7 +274,7 @@ test('every vote count renders a bar, including none and all', () => {
   for (let voters = 0; voters <= 12; voters++) {
     const votes = { 0: { 0: Array.from({ length: voters }, (_, i) => `U${i}`) } };
     const p = pollWith('t', { questions: [q('Pick one')], votes });
-    auditBlocks(V.buildPollBlocks(p), `voters-${voters}/message`);
+    auditMessage(V.buildPollBlocks(p), `voters-${voters}/message`);
     auditView(V.buildResultsModal(p, 'U0123456789'), `voters-${voters}/results`);
     auditText({ csv: V.buildPollCsv(p) }, `voters-${voters}/csv`);
   }
@@ -303,10 +303,10 @@ test('a poll missing anything optional still builds every screen', () => {
   for (const [name, over] of shapes) {
     const p = pollWith('Team lunch', over);
     assert.doesNotThrow(() => {
-      auditBlocks(V.buildPollBlocks(p), `${name}/message`);
+      auditMessage(V.buildPollBlocks(p), `${name}/message`);
       auditView(V.buildResultsModal(p, 'U0123456789'), `${name}/results`);
       auditView(V.buildShareModal(p), `${name}/share`);
-      auditBlocks(V.pollListBlocks([p]), `${name}/list`);
+      auditMessage(V.pollListBlocks([p]), `${name}/list`);
       V.buildPollCsv(p);
     }, `${name}: a stored poll of this shape should still render`);
   }
