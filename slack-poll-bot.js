@@ -1705,7 +1705,7 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
     console.error('vote_option connect error:', err.message);
     return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
   }
-  let finalPoll = null, note = null;
+  let finalPoll = null, note = null, lapsed = null, seen = null;
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
@@ -1713,6 +1713,9 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
       await dbClient.query('ROLLBACK');
       return await tell('❌ This poll no longer exists.');
     }
+    // The row, not the poll: the poll's votes are changed in place below, and a
+    // write that then fails must not be shown as if it had counted.
+    seen = rows[0];
     const poll = rowToPoll(rows[0]);
 
     if (poll.status === 'closed') {
@@ -1722,9 +1725,9 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
     if (poll.closeAt && new Date() >= new Date(poll.closeAt)) {
       await dbClient.query("UPDATE polls SET status='closed' WHERE id=$1", [pollId]);
       await dbClient.query('COMMIT');
-      await tell('⏰ This poll reached its close time - your vote was *not* recorded.');
-      await updatePollMessage(client, { ...poll, status: 'closed' });
-      await sendCloseNotifications(client, { ...poll, status: 'closed' });
+      // Announced as every other close is, final results included - once the
+      // connection is back in the pool, below.
+      lapsed = { ...poll, status: 'closed' };
       return;
     }
 
@@ -1782,6 +1785,14 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
     return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
   } finally {
     dbClient.release();
+    if (lapsed) {
+      await tell('⏰ This poll reached its close time - your vote was *not* recorded.');
+      await announceClose(client, lapsed);
+    } else if (!finalPoll && seen && action.type === 'static_select') {
+      // A refused pick still shows in the dropdown as if it counted. Posting
+      // the message again resets it to the placeholder.
+      await updatePollMessage(client, rowToPoll(seen));
+    }
   }
 
   // A press answers one question. If the poll has any that a button cannot
@@ -1997,8 +2008,12 @@ receiver.router.get('/slack/oauth_redirect', async (req, res) => {
     console.log(`✅ Installed for ${key}${result.is_enterprise_install ? ' (org-wide)' : ''}`);
     res.send('<h2>✅ CipherPol Bot installed!</h2><p>You can close this window and return to Slack.</p>');
   } catch (e) {
-    console.error('OAuth redirect error:', e.message);
-    res.status(500).send(`<h2>❌ Installation failed</h2><p>${escapeHtml(e.message)}</p>`);
+    console.error('OAuth redirect error:', e.data?.error || e.message);
+    // Slack's own error code is safe to show and says what to fix. Anything
+    // else may be a database error, which can name the host - logged only, as
+    // on /health.
+    const detail = e.data?.error ? ` (<code>${escapeHtml(e.data.error)}</code>)` : '';
+    res.status(500).send(`<h2>❌ Installation failed${detail}</h2><p>Start again from <a href="/slack/install">/slack/install</a>.</p>`);
   }
 });
 

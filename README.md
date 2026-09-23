@@ -205,6 +205,26 @@ On a multi-select question a press toggles that option, so you can pick several
 and take one back. Adding a choice is allowed even when the creator turned vote
 changes off - taking one back is not, since that is changing your mind.
 
+**Long polls change shape to fit.** Slack refuses any message over 50 blocks
+outright - nothing is posted - and the usual layout spends a block per option.
+So the message steps down, keeping the richest layout that fits:
+
+| Layout | When | Voting from the message |
+|---|---|---|
+| A block per option | Most polls | A numbered button on each option |
+| A block per question | Longer polls (options across all questions past ~40) | One **Vote…** dropdown per question - same rules as the buttons |
+| Questions packed into text | Very large polls | None - the message says to press **🗳️ Vote** |
+
+Tallies still show in the first two (voter names are dropped to save room). The
+results message and screens follow the same steps. Only if even packed text
+will not fit is the tail cut, and then the message says how many questions it
+left out; every question is still in the poll and on the ballot.
+
+The voting form has its own limit - 100 fields, where each Likert statement and
+each ranked item is one. A poll whose form would be over that is refused while
+it is being written, with an error on the form saying what to cut, rather than
+posting a poll that nobody can vote on.
+
 **Results are live by default.** A poll whose point is a visible tally should
 show one, so **Show results** starts at *In real-time* - the setting most people
 were reaching for, and two clicks in a dropdown to get to. Change it under
