@@ -720,7 +720,7 @@ test('a live ballot says the count, and says so when several answers are allowed
 test('a closed poll is a record, so the ballot buttons go', () => {
   const blocks = buildPollBlocks(poll({ status: 'closed' }));
   const ids = blocks.find(b => b.type === 'actions').elements.map(e => e.action_id);
-  assert.deepStrictEqual(ids, ['view_results_modal', 'share_poll']);
+  assert.deepStrictEqual(ids, ['view_results_modal', 'poll_more']);
 });
 
 test('hiding the tally does not hide the ballot', () => {

@@ -140,7 +140,7 @@ scenario('the sweeper closes an overdue poll, updates its message and announces 
   await sim.sweep();
   assert.strictEqual(sim.db.row(made.id).status, 'closed');
   assert.strictEqual(announcements(sim).length, 1);
-  assert.deepStrictEqual(buttonsOn(message(sim, made.messageRefs[0])), ['view_results_modal', 'share_poll']);
+  assert.deepStrictEqual(buttonsOn(message(sim, made.messageRefs[0])), ['view_results_modal', 'poll_more']);
 });
 
 scenario('a sleeping database costs the first press its three seconds, and the person is told to press again', async sim => {
@@ -429,7 +429,11 @@ scenario('a closed poll\'s message still gives its creator a way to export', asy
   await ama.press('poll_more', {}, at(ref));
   await ama.press('more_close', {});
   assert.ok(buttonsOn(message(sim, ref)).includes('poll_more'), `closed message offers: ${buttonsOn(message(sim, ref))}`);
-}, { todo: 'AUDIT #5: More is only on active polls, so a closed poll has no Export in the channel' });
+  await ama.press('poll_more', {}, at(ref));
+  assert.ok(actionsIn(ama.top.view).includes('more_export'));
+  await ama.press('more_export', {});
+  assert.strictEqual(sim.slack.files.length, 1);
+});
 
 scenario('/poll-export works in a public channel the bot has not joined', async sim => {
   const ama = sim.user('UAMA');

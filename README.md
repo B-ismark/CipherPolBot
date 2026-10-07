@@ -249,7 +249,8 @@ given one, and it is never told who the other person is. So pick them under
 in your own DM with the bot with a **Send it on** button.
 
 **The More button.** Under every active poll sit two buttons, **🗳️ Vote** and
-**More**. Slack shows every reader the same copy of a message, so a Close or
+**More**; once it closes, **📊 View Results** and **More**, so the creator can
+still export from the channel. Slack shows every reader the same copy of a message, so a Close or
 Export button on it would be offered to every voter and refused to all but the
 creator. More is the same button for everyone, but what it opens is built for
 whoever pressed it:
@@ -258,8 +259,9 @@ whoever pressed it:
   poll's rules in a line (anonymous or names shown, vote changes, when results
   appear), and **Results** (unless the poll is hiding them) and **Send to another
   channel**.
-- **The creator and co-creators** also get **Export CSV** and **Close poll**, in a
-  part of the screen labelled as theirs. Both are checked again when pressed.
+- **The creator and co-creators** also get **Export CSV** and, while the poll is
+  open, **Close poll**, in a part of the screen labelled as theirs. Both are
+  checked again when pressed.
 
 **Closing a poll.** Press **More** on the poll, then **Close poll**. A poll that
 already has votes asks for confirmation first. `/polls-list` has a **🔒 Close**
