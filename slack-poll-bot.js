@@ -325,7 +325,7 @@ const {
 } = require('./lib/install');
 const {
   resolveChannelInfo, resolveDestinations, postPollTo,
-  reachesCreator, describeFailures, logFailures, toMessageRefs
+  reachesCreator, describeFailures, logFailures, toMessageRefs, MAX_DESTINATIONS
 } = require('./lib/destinations');
 
 async function sendCloseNotifications(client, poll) {
@@ -1546,9 +1546,19 @@ app.action('share_poll', async ({ ack, body, client, action, respond }) => {
 });
 
 app.view('share_poll_submit', async ({ ack, body, view, client }) => {
-  await ack({ response_action: 'clear' });
   const { pollId } = JSON.parse(view.private_metadata);
   const { destChannels: channelIds, destUsers: userIds } = readDestinations(view.state?.values);
+  // Both pickers are optional, so Slack lets an empty screen through. Said on
+  // the screen, which stays open, rather than closing it and saying so in a DM.
+  // Each picker caps itself at the limit, but not the two together.
+  const picked = (channelIds?.length || 0) + (userIds?.length || 0);
+  if (!picked) {
+    return await ack({ response_action: 'errors', errors: { poll_dest_channels: 'Pick at least one channel or person to send the poll to.' } });
+  }
+  if (picked > MAX_DESTINATIONS) {
+    return await ack({ response_action: 'errors', errors: { poll_dest_channels: `Pick at most ${MAX_DESTINATIONS} channels and people in all (you picked ${picked}).` } });
+  }
+  await ack({ response_action: 'clear' });
   const actor = body.user.id;
 
   try {
@@ -1572,9 +1582,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     const fresh = targets.filter(t => !already.has(t.channel));
 
     if (!fresh.length && !failures.length) {
-      return await dmUser(client, actor, targets.length
-        ? `⚠️ *${pollTitleMrkdwn(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
-        : '⚠️ Pick at least one channel or person to send the poll to.');
+      return await dmUser(client, actor, `⚠️ *${pollTitleMrkdwn(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`);
     }
 
     const { posted, failures: postFailures } = await postPollTo(client, pollMessage(poll), fresh);
@@ -1618,16 +1626,10 @@ async function voteScreen(pollId, userId) {
   const poll = await getPoll(pollId);
   if (!poll) throw new Error('that poll no longer exists');
 
+  // A closed poll's results are open to everyone, so the screen shows them
+  // rather than a command with the poll's id in it to go and type.
   if (poll.status === 'closed') {
-    return {
-      type: 'modal',
-      title: { type: 'plain_text', text: 'Poll Closed' },
-      close: { type: 'plain_text', text: 'Close' },
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } },
-        { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results ${poll.id}\` to view the final results.` }] }
-      ]
-    };
+    return buildResultsModal(poll, userId, { notice: '🔒 This poll has closed, so it no longer takes votes. Here are the final results.' });
   }
 
   // With vote changes off, what is answered stays answered - but only the
