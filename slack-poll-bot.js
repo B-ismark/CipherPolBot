@@ -747,7 +747,8 @@ async function openScreen(client, triggerId, title, load, { say, doing = 'load t
     opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
   } catch (err) {
     // Too late even for the placeholder.
-    if (await sayInstead(await work.catch(() => null))) return;
+    const result = await work.catch(e => { console.error(`${title} screen failed to load:`, e); return null; });
+    if (await sayInstead(result)) return;
     throw err;
   }
   let result, view;
