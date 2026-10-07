@@ -303,6 +303,7 @@ const {
   canCreatePoll,
   pollCreationLimitMessage,
   checkPollCreationRateLimit,
+  releasePollCreation,
   checkShareRateLimit,
   claimNotification,
   releaseNotification,
@@ -474,7 +475,7 @@ async function updatePollMessage(client, poll) {
 // ==================== POLL CREATION HELPER ====================
 
 async function createAndPostPoll(client, meta, teamId = null) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false, destChannels = [], destUsers = [] } = meta;
+  const { userId } = meta;
 
   // The submission has already been acked, so nothing here is racing Slack's
   // 3-second deadline and this wait costs nothing once the bot is up.
@@ -482,8 +483,21 @@ async function createAndPostPoll(client, meta, teamId = null) {
     throw new Error('The bot is still starting up. Please try again in a few seconds.');
   }
 
-  // Rate limiting check
   await checkPollCreationRateLimit(userId);
+  try {
+    const made = await validateAndPost(client, meta, teamId);
+    if (made.nowhere) releasePollCreation(userId);
+    return made;
+  } catch (err) {
+    releasePollCreation(userId);
+    throw err;
+  }
+}
+
+// The part of creating a poll that can fail, so the allowance taken above can
+// be handed back when it does.
+async function validateAndPost(client, meta, teamId) {
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false, destChannels = [], destUsers = [] } = meta;
 
   // Input validation
   const title = (pollTitle || savedQuestions[0]?.text || '').trim();

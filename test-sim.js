@@ -412,15 +412,15 @@ scenario('a poll with an NPS question can be posted', async sim => {
   const ama = sim.user('UAMA');
   const made = await ama.createPoll({ questions: [V.buildQuestion('How likely are you to recommend us?', 'nps', '')] });
   assert.strictEqual(made.messageRefs.length, 1, ama.dms().map(m => m.text).join(' '));
-}, { todo: 'AUDIT #3: NPS has 11 options and the limit is 10' });
+});
 
 scenario('a poll that fails to post does not use up the creator\'s daily allowance', async sim => {
   const ama = sim.user('UAMA');
-  const nps = V.buildQuestion('Recommend us?', 'nps', '');
-  for (let i = 0; i < MAX_POLLS_PER_USER_PER_DAY; i++) await ama.createPoll({ questions: [nps] });
+  // G1 is a private channel the app was never invited to, so nothing posts.
+  for (let i = 0; i < MAX_POLLS_PER_USER_PER_DAY; i++) await ama.createPoll({ questions: [LUNCH()], destChannels: ['G1'] });
   const ok = await ama.createPoll({ questions: [LUNCH()] });
   assert.strictEqual(ok.messageRefs.length, 1, ama.dms().map(m => m.text).slice(-1).join(' '));
-}, { todo: 'AUDIT #4: the allowance is charged before the poll is validated or posted' });
+});
 
 scenario('a closed poll\'s message still gives its creator a way to export', async sim => {
   const ama = sim.user('UAMA');
