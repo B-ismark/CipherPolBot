@@ -788,7 +788,7 @@ app.command('/polls-list', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({
       channel, user: userId,
       text: `${polls.length} active poll${polls.length !== 1 ? 's' : ''}`,
-      blocks: pollListBlocks(polls)
+      blocks: pollListBlocks(polls, { viewerId: userId })
     });
   } catch (err) {
     console.error('/polls-list error:', err);
@@ -806,7 +806,7 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({
       channel, user: userId,
       text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`,
-      blocks: pollListBlocks(polls, { closed: true })
+      blocks: pollListBlocks(polls, { closed: true, viewerId: userId })
     });
   } catch (err) {
     console.error('/polls-archive error:', err);
@@ -1833,8 +1833,9 @@ app.action('view_results_modal', async ({ ack, body, client, action, respond }) 
   }
 });
 
-// The Close button on the poll message. It is visible to the whole channel, so
-// this is where the poll's own permissions are enforced.
+// The Close button on /polls-list. Lists only offer it to the people who run the
+// poll, but polls posted before that change still carry one on the message
+// itself, visible to the whole channel - so the permission is enforced here.
 app.action('close_poll', async ({ ack, body, client, action, respond }) => {
   await ack();
   const userId = body.user.id;

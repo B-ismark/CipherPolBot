@@ -647,10 +647,12 @@ test('the posted poll is a valid message', () => {
   auditMessage(buildPollBlocks(poll()), 'poll-message');
 });
 
-test('an active poll offers a vote, a send and a close', () => {
+test('an active poll offers a vote and a send, and no close', () => {
+  // The message is one copy shared by the whole channel, so a Close button on
+  // it would be offered to every voter and refused to all but the creator.
   const blocks = buildPollBlocks(poll());
   const ids = blocks.find(b => b.type === 'actions').elements.map(e => e.action_id);
-  assert.deepStrictEqual(ids, ['open_vote_modal', 'share_poll', 'close_poll']);
+  assert.deepStrictEqual(ids, ['open_vote_modal', 'share_poll']);
 });
 
 test('a closed poll is a record, so the ballot buttons go', () => {
@@ -891,12 +893,31 @@ test('a locked question with an enormous text is still a valid view', () => {
 // ==================== the poll lists ====================
 
 test('every poll on a list carries buttons rather than an id to copy', () => {
-  const blocks = pollListBlocks([poll(), poll()]);
+  const blocks = pollListBlocks([poll(), poll()], { viewerId: 'U0123456789' });
   auditMessage(blocks, 'polls-list');
   const rows = blocks.filter(b => b.type === 'actions');
   assert.strictEqual(rows.length, 2, 'one button row per poll');
   assert.deepStrictEqual(rows[0].elements.map(e => e.action_id),
     ['list_poll_results', 'share_poll', 'close_poll', 'list_poll_export']);
+});
+
+test('a list offers Close and Export only on the polls its viewer runs', () => {
+  const list = (viewerId, opts = {}) => pollListBlocks([poll({ coCreators: ['UCO'] })], { viewerId, ...opts })
+    .filter(b => b.type === 'actions')[0].elements.map(e => e.action_id);
+  for (const id of ['close_poll', 'list_poll_export']) {
+    assert.ok(list('U0123456789').includes(id), `${id}: the creator`);
+    assert.ok(list('UCO').includes(id), `${id}: a co-creator`);
+    assert.ok(!list('UBYSTANDER').includes(id), `${id}: someone who only sees it posted here`);
+    assert.ok(!list(undefined).includes(id), `${id}: nobody in particular`);
+  }
+  assert.deepStrictEqual(list('UBYSTANDER'), ['list_poll_results', 'share_poll']);
+});
+
+test('the archive offers Export to the people who run a closed poll, and no Close', () => {
+  const ids = (viewerId) => pollListBlocks([poll({ status: 'closed' })], { closed: true, viewerId })
+    .find(b => b.type === 'actions').elements.map(e => e.action_id);
+  assert.deepStrictEqual(ids('U0123456789'), ['list_poll_results', 'share_poll', 'list_poll_export']);
+  assert.deepStrictEqual(ids('UBYSTANDER'), ['list_poll_results', 'share_poll']);
 });
 
 test('a closed poll cannot be closed again', () => {
