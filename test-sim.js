@@ -454,7 +454,10 @@ scenario('the CSV names the people who wrote answers, and keeps their Slack ID b
   const input = k.top.view.blocks.find(b => b.type === 'input');
   clean(await k.submit({ [input.block_id]: { [input.element.action_id]: { type: 'plain_text_input', value: 'Loved it' } } }));
   clean(await ama.command('/poll-export', made.id));
-  assert.match(sim.slack.files.at(-1).content, /"Person UK \(UK\)","Loved it"/);
+  const csv = sim.slack.files.at(-1).content;
+  assert.match(csv, /"Person UK","UK","Thoughts\?","Loved it"/);
+  assert.match(csv, /"Thoughts\?","Open ended","See Responses below","1"/, 'the totals count it, without repeating it');
+  assert.strictEqual(csv.split('Loved it').length, 2, 'the answer appears once');
 });
 
 scenario('a Yes/No poll\'s export says who voted which way', async sim => {
@@ -478,7 +481,7 @@ scenario('before the app is reinstalled with users:read, the CSV still goes out,
   missing.data = { ok: false, error: 'missing_scope' };
   sim.slack.failNext('users.info', missing, { times: 1 });
   clean(await ama.command('/poll-export', made.id));
-  assert.match(sim.slack.files.at(-1).content, /"UK","Loved it"/);
+  assert.match(sim.slack.files.at(-1).content, /"UK","UK","Thoughts\?","Loved it"/);
 });
 
 scenario('a rate limit on the name lookups ends them, and the export goes out with ids', async sim => {
@@ -494,7 +497,7 @@ scenario('a rate limit on the name lookups ends them, and the export goes out wi
   const r = await ama.command('/poll-export', made.id);
   clean(r);
   assert.strictEqual(r.calls.filter(c => c.method === 'users.info').length, 10, 'stopped after the round that hit the limit');
-  assert.match(sim.slack.files.at(-1).content, /"UV24","Yes"/);
+  assert.match(sim.slack.files.at(-1).content, /"UV24","UV24","Thoughts\?","Yes"/);
 });
 
 // ==================== who is offered what ====================
