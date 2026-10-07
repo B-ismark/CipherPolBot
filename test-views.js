@@ -16,7 +16,7 @@ const views = require('./lib/views');
 const {
   buildComposeModal, buildOptionsModal, buildPreviewModal, buildQuestionModal,
   buildResultsModal, buildPollBlocks, buildVoteModal, buildEditModal,
-  buildShareModal, buildCloseConfirmModal, buildMoreModal, pollListBlocks, buildPollCsv,
+  buildShareModal, buildCloseConfirmModal, buildMoreModal, pollListBlocks, buildPollCsv, csvVoterIds,
   buildQuestion, restoreQuestion, rebuildComposeView, readOptionsSettings,
   settingsSummary, questionTypeIcon, questionTypeLabel,
   DEFAULT_SHOW_RESULTS, QUESTION_TYPE_GROUPS, buildResultsBlocks
@@ -1038,6 +1038,16 @@ test('a cell that a spreadsheet would execute is defused', () => {
 test('a quote in an answer does not break the row', () => {
   const csv = buildPollCsv(poll({ questions: [question('He said "hi"?', 'A\nB')] }));
   assert.ok(csv.includes('"He said ""hi""?"'));
+});
+
+test('the export names whoever wrote an answer, with the id kept beside it', () => {
+  const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
+  const p = poll({ questions: [open, question()], votes: { 0: { U7: 'Fine', U8: 'Meh' }, 1: { 0: ['U9'] } } });
+  assert.deepStrictEqual(csvVoterIds(p), ['U7', 'U8'], 'only people the CSV lists by name');
+  const csv = buildPollCsv(p, { U7: '=Ama' });
+  assert.ok(csv.includes(`"'=Ama (U7)","Fine"`), 'named, id kept, and a name is no formula');
+  assert.ok(csv.includes('"U8","Meh"'), 'no name found: the id alone');
+  assert.deepStrictEqual(csvVoterIds({ ...p, anonymous: true }), [], 'an anonymous poll looks nobody up');
 });
 
 test('an anonymous poll does not name its voters in the export', () => {

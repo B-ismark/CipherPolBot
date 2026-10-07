@@ -158,6 +158,13 @@ class FakeSlack {
           return { ok: true, channel: { id } };
         })()
       },
+      // Every person in the fake workspace is findable, named after their id.
+      users: {
+        info: async args => call('users.info', args, () => {
+          if (!/^U/.test(args.user || '')) throw slackError('user_not_found');
+          return { ok: true, user: { id: args.user, name: args.user.toLowerCase(), real_name: `Person ${args.user}`, profile: { display_name: '' } } };
+        })()
+      },
       files: {
         uploadV2: async args => call('files.uploadV2', args, () => {
           const c = needChannel(args.channel_id);

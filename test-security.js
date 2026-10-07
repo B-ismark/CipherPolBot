@@ -268,12 +268,12 @@ test('a forged, tampered, stale or cross-browser state is refused', () => {
   assert.strictEqual(verifyInstallState('', state, nonce, now), false, 'no secret configured');
 });
 
-test('the install link asks for the five scopes and carries the state', () => {
+test('the install link asks for the six scopes and carries the state', () => {
   const url = new URL(installUrl('123.456', 'the-state'));
   assert.strictEqual(url.origin + url.pathname, 'https://slack.com/oauth/v2/authorize');
   assert.strictEqual(url.searchParams.get('state'), 'the-state');
   assert.deepStrictEqual(url.searchParams.get('scope').split(','), BOT_SCOPES);
-  assert.strictEqual(BOT_SCOPES.length, 5);
+  assert.strictEqual(BOT_SCOPES.length, 6);
 });
 
 test('the state cookie is private, https-only, and survives the redirect back', () => {

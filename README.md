@@ -25,7 +25,7 @@ Create and manage polls in Slack with real-time vote tracking. Polls are stored 
 
 ### 2. Add Bot Token Scopes
 
-Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these five:
+Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these six:
 
 | Scope | Needed for |
 |-------|-----------|
@@ -34,10 +34,11 @@ Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these five:
 | `chat:write.public` | Posting to a public channel without being invited to it first |
 | `im:write` | Opening a DM — polls sent to people, polls created in DMs, close notifications, error reports |
 | `files:write` | The CSV from `/poll-export` |
+| `users:read` | Names in the CSV export, beside each person's Slack ID (without it, the export shows the IDs alone) |
 
 That is the complete set: those are the only Slack methods the bot calls
 (`chat.postMessage`, `chat.postEphemeral`, `chat.update`, `conversations.open`,
-`files.uploadV2`, and the `views.*` methods, which need no scope at all).
+`files.uploadV2`, `users.info`, and the `views.*` methods, which need no scope at all).
 
 Nothing else is required. In particular `im:history`, `channels:join`, `groups:write`,
 `mpim:write` and `conversations.connect:read` are **not** used — the bot never reads

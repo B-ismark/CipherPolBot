@@ -315,7 +315,7 @@ const {
   readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
   buildQuestion, buildVoteModal, ballotFits, BALLOT_FULL, isInlineVotable, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
-  buildCloseConfirmModal, buildMoreModal, buildNoticeModal, pollListBlocks, buildPollCsv,
+  buildCloseConfirmModal, buildMoreModal, buildNoticeModal, pollListBlocks, buildPollCsv, csvVoterIds,
   buildPostConfirmation, failureRecord, nowhereRecord
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
@@ -1089,6 +1089,29 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
 });
 
 
+// Names for the people a CSV lists. Needs the users:read scope: on an install
+// from before it was added - or for anyone Slack will not look up - the id is
+// left on its own, as it always was, rather than costing the export. Ten at a
+// time, so a long poll does not queue hundreds of lookups one by one.
+async function voterNames(client, poll) {
+  const names = {};
+  const ids = csvVoterIds(poll);
+  let allowed = true;
+  for (let i = 0; i < ids.length && allowed; i += 10) {
+    await Promise.all(ids.slice(i, i + 10).map(async id => {
+      try {
+        const { user } = await client.users.info({ user: id });
+        const name = user?.real_name || user?.profile?.display_name || user?.name;
+        if (name) names[id] = name;
+      } catch (err) {
+        if (err.data?.error === 'missing_scope') allowed = false;
+      }
+    }));
+  }
+  if (!allowed) console.warn('CSV export: no names, only ids - the app needs the users:read scope (add it and reinstall)');
+  return names;
+}
+
 // Upload that CSV wherever the request came from. File uploads do not honour
 // chat:write.public, so this only works in a DM or a channel the bot is in -
 // hence the failure being reported rather than swallowed.
@@ -1096,7 +1119,7 @@ async function uploadPollCsv(client, poll, channel) {
   await client.files.uploadV2({
     channel_id: channel,
     filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
-    content: buildPollCsv(poll),
+    content: buildPollCsv(poll, await voterNames(client, poll)),
     title: `Results: ${poll.title}`,
     initial_comment: `📊 Export for poll: *${pollTitleMrkdwn(poll)}*  ·  ID: \`${poll.id}\``
   });
