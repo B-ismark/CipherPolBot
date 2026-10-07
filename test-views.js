@@ -694,6 +694,32 @@ test('an active poll offers a vote and a More button, and nothing only some can 
   assert.strictEqual(buttons[1].value, poll().id);
 });
 
+test('the vote buttons say what they do, and a screen reader hears which option each one is for', () => {
+  const buttonsOf = q => buildPollBlocks(poll({ questions: [q], votes: {} }))
+    .map(b => b.accessory).filter(a => a?.type === 'button');
+  const KEYCAP = /⃣|🔟/u;
+
+  const venues = ['Paintball Aburi', 'Safari Valley', 'Mountain Gemi, Amedzofe'];
+  const one = buttonsOf(buildQuestion('Where?', 'multiple_choice', venues.join('\n')));
+  assert.strictEqual(one.length, 3);
+  assert.strictEqual(new Set(one.map(b => b.text.text)).size, 1, 'one verb on every row');
+  assert.strictEqual(new Set(one.map(b => b.accessibility_label)).size, 3, 'but each is told apart when read aloud');
+  one.forEach((b, i) => assert.ok(b.accessibility_label.includes(venues[i]), `button ${i + 1} names its option`));
+
+  const several = buttonsOf({ ...buildQuestion('Snacks?', 'multiple_choice', 'Chips\nFruit'), allowMultiple: true });
+  assert.notStrictEqual(several[0].text.text, one[0].text.text, 'a toggle does not read like a single vote');
+
+  const nps = buttonsOf(buildQuestion('Recommend us?', 'nps', ''));
+  assert.deepStrictEqual(nps.map(b => b.text.text), nps.map((_, i) => String(i)), 'a score button shows the score it gives');
+
+  const long = buttonsOf(buildQuestion('Where?', 'multiple_choice', 'x'.repeat(80)));
+  assert.ok(long[0].accessibility_label.length <= LIMITS.buttonText, 'a long option still fits Slack\'s label limit');
+
+  for (const q of [buildQuestion('Where?', 'multiple_choice', venues.join('\n')), buildQuestion('Rate it', 'scale_5', '')]) {
+    assert.ok(!KEYCAP.test(JSON.stringify(buildPollBlocks(poll({ questions: [q], votes: {} })))), `${q.type}: no keycap emoji left on the poll`);
+  }
+});
+
 // ==================== the More screen ====================
 
 const more = (over, viewerId) => buildMoreModal(poll(over), viewerId, 'C1');
