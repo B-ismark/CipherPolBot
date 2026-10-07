@@ -1764,6 +1764,10 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
       }
       if (picked(qv[oi])) {
         await dbClient.query('ROLLBACK');
+        // Pressing your own answer again changed nothing, so on an anonymous
+        // poll there is nothing worth a line. The dropdown is still reset in the
+        // finally below, and the rollback above has already released the row.
+        if (poll.anonymous) return;
         return await tell(`✅ You already voted for *${q.options[oi]}* - nothing changed.`);
       }
       Object.keys(qv).forEach(k => { qv[k] = (qv[k] || []).filter(id => id !== userId); });
