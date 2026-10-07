@@ -259,7 +259,7 @@ whoever pressed it:
   poll's rules in a line (anonymous or names shown, vote changes, when results
   appear), and **Results** (unless the poll is hiding them) and **Send to another
   channel**.
-- **The creator and co-creators** also get **Export CSV** and, while the poll is
+- **The creator** also gets **Export CSV** and, while the poll is
   open, **Close poll**, in a part of the screen labelled as theirs. Both are
   checked again when pressed.
 
@@ -274,7 +274,7 @@ refused as before.
 ```
 /poll-results poll_1706234567_abc12345
 ```
-→ Shows a breakdown with visual progress bars, visible only to you. Results the poll owner restricted ("only me", or "after the poll closes") stay hidden from everyone else until the poll closes; the owner and co-creators always see their own.
+→ Shows a breakdown with visual progress bars, visible only to you. Results the poll owner restricted ("only me", or "after the poll closes") stay hidden from everyone else until the poll closes; the owner always sees their own.
 
 ```
 /polls-list
@@ -304,12 +304,12 @@ are the creator's business anyway.
 ```
 /poll-share poll_1706234567_abc12345
 ```
-→ Posts current results into the channel. Creator and co-creators only, since everyone there can read them - and refused while the poll still restricts its results, because the voters were told they were private. Close the poll first; the results setting cannot be changed after creation.
+→ Posts current results into the channel. Creator only, since everyone there can read them - and refused while the poll still restricts its results, because the voters were told they were private. Close the poll first; the results setting cannot be changed after creation.
 
 ```
 /poll-export poll_1706234567_abc12345
 ```
-→ Exports results as a CSV file, with per-voter rows for non-anonymous polls, into your DM with the bot. Creator and co-creators only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
+→ Exports results as a CSV file, with per-voter rows for non-anonymous polls, into your DM with the bot. Creator only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
 
 ```
 /poll-close poll_1706234567_abc12345

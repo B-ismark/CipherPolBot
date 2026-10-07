@@ -50,6 +50,8 @@ async function initDb() {
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS order_by_votes BOOLEAN NOT NULL DEFAULT false`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS message_refs TEXT NOT NULL DEFAULT '[]'`);
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS notify_on_close TEXT NOT NULL DEFAULT '[]'`);
+  // co_creators (TEXT, default '[]') is left from a feature never built; the
+  // bot no longer reads or writes it.
   await pool.query(`ALTER TABLE polls ADD COLUMN IF NOT EXISTS co_creators TEXT NOT NULL DEFAULT '[]'`);
   // Holds the installation key (see lib/install.js): the enterprise id for an
   // org-wide install, the workspace id otherwise. Needed to pick the right bot
@@ -69,8 +71,8 @@ async function initDb() {
 
 async function savePoll(poll) {
   await pool.query(`
-    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs, notify_on_close, co_creators, team_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+    INSERT INTO polls (id, title, description, questions, votes, anonymous, allow_revote, creator, channel_id, message_ts, status, close_at, vote_timestamps, show_results, order_by_votes, message_refs, notify_on_close, team_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
     ON CONFLICT (id) DO UPDATE SET
       title=EXCLUDED.title, description=EXCLUDED.description, questions=EXCLUDED.questions,
       votes=EXCLUDED.votes, anonymous=EXCLUDED.anonymous, allow_revote=EXCLUDED.allow_revote,
@@ -79,7 +81,6 @@ async function savePoll(poll) {
       close_at=EXCLUDED.close_at, vote_timestamps=EXCLUDED.vote_timestamps,
       show_results=EXCLUDED.show_results, order_by_votes=EXCLUDED.order_by_votes,
       message_refs=EXCLUDED.message_refs, notify_on_close=EXCLUDED.notify_on_close,
-      co_creators=EXCLUDED.co_creators,
       team_id=COALESCE(EXCLUDED.team_id, polls.team_id)
   `, [
     poll.id, poll.title, poll.description || '',
@@ -90,7 +91,6 @@ async function savePoll(poll) {
     poll.showResults || 'creator_only', poll.orderByVotes || false,
     JSON.stringify(poll.messageRefs || []),
     JSON.stringify(poll.notifyOnClose || []),
-    JSON.stringify(poll.coCreators || []),
     poll.teamId || null
   ]);
 }
@@ -106,8 +106,7 @@ function rowToPoll(row) {
     questions: JSON.parse(row.questions || '[]'),
     votes: JSON.parse(row.votes || '{}'),
     voteTimestamps: JSON.parse(row.vote_timestamps || '{}'),
-    notifyOnClose: JSON.parse(row.notify_on_close || '[]'),
-    coCreators: JSON.parse(row.co_creators || '[]')
+    notifyOnClose: JSON.parse(row.notify_on_close || '[]')
   };
 }
 
@@ -117,8 +116,8 @@ async function getPoll(id) {
   return rows.length ? rowToPoll(rows[0]) : null;
 }
 
-// The rows a poll list could show this person: theirs, ones they co-run, and
-// ones posted where they asked. Narrowed here rather than after loading every
+// The rows a poll list could show this person: theirs, and ones posted where
+// they asked. Narrowed here rather than after loading every
 // poll ever made, votes and all, on each list command. The columns are JSON
 // kept as TEXT, hence the casts; channel_id also covers polls from before
 // message_refs existed. listablePolls applies the exact rule to what comes back.
@@ -126,7 +125,6 @@ async function getListablePolls(status, userId, channelId) {
   const { rows } = await pool.query(
     `SELECT * FROM polls WHERE status=$1 AND (
        creator=$2
-       OR co_creators::jsonb ? $2
        OR channel_id=$3
        OR message_refs::jsonb @> jsonb_build_array(jsonb_build_object('channelId', $3::text))
      ) ORDER BY created_at DESC`,
@@ -309,7 +307,7 @@ const {
   releaseNotification,
   draftFitsInView
 } = require('./lib/validation');
-const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
+const { isCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
 const { getAllVoters, answeredQuestions, votingState, previousAnswers, pollMessageRefs, pollDisplayTitle, escapeMrkdwn, pollTitleMrkdwn } = require('./lib/poll');
 const {
   readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
@@ -568,7 +566,6 @@ async function validateAndPost(client, meta, teamId) {
     orderByVotes,
     voteTimestamps: {},
     notifyOnClose: [],
-    coCreators: [],
     status: 'active'
   };
 
@@ -697,6 +694,50 @@ async function reportButtonFailure({ respond, client, userId, err, doing }) {
   await dmUser(client, userId, text);
 }
 
+// Slack lets a press open its screen for 3 seconds, and a database waking from
+// sleep can take longer than that to answer - so the first press after a quiet
+// spell used to fail and had to be made again. Now, when the screen's contents
+// are not ready within a moment, a "Loading…" screen opens with the press's
+// trigger while it is still good, and is filled in once the database answers.
+// When they are ready in time, which is nearly always, the real screen opens
+// straight away and nothing looks different.
+//
+// `load` returns the finished view, or throws. A throw before the placeholder
+// is up reaches the caller as it always did; one after it is shown on the
+// placeholder, since that is what the person is looking at.
+const OPEN_SCREEN_WAIT_MS = 800;
+
+async function openScreen(client, triggerId, title, load) {
+  const work = Promise.resolve().then(load);
+  // Settled later than the race below may look, so never left unhandled.
+  work.catch(() => {});
+  let timer;
+  const waited = new Promise(resolve => { timer = setTimeout(() => resolve(null), OPEN_SCREEN_WAIT_MS); });
+  let quick;
+  try {
+    quick = await Promise.race([work.then(view => ({ view })), waited]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (quick) return client.views.open({ trigger_id: triggerId, view: quick.view });
+
+  const opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
+  let view;
+  try {
+    view = await work;
+  } catch (err) {
+    console.error(`${title} screen failed to load:`, err);
+    view = buildNoticeModal(title, `❌ Could not load this: ${err.message}`);
+  }
+  try {
+    await client.views.update({ view_id: opened.view.id, view });
+  } catch (err) {
+    // Closed while it loaded: they chose to leave, so there is nothing to tell.
+    if ((err.data?.error || err.message) === 'not_found') return;
+    throw err;
+  }
+}
+
 async function handleNewPoll({ ack, body, client, respond }) {
   await ack();
   try {
@@ -806,7 +847,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID` - posts the *results* into this channel. To send another copy of the poll itself, press *More* on the poll, then *Send*.' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
+    if (!isCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
     // Voters were told these results were restricted, so do not let one command
     // publish them to a channel while the poll is still open.
     if (!canViewResults(poll, null)) return client.chat.postEphemeral({
@@ -829,7 +870,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
 // private channel, or to three people by DM, readable by the whole workspace.
 function listablePolls(polls, userId, channelId) {
   return polls.filter(p =>
-    isCreatorOrCoCreator(p, userId) || pollMessageRefs(p).some(r => r.channelId === channelId)
+    isCreator(p, userId) || pollMessageRefs(p).some(r => r.channelId === channelId)
   );
 }
 
@@ -898,7 +939,7 @@ app.action('list_poll_export', async ({ ack, body, client, action, respond }) =>
   try {
     const poll = await getPoll(action.value);
     if (!poll) return await deny('❌ That poll no longer exists.');
-    if (!isCreatorOrCoCreator(poll, userId)) return await deny(`❌ Only <@${poll.creator}> can export this poll.`);
+    if (!isCreator(poll, userId)) return await deny(`❌ Only <@${poll.creator}> can export this poll.`);
     const own = await client.conversations.open({ users: userId });
     await uploadPollCsv(client, poll, own.channel.id);
     await deny(`⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.`);
@@ -937,8 +978,8 @@ async function announceClose(client, closed, channel = closed.channelId) {
   return resultsError;
 }
 
-// Null when someone else got there first - another press, a co-creator, or
-// the close time - in which case they have already announced it, and the
+// Null when someone else got there first - another press, or the close
+// time - in which case they have already announced it, and the
 // caller says so rather than appearing to do nothing.
 async function finalizePollClose(client, poll, channel) {
   const closed = await closePoll(poll.id);
@@ -967,7 +1008,7 @@ app.command('/poll-close', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
+    if (!isCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
     if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: '⚠️ This poll is already closed.' });
 
     const participants = getAllVoters(poll).size;
@@ -996,7 +1037,7 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-edit POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
+    if (!isCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
     // Its final results are already out under this title.
     if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: `🔒 *${pollTitleMrkdwn(poll)}* has closed, so it can no longer be edited.` });
     await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
@@ -1029,7 +1070,7 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-export POLL_ID`' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
+    if (!isCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
     // To the DM, like the Export buttons: an upload to a channel the bot was
     // never invited to fails, which is most public channels.
     const own = await client.conversations.open({ users: userId });
@@ -1452,9 +1493,11 @@ async function saveEdit(pollId, title, description) {
 app.action('share_poll', async ({ ack, body, client, action, respond }) => {
   await ack();
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) throw new Error('that poll no longer exists');
-    await client.views.open({ trigger_id: body.trigger_id, view: buildShareModal(poll) });
+    await openScreen(client, body.trigger_id, 'Send poll', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) throw new Error('that poll no longer exists');
+      return buildShareModal(poll);
+    });
   } catch (err) {
     console.error('share_poll error:', err);
     await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the send screen' });
@@ -1522,33 +1565,29 @@ app.action('open_vote_modal', async ({ ack, body, client, action, respond }) => 
   // This used to have no error handling at all, so after a nap the Vote button
   // simply did nothing - the one button every voter presses.
   try {
-    await openVoteModal({ body, client, action });
+    await openScreen(client, body.trigger_id, 'Vote', () => voteScreen(action.value, body.user.id));
   } catch (err) {
     console.error('open_vote_modal error:', err);
     await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the ballot' });
   }
 });
 
-async function openVoteModal({ body, client, action }) {
-  const poll = await getPoll(action.value);
+// What the Vote button opens for this person.
+async function voteScreen(pollId, userId) {
+  const poll = await getPoll(pollId);
   if (!poll) throw new Error('that poll no longer exists');
 
   if (poll.status === 'closed') {
-    return client.views.open({
-      trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        title: { type: 'plain_text', text: 'Poll Closed' },
-        close: { type: 'plain_text', text: 'Close' },
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results ${poll.id}\` to view the final results.` }] }
-        ]
-      }
-    });
+    return {
+      type: 'modal',
+      title: { type: 'plain_text', text: 'Poll Closed' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results ${poll.id}\` to view the final results.` }] }
+      ]
+    };
   }
-
-  const userId = body.user.id;
 
   // With vote changes off, what is answered stays answered - but only the
   // questions that are. Turning someone away for having answered anything was
@@ -1557,26 +1596,20 @@ async function openVoteModal({ body, client, action }) {
   // straight after the reply to their press told them to use this button.
   const { locked, finished } = votingState(poll, userId);
   if (finished) {
-    return client.views.open({
-      trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        title: { type: 'plain_text', text: 'Already Voted' },
-        close: { type: 'plain_text', text: 'Close' },
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: '✅ You have already submitted your vote for this poll.' } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Vote changes are not allowed for this poll.' }] }
-        ]
-      }
-    });
+    return {
+      type: 'modal',
+      title: { type: 'plain_text', text: 'Already Voted' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: '✅ You have already submitted your vote for this poll.' } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: 'Vote changes are not allowed for this poll.' }] }
+      ]
+    };
   }
 
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: poll.allowRevote
-      ? buildVoteModal(poll, previousAnswers(poll, userId))
-      : buildVoteModal(poll, {}, { locked })
-  });
+  return poll.allowRevote
+    ? buildVoteModal(poll, previousAnswers(poll, userId))
+    : buildVoteModal(poll, {}, { locked });
 }
 
 // Slack allows 3 seconds for the ack. A vote is normally written well inside
@@ -1929,11 +1962,10 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
 app.action('view_results_modal', async ({ ack, body, client, action, respond }) => {
   await ack();
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) throw new Error('that poll no longer exists');
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: buildResultsModal(poll, body.user.id)
+    await openScreen(client, body.trigger_id, 'Poll Results', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) throw new Error('that poll no longer exists');
+      return buildResultsModal(poll, body.user.id);
     });
   } catch (err) {
     console.error('view_results_modal error:', err);
@@ -1952,7 +1984,7 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
   try {
     const poll = await getPoll(action.value);
     if (!poll) return await deny('❌ That poll no longer exists.');
-    if (!isCreatorOrCoCreator(poll, userId)) {
+    if (!isCreator(poll, userId)) {
       return await deny(`❌ Only <@${poll.creator}> can close this poll.`);
     }
     if (poll.status === 'closed') return await deny('⚠️ This poll is already closed.');
@@ -2002,11 +2034,10 @@ app.action('poll_more', async ({ ack, body, client, action, respond }) => {
   await ack();
   const userId = body.user.id;
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) throw new Error('that poll no longer exists');
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: buildMoreModal(poll, userId, closeChannelFor(poll, body.channel?.id))
+    await openScreen(client, body.trigger_id, 'Poll options', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) throw new Error('that poll no longer exists');
+      return buildMoreModal(poll, userId, closeChannelFor(poll, body.channel?.id));
     });
   } catch (err) {
     console.error('poll_more error:', err);
@@ -2060,14 +2091,14 @@ moreAction('more_send', 'open the send screen', async ({ poll, push }) => {
 // Export and Close are checked here as well as hidden from other people's
 // screens: the button is only ever as private as the screen it was on.
 moreAction('more_export', 'export that poll', async ({ poll, userId, client, notice }) => {
-  if (!isCreatorOrCoCreator(poll, userId)) return await notice('Export', `❌ Only <@${poll.creator}> can export this poll.`);
+  if (!isCreator(poll, userId)) return await notice('Export', `❌ Only <@${poll.creator}> can export this poll.`);
   const own = await client.conversations.open({ users: userId });
   await uploadPollCsv(client, poll, own.channel.id);
   await notice('Export', `⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.`);
 });
 
 moreAction('more_close', 'close the poll', async ({ poll, userId, client, push, notice, channelId }) => {
-  if (!isCreatorOrCoCreator(poll, userId)) return await notice('Close poll', `❌ Only <@${poll.creator}> can close this poll.`);
+  if (!isCreator(poll, userId)) return await notice('Close poll', `❌ Only <@${poll.creator}> can close this poll.`);
   if (poll.status === 'closed') return await notice('Close poll', '⚠️ This poll is already closed.');
   const participants = getAllVoters(poll).size;
   if (participants > 0) return await push(buildCloseConfirmModal(poll, channelId, participants));
@@ -2086,12 +2117,12 @@ app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
   try {
     const poll = await getPoll(pollId);
     if (!poll) return await dmUser(client, userId, '❌ That poll no longer exists.');
-    // Checked again here, not only where the modal was opened: co-creators can
-    // be removed, and this is the step that actually ends the poll.
-    if (!isCreatorOrCoCreator(poll, userId)) {
+    // Checked again here, not only where the modal was opened: this is the
+    // step that actually ends the poll.
+    if (!isCreator(poll, userId)) {
       return await dmUser(client, userId, `❌ Only <@${poll.creator}> can close this poll.`);
     }
-    // The close time, or a co-creator, can beat this confirmation to it, and
+    // The close time, or another press, can beat this confirmation to it, and
     // pressing Close Poll with nothing coming back read as the button failing.
     const said = closeOutcomeText(poll, poll.status === 'closed' ? null : await finalizePollClose(client, poll, channelId), channelId);
     if (said) await dmUser(client, userId, said);

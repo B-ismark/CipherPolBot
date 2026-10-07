@@ -24,7 +24,7 @@ const {
   releaseNotification
 } = require('./lib/validation');
 
-const { canViewResults, isCreatorOrCoCreator } = require('./lib/policy');
+const { canViewResults, isCreator } = require('./lib/policy');
 const {
   installationKey, installationKeyFromOAuth, BOT_SCOPES, STATE_TTL_MS, STATE_COOKIE,
   createInstallState, verifyInstallState, installUrl, stateCookie, readCookie
@@ -187,8 +187,8 @@ test('asking is free, and never moves the budget', () => {
   }
 });
 
-const poll = (showResults, status = 'active', coCreators = []) =>
-  ({ showResults, status, creator: 'U_CREATOR', coCreators });
+const poll = (showResults, status = 'active') =>
+  ({ showResults, status, creator: 'U_CREATOR' });
 
 test('realtime results are visible to everyone', () => {
   assert.strictEqual(canViewResults(poll('realtime'), 'U_STRANGER'), true);
@@ -198,9 +198,8 @@ test('creator_only hides live results from other members', () => {
   assert.strictEqual(canViewResults(poll('creator_only'), 'U_STRANGER'), false);
 });
 
-test('creator_only shows live results to the creator and co-creators', () => {
+test('creator_only shows live results to the creator', () => {
   assert.strictEqual(canViewResults(poll('creator_only'), 'U_CREATOR'), true);
-  assert.strictEqual(canViewResults(poll('creator_only', 'active', ['U_CO']), 'U_CO'), true);
 });
 
 test('creator_only hides live results on shared surfaces (no viewer)', () => {
@@ -212,9 +211,8 @@ test('on_close hides live results from other members', () => {
   assert.strictEqual(canViewResults(poll('on_close'), null), false);
 });
 
-test('the creator and co-creators always see their own live results', () => {
+test('the creator always sees their own live results', () => {
   assert.strictEqual(canViewResults(poll('on_close'), 'U_CREATOR'), true);
-  assert.strictEqual(canViewResults(poll('on_close', 'active', ['U_CO']), 'U_CO'), true);
   assert.strictEqual(canViewResults(poll('creator_only'), 'U_CREATOR'), true);
 });
 
@@ -223,10 +221,9 @@ test('closing a poll makes results visible to everyone', () => {
   assert.strictEqual(canViewResults(poll('on_close', 'closed'), 'U_STRANGER'), true);
 });
 
-test('poll management is limited to the creator and co-creators', () => {
-  assert.strictEqual(isCreatorOrCoCreator(poll('realtime'), 'U_CREATOR'), true);
-  assert.strictEqual(isCreatorOrCoCreator(poll('realtime', 'active', ['U_CO']), 'U_CO'), true);
-  assert.strictEqual(isCreatorOrCoCreator(poll('realtime'), 'U_STRANGER'), false);
+test('poll management is limited to the creator', () => {
+  assert.strictEqual(isCreator(poll('realtime'), 'U_CREATOR'), true);
+  assert.strictEqual(isCreator(poll('realtime'), 'U_STRANGER'), false);
 });
 
 test('a workspace install is keyed by its workspace id', () => {

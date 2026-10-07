@@ -22,7 +22,7 @@
 const COLUMNS = [
   'id', 'title', 'description', 'questions', 'votes', 'anonymous', 'allow_revote',
   'creator', 'channel_id', 'message_ts', 'status', 'close_at', 'vote_timestamps',
-  'show_results', 'order_by_votes', 'message_refs', 'notify_on_close', 'co_creators', 'team_id'
+  'show_results', 'order_by_votes', 'message_refs', 'notify_on_close', 'team_id'
 ];
 
 const matches = (pattern, sql) => (pattern instanceof RegExp ? pattern.test(sql) : sql.includes(pattern));
@@ -196,6 +196,9 @@ class FakeClient {
       await db.lockFor(id).acquire(this.id);
       try {
         const existing = this.read(id);
+        if (params.length !== COLUMNS.length) {
+          throw new Error(`fake-pg: INSERT has ${params.length} values but COLUMNS lists ${COLUMNS.length}`);
+        }
         const incoming = {};
         COLUMNS.forEach((c, i) => { incoming[c] = params[i]; });
         incoming.close_at = incoming.close_at ? new Date(incoming.close_at) : null;
@@ -213,7 +216,6 @@ class FakeClient {
       const hit = this.visibleRows().filter(r =>
         r.status === status && (
           r.creator === userId
-          || JSON.parse(r.co_creators || '[]').includes(userId)
           || r.channel_id === channelId
           || JSON.parse(r.message_refs || '[]').some(ref => ref.channelId === channelId)
         ));
