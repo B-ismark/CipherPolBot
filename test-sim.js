@@ -405,8 +405,8 @@ scenario('the message tally always matches the database, however votes interleav
   ]);
   const votes = Object.values(votesOf(sim, made.id)[0]).flat().length;
   assert.strictEqual(votes, 2);
-  assert.match(text(message(sim, ref)), /2 participants/, 'the slower refresh must not overwrite the newer one');
-}, { todo: 'AUDIT #2: each vote refreshes the message from its own snapshot, so a late refresh can show an older tally' });
+  assert.match(text(message(sim, ref)), /\*2\* participants/, 'the slower refresh must not overwrite the newer one');
+});
 
 scenario('a poll with an NPS question can be posted', async sim => {
   const ama = sim.user('UAMA');

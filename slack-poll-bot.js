@@ -463,12 +463,38 @@ async function dmUser(client, userId, text) {
 
 
 
+// Polls whose messages are being refreshed right now, by id.
+const refreshing = new Map();
+
+// Brings every copy of a poll's message up to date. Two votes a moment apart
+// used to refresh from their own snapshots, and whichever reached Slack last
+// won - sometimes the older tally, which then stayed until the next vote. Now a
+// poll has one refresh at a time, each drawn from the database as it is then;
+// a call that arrives during one asks for another pass when it finishes.
 async function updatePollMessage(client, poll) {
-  const refs = pollMessageRefs(poll);
-  const blocks = buildPollBlocks(poll);
-  await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
-    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollTitleMrkdwn(poll)}`, blocks })
-  ));
+  const running = refreshing.get(poll.id);
+  if (running) {
+    running.again = true;
+    return running.done;
+  }
+  const state = { again: false };
+  refreshing.set(poll.id, state);
+  state.done = (async () => {
+    let latest = poll;
+    try {
+      do {
+        state.again = false;
+        latest = (await getPoll(poll.id).catch(() => null)) || latest;
+        const blocks = buildPollBlocks(latest);
+        await Promise.allSettled(pollMessageRefs(latest).map(({ channelId, messageTs }) =>
+          client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollTitleMrkdwn(latest)}`, blocks })
+        ));
+      } while (state.again);
+    } finally {
+      refreshing.delete(poll.id);
+    }
+  })();
+  return state.done;
 }
 
 
