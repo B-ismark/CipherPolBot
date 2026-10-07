@@ -482,7 +482,7 @@ scenario('a vote cast while the poll is still being posted is kept', async sim =
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
   assert.deepStrictEqual((await voted).ephemerals.map(e => e.text), ['✅ Your vote for *Thai* is in.']);
   assert.deepStrictEqual(votesOf(sim, made.id)[0][0], ['UK'], 'the voter was told it counted');
-}, { todo: 'AUDIT #14: the second save writes back the whole poll as it was before anyone voted' });
+});
 
 scenario('an edit does not undo a vote that lands while it is saving', async sim => {
   const ama = sim.user('UAMA');
@@ -493,7 +493,7 @@ scenario('an edit does not undo a vote that lands while it is saving', async sim
   await sim.db.settle();
   assert.strictEqual(sim.db.row(made.id).title, 'Lunch, Friday');
   assert.deepStrictEqual(votesOf(sim, made.id)[0][1], ['UK']);
-}, { todo: 'AUDIT #14: /poll-edit saves the whole poll as it read it' });
+});
 
 scenario('an edit cannot reopen a poll that closed while it was saving', async sim => {
   const ama = sim.user('UAMA');
@@ -504,7 +504,31 @@ scenario('an edit cannot reopen a poll that closed while it was saving', async s
   await sim.db.settle();
   assert.strictEqual(sim.db.row(made.id).status, 'closed');
   assert.ok(!buttonsOn(message(sim, made.messageRefs[0])).includes('open_vote_modal'), 'its final results are out, and it takes votes again');
-}, { todo: 'AUDIT #14: /poll-edit writes back the status it read' });
+});
+
+scenario('a closed poll cannot be edited', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  await ama.command('/poll-close', made.id);
+  assert.strictEqual(sim.db.row(made.id).status, 'closed');
+  const r = await ama.command('/poll-edit', made.id);
+  assert.strictEqual(r.modal, null);
+  assert.match(r.ephemerals[0].text, /has closed, so it can no longer be edited/);
+});
+
+scenario('an edit that saves slowly shows Saving, then the result, never an error', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  await ama.command('/poll-edit', made.id);
+  // Past the two seconds the bot gives itself before Slack's three run out.
+  sim.db.before(/^UPDATE polls SET title/, () => new Promise(r => setTimeout(r, 2100)));
+  const r = await ama.submit({ edit_title: { value: { value: 'Lunch, Friday' } } });
+  assert.match(text(r.ackPayload.view.blocks), /Saving your edit/);
+  const later = r.calls.filter(c => c.method === 'views.update');
+  assert.strictEqual(later.length, 1);
+  assert.match(text(later[0].args.view.blocks), /has been updated/);
+  assert.match(text(message(sim, made.messageRefs[0])), /Lunch, Friday/);
+});
 
 scenario('two people sending a poll at the same moment both get a copy that stays in step', async sim => {
   sim.slack.addChannel('C3', { type: 'public', name: 'social' });
@@ -517,4 +541,4 @@ scenario('two people sending a poll at the same moment both get a copy that stay
   await sim.db.settle();
   assert.deepStrictEqual(JSON.parse(sim.db.row(made.id).message_refs).map(r => r.channelId).sort(), ['C1', 'C2', 'C3'],
     'the forgotten copy never updates and never shows the poll closed');
-}, { todo: 'AUDIT #14: Send writes back the list of copies it read' });
+});

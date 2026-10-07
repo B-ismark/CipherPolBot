@@ -227,8 +227,16 @@ class FakeClient {
     if (sql === 'UPDATE polls SET votes=$1, vote_timestamps=$2, notify_on_close=$3 WHERE id=$4') {
       return this.update(params[3], row => ({ ...row, votes: params[0], vote_timestamps: params[1], notify_on_close: params[2] }));
     }
-    if (sql === 'UPDATE polls SET message_refs=$1 WHERE id=$2') {
-      return this.update(params[1], row => ({ ...row, message_refs: params[0] }));
+    // Appending to the JSON list of copies, as Postgres' jsonb || does.
+    const append = (refs, more) => JSON.stringify([...JSON.parse(refs || '[]'), ...JSON.parse(more)]);
+    if (sql === 'UPDATE polls SET message_refs=(message_refs::jsonb || $1::jsonb)::text WHERE id=$2') {
+      return this.update(params[1], row => ({ ...row, message_refs: append(row.message_refs, params[0]) }));
+    }
+    if (sql === 'UPDATE polls SET message_refs=(message_refs::jsonb || $1::jsonb)::text, channel_id=$2, message_ts=$3 WHERE id=$4 RETURNING *') {
+      return this.update(params[3], row => ({ ...row, message_refs: append(row.message_refs, params[0]), channel_id: params[1], message_ts: params[2] }), { returning: true });
+    }
+    if (sql === "UPDATE polls SET title=$1, description=$2 WHERE id=$3 AND status='active' RETURNING *") {
+      return this.update(params[2], row => ({ ...row, title: params[0], description: params[1] }), { onlyIf: row => row.status === 'active', returning: true });
     }
     if (sql === "UPDATE polls SET status='closed' WHERE id=$1") {
       return this.update(params[0], row => ({ ...row, status: 'closed' }));

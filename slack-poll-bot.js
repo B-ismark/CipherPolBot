@@ -579,11 +579,18 @@ async function validateAndPost(client, meta, teamId) {
     }
   }
 
-  poll.messageRefs = toMessageRefs(posted);
-  poll.channelId = posted[0].channelId;
-  poll.messageTs = posted[0].messageTs;
-  await savePoll(poll);
-  return { poll, channel: posted[0].channelId, posted, failures: allFailures, redirected, usedFallback };
+  // Only where it went. The poll has been live since its first message
+  // landed, so a vote may already be in that row; saving the whole poll as it
+  // was built here used to wipe it, after the voter was told it counted.
+  const { rows } = await pool.query(
+    'UPDATE polls SET message_refs=(message_refs::jsonb || $1::jsonb)::text, channel_id=$2, message_ts=$3 WHERE id=$4 RETURNING *',
+    [JSON.stringify(toMessageRefs(posted)), posted[0].channelId, posted[0].messageTs, pollId]
+  );
+  const saved = rows.length ? rowToPoll(rows[0]) : { ...poll, messageRefs: toMessageRefs(posted), channelId: posted[0].channelId, messageTs: posted[0].messageTs };
+  // That early vote refreshed nothing, because the bot did not know yet where
+  // the poll was. So the copies still show none.
+  if (JSON.stringify(saved.votes) !== JSON.stringify(poll.votes)) await updatePollMessage(client, saved);
+  return { poll: saved, channel: posted[0].channelId, posted, failures: allFailures, redirected, usedFallback };
 }
 
 // ==================== HELPERS ====================
@@ -957,6 +964,8 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
+    // Its final results are already out under this title.
+    if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: `🔒 *${pollTitleMrkdwn(poll)}* has closed, so it can no longer be edited.` });
     await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
   } catch (err) {
     console.error('/poll-edit error:', err);
@@ -1340,23 +1349,54 @@ app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
     return await ack({ response_action: 'errors', errors: { edit_description: `Description exceeds maximum length of ${MAX_POLL_DESCRIPTION_LENGTH} characters.` } });
   }
 
+  // Same deadline as a vote: the result goes in the ack when the save is
+  // quick, and a holding screen goes there when it is not. Refreshing every
+  // copy of the poll waits until after, so it can never be the reason the
+  // creator sees "trouble connecting" on an edit that saved.
+  const work = saveEdit(pollId, newTitle, newDesc);
+  let timer;
+  const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), VOTE_ACK_DEADLINE_MS); });
+  let outcome = await Promise.race([work, deadline]);
+  clearTimeout(timer);
+
+  if (outcome) {
+    await ack({ response_action: 'update', view: outcome.view });
+  } else {
+    await ack({ response_action: 'update', view: buildNoticeModal('Saving', '⏳ Saving your edit…') });
+    const ackedAt = Date.now();
+    outcome = await work;
+    const gap = VOTE_UPDATE_SPACING_MS - (Date.now() - ackedAt);
+    if (gap > 0) await new Promise(resolve => setTimeout(resolve, gap));
+    try {
+      await client.views.update({ view_id: view.id, view: outcome.view });
+    } catch (err) {
+      console.warn('edit result view failed:', err.data?.error || err.message);
+    }
+  }
+  if (outcome.poll) await updatePollMessage(client, outcome.poll);
+});
+
+// Writes the title and description and nothing else, so a vote or a close
+// that lands meanwhile is not undone - and only while the poll is open, so an
+// edit can never reopen one. Never throws: every ending is a screen.
+async function saveEdit(pollId, title, description) {
   try {
-    const poll = await getPoll(pollId);
-    if (!poll) { await ack(); return; }
-    const updated = { ...poll, title: newTitle, description: newDesc };
-    await savePoll(updated);
-    await updatePollMessage(client, updated);
-    await ack({ response_action: 'update', view: {
-      type: 'modal',
-      title: { type: 'plain_text', text: 'Poll Updated' },
-      close: { type: 'plain_text', text: 'Close' },
-      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${escapeMrkdwn(newTitle)}* has been updated.` } }]
-    }});
+    const { rows } = await pool.query(
+      "UPDATE polls SET title=$1, description=$2 WHERE id=$3 AND status='active' RETURNING *",
+      [title, description, pollId]
+    );
+    if (!rows.length) {
+      return { view: buildNoticeModal('Poll Closed', '🔒 This poll has closed, so it can no longer be edited. Nothing was changed.') };
+    }
+    return {
+      poll: rowToPoll(rows[0]),
+      view: buildNoticeModal('Poll Updated', `✅ *${escapeMrkdwn(title)}* has been updated.`)
+    };
   } catch (err) {
     console.error('poll_edit_submit error:', err);
-    await ack();
+    return { view: buildNoticeModal('Edit Not Saved', '⚠️ Something went wrong saving your edit. Nothing was changed - please try again.') };
   }
-});
+}
 
 app.action('share_poll', async ({ ack, body, client, action, respond }) => {
   await ack();
@@ -1404,8 +1444,10 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
 
     const { posted, failures: postFailures } = await postPollTo(client, pollMessage(poll), fresh);
     if (posted.length) {
-      const refs = [...(poll.messageRefs || []), ...toMessageRefs(posted)];
-      await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(refs), pollId]);
+      // Appended rather than rewritten, so two people sending at once both keep
+      // their copy on record - a forgotten copy never updates again.
+      await pool.query('UPDATE polls SET message_refs=(message_refs::jsonb || $1::jsonb)::text WHERE id=$2',
+        [JSON.stringify(toMessageRefs(posted)), pollId]);
     }
 
     const parts = [];
