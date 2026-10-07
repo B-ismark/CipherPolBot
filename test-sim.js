@@ -455,7 +455,11 @@ scenario('a poll with a paragraph from each of ten people still updates', async 
   }
   await sim.user('UE').press('vote_option_1_0', {}, at(ref));
   assert.match(text(message(sim, ref)), /<@UE>/, 'the message stopped showing new votes');
-}, { todo: 'AUDIT #13: every answer goes into one block, and past 3000 characters Slack refuses the whole message' });
+  assert.match(text(message(sim, ref)), /and 1 more/, 'and says what it is not showing');
+  await sim.user('UAMA').command('/poll-close', made.id);
+  await sim.user('UAMA').submit({});
+  assert.strictEqual(announcements(sim).length, 1, 'the final results were posted');
+});
 
 // These four put someone else's action into the gap between the bot reading a
 // poll and writing it back. The gap is whatever the bot does there, so they

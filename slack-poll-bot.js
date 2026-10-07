@@ -297,6 +297,7 @@ const {
   MAX_POLL_TITLE_LENGTH,
   MAX_POLL_DESCRIPTION_LENGTH,
   MAX_NOTIFY_SUBSCRIBERS_PER_POLL,
+  MAX_ANSWER_LENGTH,
   MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR,
   validatePollInputs,
   canCreatePoll,
@@ -1628,7 +1629,7 @@ async function recordVote({ pollId, userId, values, wantsNotify }) {
       if (!block) return;
       if (q.type === 'open_ended') {
         const text = block.response?.value;
-        if (text) poll.votes[qi][userId] = text;
+        if (text) poll.votes[qi][userId] = text.slice(0, MAX_ANSWER_LENGTH);
       } else if (q.allowMultiple) {
         (block.selected?.selected_options || []).forEach(opt => {
           const oi = parseInt(opt.value);
