@@ -415,10 +415,22 @@ scenario('Send with nothing picked stays open and says what is missing', async s
   const k = sim.user('UK');
   await k.press('poll_more', {}, at(made.messageRefs[0]));
   await k.press('more_send', {});
-  const r = await k.submit({});
-  clean(r);
-  assert.match(r.viewErrors?.poll_dest_channels || '', /Pick at least one channel or person/);
-  assert.strictEqual(k.top.view.callback_id, 'share_poll_submit', 'the Send screen is still open');
+  const pick = (channels, users) => ({
+    poll_dest_channels: { value: { type: 'multi_conversations_select', selected_conversations: channels } },
+    poll_dest_users: { value: { type: 'multi_users_select', selected_users: users } }
+  });
+  // Slack sends both pickers, empty - and an older client may leave them out.
+  for (const values of [pick([], []), {}]) {
+    const r = await k.submit(values);
+    clean(r);
+    assert.match(r.viewErrors?.poll_dest_channels || '', /Pick at least one channel or person/);
+    assert.strictEqual(k.top.view.callback_id, 'share_poll_submit', 'the Send screen is still open');
+  }
+  // Ten in each picker is allowed; eleven in all is not.
+  const many = await k.submit(pick(['C2', 'C3', 'C4', 'C5', 'C6', 'C7'], ['U1', 'U2', 'U3', 'U4', 'U5', 'U6']));
+  clean(many);
+  assert.match(many.viewErrors?.poll_dest_channels || '', /at most 10 .*you picked 12/);
+  assert.strictEqual(k.top.view.callback_id, 'share_poll_submit');
   assert.deepStrictEqual(k.dms(), [], 'nothing arrives in a DM');
 });
 

@@ -325,7 +325,7 @@ const {
 } = require('./lib/install');
 const {
   resolveChannelInfo, resolveDestinations, postPollTo,
-  reachesCreator, describeFailures, logFailures, toMessageRefs
+  reachesCreator, describeFailures, logFailures, toMessageRefs, MAX_DESTINATIONS
 } = require('./lib/destinations');
 
 async function sendCloseNotifications(client, poll) {
@@ -1550,8 +1550,13 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
   const { destChannels: channelIds, destUsers: userIds } = readDestinations(view.state?.values);
   // Both pickers are optional, so Slack lets an empty screen through. Said on
   // the screen, which stays open, rather than closing it and saying so in a DM.
-  if (!channelIds?.length && !userIds?.length) {
+  // Each picker caps itself at the limit, but not the two together.
+  const picked = (channelIds?.length || 0) + (userIds?.length || 0);
+  if (!picked) {
     return await ack({ response_action: 'errors', errors: { poll_dest_channels: 'Pick at least one channel or person to send the poll to.' } });
+  }
+  if (picked > MAX_DESTINATIONS) {
+    return await ack({ response_action: 'errors', errors: { poll_dest_channels: `Pick at most ${MAX_DESTINATIONS} channels and people in all (you picked ${picked}).` } });
   }
   await ack({ response_action: 'clear' });
   const actor = body.user.id;
@@ -1577,9 +1582,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     const fresh = targets.filter(t => !already.has(t.channel));
 
     if (!fresh.length && !failures.length) {
-      return await dmUser(client, actor, targets.length
-        ? `⚠️ *${pollTitleMrkdwn(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
-        : '⚠️ Pick at least one channel or person to send the poll to.');
+      return await dmUser(client, actor, `⚠️ *${pollTitleMrkdwn(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`);
     }
 
     const { posted, failures: postFailures } = await postPollTo(client, pollMessage(poll), fresh);
