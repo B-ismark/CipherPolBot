@@ -949,10 +949,12 @@ app.action('list_poll_results', async ({ ack, body, client, action, respond }) =
   const userId = body.user.id;
   const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) return await deny('❌ That poll no longer exists.');
-    if (!canViewResults(poll, userId)) return await deny(`🔒 ${resultsHiddenReason(poll)}.`);
-    await client.views.open({ trigger_id: body.trigger_id, view: buildResultsModal(poll, userId) });
+    await openScreen(client, body.trigger_id, 'Poll Results', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) return { say: '❌ That poll no longer exists.' };
+      if (!canViewResults(poll, userId)) return { say: `🔒 ${resultsHiddenReason(poll)}.` };
+      return buildResultsModal(poll, userId);
+    }, { say: deny, doing: 'open those results' });
   } catch (err) {
     console.error('list_poll_results error:', err);
     await reportButtonFailure({ respond, client, userId, err, doing: 'open those results' });

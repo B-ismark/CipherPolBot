@@ -204,6 +204,34 @@ scenario('a database waking from sleep no longer costs /poll-edit, /poll-close o
   assert.strictEqual(announcements(sim).length, 1);
 });
 
+scenario('a database waking from sleep no longer costs the Results button on a poll list', async sim => {
+  const lunch = await sim.user('UAMA').createPoll({ title: 'Lunch vote', questions: [LUNCH()] });
+  const secret = await sim.user('UAMA').createPoll({ title: 'Secret vote', questions: [LUNCH()], showResults: 'on_close' });
+  const k = sim.user('UK');
+  await k.command('/polls-list', '', { channel: 'C1' });
+  const list = k.whispers().length - 1;
+
+  // Cold: the Loading screen fills in with the results.
+  coldNextLookup(sim);
+  const r = await k.press('list_poll_results', { value: lunch.id }, { ephemeral: list });
+  clean(r);
+  assert.match(text(r.calls.find(c => c.method === 'views.open').args.view.blocks), /Loading/);
+  assert.match(text(k.top.view.blocks), /Lunch vote/);
+  assert.deepStrictEqual(r.ephemerals, [], 'nobody is told to press again');
+  k.dismiss();
+
+  // Hidden results: said where they are looking - the placeholder when slow,
+  // a private message as before when quick.
+  coldNextLookup(sim);
+  clean(await k.press('list_poll_results', { value: secret.id }, { ephemeral: list }));
+  assert.match(text(k.top.view.blocks), /Results visible after poll closes/);
+  k.dismiss();
+  const quick = await k.press('list_poll_results', { value: secret.id }, { ephemeral: list });
+  clean(quick);
+  assert.strictEqual(k.top, null);
+  assert.match(quick.ephemerals[0].text, /Results visible after poll closes/);
+});
+
 scenario('when a slow /poll-close or /poll-edit ends in a message, it is shown on the Loading screen', async sim => {
   const ama = sim.user('UAMA');
   const made = await ama.createPoll({ questions: [LUNCH()] });
