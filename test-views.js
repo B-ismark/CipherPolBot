@@ -1056,3 +1056,38 @@ test('a long choice with an ampersand still fits Slack\'s option limit once esca
   for (const o of boxes) assert.ok(o.text.text.length <= 75, `${o.text.text.length}: ${o.text.text}`);
   auditView(view, 'vote/escaped-long-option');
 });
+
+// ==================== wording that has to stay true ====================
+
+test('the Edit screen says what can be changed, without hinting at what never can', () => {
+  const poll = { id: 'p', title: 'T', creator: 'U1', questions: [question()], votes: { 0: { 0: [], 1: [] } }, status: 'active' };
+  const text = JSON.stringify(buildEditModal(poll).blocks);
+  assert.match(text, /Only the title and description can be changed/);
+  assert.doesNotMatch(text, /after votes have been cast/);
+});
+
+test('a ranking hands out no medals until someone has ranked', () => {
+  const q = { text: 'Order?', type: 'ranking', options: ['Search', 'Export', 'Share'], allowMultiple: false };
+  const fresh = { id: 'p', title: 'T', creator: 'U1', questions: [q], votes: { 0: {} }, status: 'active', showResults: 'realtime' };
+  assert.doesNotMatch(JSON.stringify(buildPollBlocks(fresh)), /🥇|🥈|🥉/);
+  const ranked = { ...fresh, votes: { 0: { UA: '2,1,3' } } };
+  assert.match(JSON.stringify(buildPollBlocks(ranked)), /🥇  \*Export\*/);
+});
+
+test('a closed poll does not talk about a future it no longer has', () => {
+  const base = { id: 'p', title: 'T', creator: 'U1', questions: [question()], votes: { 0: { 0: [], 1: [] } }, showResults: 'on_close' };
+  const closed = { ...base, status: 'closed' };
+  const more = JSON.stringify(buildMoreModal(closed, 'U1', 'C1').blocks);
+  assert.match(more, /Final results are out/);
+  assert.doesNotMatch(more, /after the poll closes|until it closes|Live results/);
+  assert.doesNotMatch(JSON.stringify(buildPollBlocks(closed)), /No votes yet/);
+  assert.match(JSON.stringify(buildPollBlocks({ ...base, status: 'active', showResults: 'realtime' })), /No votes yet/);
+  assert.match(JSON.stringify(buildMoreModal({ ...base, status: 'active' }, 'U1', 'C1').blocks), /Results after the poll closes/);
+});
+
+test('every agree scale runs the same way: 1 is Strongly Disagree', () => {
+  const agree = buildQuestion('Ship it?', 'agree_disagree', '').options;
+  assert.deepStrictEqual(agree, ['Strongly Disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly Agree']);
+  assert.match(views.LIKERT_SCALE[0].label, /Strongly Disagree/);
+  assert.match(views.LIKERT_SCALE[4].label, /Strongly Agree/);
+});
