@@ -14,7 +14,8 @@
 //   - the shape of rows: JSON columns are TEXT, close_at and created_at are
 //     Dates, booleans are booleans.
 //
-// Faults can be injected (fail the next statement matching a pattern) and time
+// Faults can be injected (fail the next statement matching a pattern), someone
+// else's action can be run in the gap before a statement (`before`), and time
 // is a clock the test owns: `latencyMs` advances it per statement, which is how
 // a slow cold database eats Slack's three-second window without a test waiting.
 
@@ -24,11 +25,14 @@ const COLUMNS = [
   'show_results', 'order_by_votes', 'message_refs', 'notify_on_close', 'co_creators', 'team_id'
 ];
 
+const matches = (pattern, sql) => (pattern instanceof RegExp ? pattern.test(sql) : sql.includes(pattern));
+
 class Lock {
-  constructor() { this.owner = null; this.queue = []; }
+  constructor(onWait = () => {}) { this.owner = null; this.queue = []; this.onWait = onWait; }
   async acquire(owner) {
     if (this.owner === owner) return;
     if (this.owner === null) { this.owner = owner; return; }
+    this.onWait();
     await new Promise(resolve => this.queue.push(resolve));
     this.owner = owner;
   }
@@ -48,6 +52,9 @@ class FakeDb {
     this.locks = new Map();
     this.latencyMs = 0;
     this.faults = [];
+    this.hooks = [];
+    this.blocked = null;             // set while a hook runs: called if it waits on a lock
+    this.started = [];               // what hooks started, for settle()
     this.statements = [];            // every statement run, for assertions
     this.nextTxn = 1;
   }
@@ -55,6 +62,12 @@ class FakeDb {
   // ---- test controls ----
   failNext(pattern, error = new Error('fake-pg: injected failure'), { times = 1 } = {}) {
     this.faults.push({ pattern, error, times });
+  }
+  // Runs `fn` just before the next statement matching `pattern` (passing over
+  // the first `skip` matches): how a test puts someone else's action into the
+  // gap between two of the bot's own statements.
+  before(pattern, fn, { skip = 0 } = {}) {
+    this.hooks.push({ pattern, fn, skip });
   }
   rows() { return [...this.polls.values()]; }
   row(id) { return this.polls.get(id); }
@@ -67,17 +80,33 @@ class FakeDb {
 
   // ---- internals ----
   lockFor(id) {
-    if (!this.locks.has(id)) this.locks.set(id, new Lock());
+    if (!this.locks.has(id)) this.locks.set(id, new Lock(() => this.blocked && this.blocked()));
     return this.locks.get(id);
   }
   tick() { if (this.latencyMs) this.clock.advance(this.latencyMs); }
   maybeFail(sql) {
-    const i = this.faults.findIndex(f => (f.pattern instanceof RegExp ? f.pattern.test(sql) : sql.includes(f.pattern)));
+    const i = this.faults.findIndex(f => matches(f.pattern, sql));
     if (i < 0) return;
     const f = this.faults[i];
     if (--f.times <= 0) this.faults.splice(i, 1);
     throw f.error;
   }
+  async runHook(sql) {
+    const i = this.hooks.findIndex(h => matches(h.pattern, sql));
+    if (i < 0) return;
+    const h = this.hooks[i];
+    if (h.skip-- > 0) return;
+    // Removed before it runs: what it does may send the same statement.
+    this.hooks.splice(i, 1);
+    // If it has to wait for a row the bot holds, the bot goes first and it
+    // finishes afterwards - waiting for it here would be a deadlock.
+    const waits = new Promise(resolve => { this.blocked = resolve; });
+    const run = Promise.resolve().then(h.fn);
+    this.started.push(run);
+    try { await Promise.race([run, waits]); } finally { this.blocked = null; }
+  }
+  // Waits for everything `before` started, for a test to call before it looks.
+  async settle() { await Promise.all(this.started); }
 }
 
 class FakePool {
@@ -123,6 +152,7 @@ class FakeClient {
   async query(rawSql, params = []) {
     const db = this.db;
     const sql = rawSql.replace(/\s+/g, ' ').trim();
+    await db.runHook(sql);
     db.statements.push({ sql, params });
     db.maybeFail(sql);
     db.tick();
