@@ -1013,3 +1013,13 @@ test('an anonymous poll does not name its voters in the export', () => {
   assert.ok(!csv.includes('U7'), 'an anonymous export must not carry user ids');
   assert.ok(csv.includes('(anonymous)'));
 });
+
+test('a long choice with an ampersand still fits Slack\'s option limit once escaped', () => {
+  const long = 'Research & Development offsite in Q3 at the downtown venue near the office';
+  const multi = { ...buildQuestion('Which?', 'multiple_choice', `${long} & more\nOther`), type: 'multiple_select', allowMultiple: true };
+  const view = buildVoteModal(poll({ questions: [multi], votes: {} }));
+  const boxes = view.blocks.flatMap(b => b.element?.type === 'checkboxes' ? b.element.options : []);
+  assert.ok(boxes.length, 'rendered as checkboxes');
+  for (const o of boxes) assert.ok(o.text.text.length <= 75, `${o.text.text.length}: ${o.text.text}`);
+  auditView(view, 'vote/escaped-long-option');
+});

@@ -447,7 +447,6 @@ scenario('a poll cannot be created with a close time that has already passed', a
   const ama = sim.user('UAMA');
   const made = await ama.createPoll({ questions: [LUNCH()], closeAt: new Date(Date.now() - 3600000).toISOString() });
   assert.strictEqual(made.messageRefs.length, 0, 'it was posted as an active poll');
-  assert.match(ama.dms().map(m => m.text).join(' '), /already passed/);
 });
 
 scenario('the options screen refuses a close time that has already passed', async sim => {
@@ -456,6 +455,15 @@ scenario('the options screen refuses a close time that has already passed', asyn
   await ama.press('compose_options', {});
   const r = await ama.submit({ poll_close_at: { value: { type: 'datetimepicker', selected_date_time: Math.floor(Date.now() / 1000) - 60 } } });
   assert.deepStrictEqual(Object.keys(r.viewErrors || {}), ['poll_close_at']);
+});
+
+scenario('Post from the preview keeps the draft when the close time has passed', async sim => {
+  const ama = sim.user('UAMA');
+  const meta = { channelId: 'C1', userId: 'UAMA', savedQuestions: [LUNCH()], closeAt: new Date(Date.now() - 60000).toISOString() };
+  const r = await ama.submitDirect('poll_preview_submit', { privateMetadata: JSON.stringify(meta) });
+  assert.strictEqual(r.ackPayload?.response_action, 'update', 'the screens were cleared, and the draft with them');
+  assert.match(text(r.ackPayload.view.blocks), /already passed/);
+  assert.strictEqual(sim.db.rows().length, 0);
 });
 
 scenario('Post refuses a close time that passed while the poll was being written', async sim => {

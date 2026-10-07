@@ -475,16 +475,17 @@ async function updatePollMessage(client, poll) {
   const running = refreshing.get(poll.id);
   if (running) {
     running.again = true;
+    running.poll = poll;
     return running.done;
   }
-  const state = { again: false };
+  const state = { again: false, poll };
   refreshing.set(poll.id, state);
   state.done = (async () => {
-    let latest = poll;
     try {
       do {
         state.again = false;
-        latest = (await getPoll(poll.id).catch(() => null)) || latest;
+        // If the read fails, the newest poll a caller handed over is next best.
+        const latest = (await getPoll(poll.id).catch(() => null)) || state.poll;
         const blocks = buildPollBlocks(latest);
         await Promise.allSettled(pollMessageRefs(latest).map(({ channelId, messageTs }) =>
           client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollTitleMrkdwn(latest)}`, blocks })
@@ -1318,6 +1319,10 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
 // this submission - which is why ← Back no longer resets them.
 app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
   const meta = JSON.parse(view.private_metadata);
+  // Caught before the ack clears the screens, so the draft is still there to fix.
+  if (closeTimePassed(meta.closeAt)) {
+    return await ack({ response_action: 'update', view: buildNoticeModal('Close Time Passed', `⏰ ${CLOSE_TIME_PASSED} Close this to get back to your poll.`) });
+  }
   await ack({ response_action: 'clear' });
   await postComposedPoll(client, meta, body, view, context);
 });
