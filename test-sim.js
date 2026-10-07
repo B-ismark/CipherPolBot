@@ -165,6 +165,20 @@ scenario('a database waking from sleep no longer costs the first press: a Loadin
   }
 });
 
+scenario('closing the Loading screen before it fills in is not reported as a failure', async sim => {
+  const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
+  const k = sim.user('UKCLOSE');
+  sim.db.before(/^SELECT \* FROM polls WHERE id/, async () => {
+    await new Promise(r => setTimeout(r, 1000));
+    k.dismiss();
+  });
+  const r = await k.press('open_vote_modal', {}, at(made.messageRefs[0]));
+  clean(r);
+  assert.strictEqual(r.calls.filter(c => c.method === 'views.update').length, 1, 'it tried to fill it in');
+  assert.strictEqual(k.top, null, 'and left it closed');
+  assert.deepStrictEqual(r.ephemerals, [], 'nobody is told something went wrong');
+});
+
 scenario('a press that reaches the bot too late to open anything is told to press again', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
   const ref = made.messageRefs[0];

@@ -729,7 +729,13 @@ async function openScreen(client, triggerId, title, load) {
     console.error(`${title} screen failed to load:`, err);
     view = buildNoticeModal(title, `❌ Could not load this: ${err.message}`);
   }
-  await client.views.update({ view_id: opened.view.id, view });
+  try {
+    await client.views.update({ view_id: opened.view.id, view });
+  } catch (err) {
+    // Closed while it loaded: they chose to leave, so there is nothing to tell.
+    if ((err.data?.error || err.message) === 'not_found') return;
+    throw err;
+  }
 }
 
 async function handleNewPoll({ ack, body, client, respond }) {
