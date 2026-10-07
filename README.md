@@ -46,9 +46,9 @@ app already has them, they are harmless, but a fresh install does not need them.
 
 **Private channels are the one gap.** `chat:write.public` covers public channels only,
 so to post a poll into a private channel the bot must be invited to it
-(`/invite @Cipher Pol`). `groups:write` does not substitute for membership. The same
-applies to `/poll-export`: file uploads do not honour `chat:write.public`, so run it
-in a DM or in a channel the bot belongs to.
+(`/invite @Cipher Pol`). `groups:write` does not substitute for membership. File uploads
+do not honour `chat:write.public` either, so every export, `/poll-export` included,
+arrives in your DM with the bot.
 
 Click **Install to Workspace** and copy your **Bot Token** (`xoxb-...`)
 
@@ -231,7 +231,7 @@ were reaching for, and two clicks in a dropdown to get to. Change it under
 **⚙️ More options** if this poll should be quieter.
 
 Hiding the tally does not hide the ballot. With **Show results** set to *Only to
-creator* or *After close*, the options and their buttons are still listed; only
+creator, until it closes* or *After close*, the options and their buttons are still listed; only
 the counts, bars and voter names are withheld. Previously the whole option list
 went with them, which left a question in the channel with no visible answers.
 
@@ -249,7 +249,8 @@ given one, and it is never told who the other person is. So pick them under
 in your own DM with the bot with a **Send it on** button.
 
 **The More button.** Under every active poll sit two buttons, **🗳️ Vote** and
-**More**. Slack shows every reader the same copy of a message, so a Close or
+**More**; once it closes, **📊 View Results** and **More**, so the creator can
+still export from the channel. Slack shows every reader the same copy of a message, so a Close or
 Export button on it would be offered to every voter and refused to all but the
 creator. More is the same button for everyone, but what it opens is built for
 whoever pressed it:
@@ -258,8 +259,9 @@ whoever pressed it:
   poll's rules in a line (anonymous or names shown, vote changes, when results
   appear), and **Results** (unless the poll is hiding them) and **Send to another
   channel**.
-- **The creator and co-creators** also get **Export CSV** and **Close poll**, in a
-  part of the screen labelled as theirs. Both are checked again when pressed.
+- **The creator and co-creators** also get **Export CSV** and, while the poll is
+  open, **Close poll**, in a part of the screen labelled as theirs. Both are
+  checked again when pressed.
 
 **Closing a poll.** Press **More** on the poll, then **Close poll**. A poll that
 already has votes asks for confirmation first. `/polls-list` has a **🔒 Close**
@@ -307,7 +309,7 @@ are the creator's business anyway.
 ```
 /poll-export poll_1706234567_abc12345
 ```
-→ Exports results as a CSV file, with per-voter rows for non-anonymous polls. Creator and co-creators only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
+→ Exports results as a CSV file, with per-voter rows for non-anonymous polls, into your DM with the bot. Creator and co-creators only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
 
 ```
 /poll-close poll_1706234567_abc12345

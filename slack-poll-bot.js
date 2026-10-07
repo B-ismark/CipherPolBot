@@ -297,18 +297,20 @@ const {
   MAX_POLL_TITLE_LENGTH,
   MAX_POLL_DESCRIPTION_LENGTH,
   MAX_NOTIFY_SUBSCRIBERS_PER_POLL,
+  MAX_ANSWER_LENGTH,
   MAX_SHARE_DESTINATIONS_PER_USER_PER_HOUR,
   validatePollInputs,
   canCreatePoll,
   pollCreationLimitMessage,
   checkPollCreationRateLimit,
+  releasePollCreation,
   checkShareRateLimit,
   claimNotification,
   releaseNotification,
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { getAllVoters, answeredQuestions, votingState, previousAnswers, pollMessageRefs, pollDisplayTitle } = require('./lib/poll');
+const { getAllVoters, answeredQuestions, votingState, previousAnswers, pollMessageRefs, pollDisplayTitle, escapeMrkdwn, pollTitleMrkdwn } = require('./lib/poll');
 const {
   readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
   buildOptionsModal, buildEditModal, buildPreviewModal, METADATA_FULL, readCurrentQuestion,
@@ -331,7 +333,7 @@ const {
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
   if (!notifyUsers.length) return;
-  const title = pollDisplayTitle(poll);
+  const title = pollTitleMrkdwn(poll);
   await Promise.allSettled(notifyUsers.map(async uid => {
     // Claimed before the send and handed back if it fails - the same rule the
     // picker path follows, and this is the caller likelier to need it: it fires
@@ -399,7 +401,7 @@ async function resolveChannel(client, channelId, userId) {
 // poll, so lib/destinations.js needs no opinion about blocks and the two
 // modules do not have to require each other.
 function pollMessage(poll) {
-  return { text: `📊 ${pollDisplayTitle(poll)}`, blocks: buildPollBlocks(poll) };
+  return { text: `📊 ${pollTitleMrkdwn(poll)}`, blocks: buildPollBlocks(poll) };
 }
 
 // The way to reach one person when there is no channel to answer in, or when
@@ -461,19 +463,51 @@ async function dmUser(client, userId, text) {
 
 
 
+// Polls whose messages are being refreshed right now, by id.
+const refreshing = new Map();
+
+// Brings every copy of a poll's message up to date. Two votes a moment apart
+// used to refresh from their own snapshots, and whichever reached Slack last
+// won - sometimes the older tally, which then stayed until the next vote. Now a
+// poll has one refresh at a time, each drawn from the database as it is then;
+// a call that arrives during one asks for another pass when it finishes.
 async function updatePollMessage(client, poll) {
-  const refs = pollMessageRefs(poll);
-  const blocks = buildPollBlocks(poll);
-  await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
-    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollDisplayTitle(poll)}`, blocks })
-  ));
+  const running = refreshing.get(poll.id);
+  if (running) {
+    running.again = true;
+    running.poll = poll;
+    return running.done;
+  }
+  const state = { again: false, poll };
+  refreshing.set(poll.id, state);
+  state.done = (async () => {
+    try {
+      do {
+        state.again = false;
+        // If the read fails, the newest poll a caller handed over is next best.
+        const latest = (await getPoll(poll.id).catch(() => null)) || state.poll;
+        const blocks = buildPollBlocks(latest);
+        await Promise.allSettled(pollMessageRefs(latest).map(({ channelId, messageTs }) =>
+          client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollTitleMrkdwn(latest)}`, blocks })
+        ));
+      } while (state.again);
+    } finally {
+      refreshing.delete(poll.id);
+    }
+  })();
+  return state.done;
 }
 
 
 // ==================== POLL CREATION HELPER ====================
 
+const CLOSE_TIME_PASSED = 'The close time you set has already passed. Pick a later one under ⚙️ More options.';
+function closeTimePassed(closeAt) {
+  return Boolean(closeAt) && new Date(closeAt).getTime() <= Date.now();
+}
+
 async function createAndPostPoll(client, meta, teamId = null) {
-  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false, destChannels = [], destUsers = [] } = meta;
+  const { userId } = meta;
 
   // The submission has already been acked, so nothing here is racing Slack's
   // 3-second deadline and this wait costs nothing once the bot is up.
@@ -481,8 +515,21 @@ async function createAndPostPoll(client, meta, teamId = null) {
     throw new Error('The bot is still starting up. Please try again in a few seconds.');
   }
 
-  // Rate limiting check
   await checkPollCreationRateLimit(userId);
+  try {
+    const made = await validateAndPost(client, meta, teamId);
+    if (made.nowhere) releasePollCreation(userId);
+    return made;
+  } catch (err) {
+    releasePollCreation(userId);
+    throw err;
+  }
+}
+
+// The part of creating a poll that can fail, so the allowance taken above can
+// be handed back when it does.
+async function validateAndPost(client, meta, teamId) {
+  const { channelId, userId, savedQuestions, pollTitle, pollDescription, pollSettings = [], closeAt, showResults = DEFAULT_SHOW_RESULTS, orderByVotes = false, destChannels = [], destUsers = [] } = meta;
 
   // Input validation
   const title = (pollTitle || savedQuestions[0]?.text || '').trim();
@@ -491,6 +538,7 @@ async function createAndPostPoll(client, meta, teamId = null) {
   // The screens above refuse this before it gets here; this is the floor for
   // any path that does not go through them.
   if (!ballotFits({ questions: savedQuestions, title, description })) throw new Error(BALLOT_FULL);
+  if (closeTimePassed(closeAt)) throw new Error(CLOSE_TIME_PASSED);
 
   const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
   const votes = {};
@@ -564,11 +612,18 @@ async function createAndPostPoll(client, meta, teamId = null) {
     }
   }
 
-  poll.messageRefs = toMessageRefs(posted);
-  poll.channelId = posted[0].channelId;
-  poll.messageTs = posted[0].messageTs;
-  await savePoll(poll);
-  return { poll, channel: posted[0].channelId, posted, failures: allFailures, redirected, usedFallback };
+  // Only where it went. The poll has been live since its first message
+  // landed, so a vote may already be in that row; saving the whole poll as it
+  // was built here used to wipe it, after the voter was told it counted.
+  const { rows } = await pool.query(
+    'UPDATE polls SET message_refs=(message_refs::jsonb || $1::jsonb)::text, channel_id=$2, message_ts=$3 WHERE id=$4 RETURNING *',
+    [JSON.stringify(toMessageRefs(posted)), posted[0].channelId, posted[0].messageTs, pollId]
+  );
+  const saved = rows.length ? rowToPoll(rows[0]) : { ...poll, messageRefs: toMessageRefs(posted), channelId: posted[0].channelId, messageTs: posted[0].messageTs };
+  // That early vote refreshed nothing, because the bot did not know yet where
+  // the poll was. So the copies still show none.
+  if (JSON.stringify(saved.votes) !== JSON.stringify(poll.votes)) await updatePollMessage(client, saved);
+  return { poll: saved, channel: posted[0].channelId, posted, failures: allFailures, redirected, usedFallback };
 }
 
 // ==================== HELPERS ====================
@@ -735,7 +790,7 @@ app.command('/poll-results', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!canViewResults(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: `🔒 ${resultsHiddenReason(poll)}.` });
-    await client.chat.postEphemeral({ channel, user: userId, text: `📊 Results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Poll Results', userId) });
+    await client.chat.postEphemeral({ channel, user: userId, text: `📊 Results: ${pollTitleMrkdwn(poll)}`, blocks: buildResultsBlocks(poll, 'Poll Results', userId) });
   } catch (err) {
     console.error('/poll-results error:', err);
     await dmUser(client, body.user_id, `❌ /poll-results failed: ${err.message}`);
@@ -759,7 +814,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
       user: userId,
       text: `🔒 Results for this poll are restricted (${resultsHiddenReason(poll).toLowerCase()}), so they cannot be posted to a channel yet. Close the poll with \`/poll-close ${poll.id}\` to release them - a poll's results setting cannot be changed once it is created.`
     });
-    await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
+    await client.chat.postMessage({ channel, text: `📊 Current results: ${pollTitleMrkdwn(poll)}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
     console.error('/poll-share error:', err);
     await dmUser(client, body.user_id, `❌ /poll-share failed: ${err.message}`);
@@ -846,7 +901,7 @@ app.action('list_poll_export', async ({ ack, body, client, action, respond }) =>
     if (!isCreatorOrCoCreator(poll, userId)) return await deny(`❌ Only <@${poll.creator}> can export this poll.`);
     const own = await client.conversations.open({ users: userId });
     await uploadPollCsv(client, poll, own.channel.id);
-    await deny(`⬇️ The CSV for *${poll.title}* is in your DM with me.`);
+    await deny(`⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.`);
   } catch (err) {
     console.error('list_poll_export error:', err);
     await dmUser(client, userId, `❌ Could not export that poll: ${err.message}`);
@@ -870,7 +925,7 @@ async function announceClose(client, closed, channel = closed.channelId) {
     try {
       await client.chat.postMessage({
         channel,
-        text: `🔒 Poll closed: ${pollDisplayTitle(closed)}`,
+        text: `🔒 Poll closed: ${pollTitleMrkdwn(closed)}`,
         blocks: buildResultsBlocks(closed, '🔒 Final Results')
       });
     } catch (err) {
@@ -894,11 +949,11 @@ async function finalizePollClose(client, poll, channel) {
 
 // What to tell whoever pressed Close, for each way finalizePollClose can end.
 function closeOutcomeText(poll, outcome, channel) {
-  if (!outcome) return `🔒 *${pollDisplayTitle(poll)}* was already closed - nothing more to do.`;
+  if (!outcome) return `🔒 *${pollTitleMrkdwn(poll)}* was already closed - nothing more to do.`;
   if (outcome.resultsError) {
     // A DM id renders as a broken channel link, so only channels are named.
     const where = /^[CG]/.test(channel || '') ? ` in <#${channel}>` : '';
-    return `🔒 *${pollDisplayTitle(poll)}* is closed, but I could not post its final results${where} (\`${outcome.resultsError}\`). \`/poll-results ${poll.id}\` shows them.`;
+    return `🔒 *${pollTitleMrkdwn(poll)}* is closed, but I could not post its final results${where} (\`${outcome.resultsError}\`). \`/poll-results ${poll.id}\` shows them.`;
   }
   return null;
 }
@@ -942,6 +997,8 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
+    // Its final results are already out under this title.
+    if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: `🔒 *${pollTitleMrkdwn(poll)}* has closed, so it can no longer be edited.` });
     await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
   } catch (err) {
     console.error('/poll-edit error:', err);
@@ -959,7 +1016,7 @@ async function uploadPollCsv(client, poll, channel) {
     filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
     content: buildPollCsv(poll),
     title: `Results: ${poll.title}`,
-    initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
+    initial_comment: `📊 Export for poll: *${pollTitleMrkdwn(poll)}*  ·  ID: \`${poll.id}\``
   });
 }
 
@@ -973,7 +1030,11 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
-    await uploadPollCsv(client, poll, channel);
+    // To the DM, like the Export buttons: an upload to a channel the bot was
+    // never invited to fails, which is most public channels.
+    const own = await client.conversations.open({ users: userId });
+    await uploadPollCsv(client, poll, own.channel.id);
+    await client.chat.postEphemeral({ channel, user: userId, text: `⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.` });
   } catch (err) {
     console.error('/poll-export error:', err);
     await dmUser(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
@@ -1184,6 +1245,11 @@ app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => 
     ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)]
     : [...(meta.savedQuestions || [])];
 
+  // Set in the future on More options, but that was a while ago.
+  if (closeTimePassed(meta.closeAt)) {
+    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: CLOSE_TIME_PASSED } });
+  }
+
   // Still the ack, so still an inline error, on the field where cutting starts.
   if (!ballotFits({ questions: savedQuestions, title: meta.pollTitle, description: meta.pollDescription })) {
     return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: BALLOT_FULL } });
@@ -1200,6 +1266,11 @@ app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => 
 app.view('poll_options_submit', async ({ ack, body, view, client }) => {
   const meta = JSON.parse(view.private_metadata);
   const merged = { ...meta, ...readOptionsSettings(view.state.values, meta) };
+  // A close time already gone would post an open poll that shuts at the next
+  // sweep or the first vote, with nothing to say why.
+  if (closeTimePassed(merged.closeAt)) {
+    return await ack({ response_action: 'errors', errors: { poll_close_at: 'Pick a time in the future.' } });
+  }
   await ack();
 
   // Acking pops this screen off and reveals the compose screen, which is then
@@ -1248,6 +1319,10 @@ app.view('question_submit', async ({ ack, body, view, client }) => {
 // this submission - which is why ← Back no longer resets them.
 app.view('poll_preview_submit', async ({ ack, body, view, client, context }) => {
   const meta = JSON.parse(view.private_metadata);
+  // Caught before the ack clears the screens, so the draft is still there to fix.
+  if (closeTimePassed(meta.closeAt)) {
+    return await ack({ response_action: 'update', view: buildNoticeModal('Close Time Passed', `⏰ ${CLOSE_TIME_PASSED} Close this to get back to your poll.`) });
+  }
   await ack({ response_action: 'clear' });
   await postComposedPoll(client, meta, body, view, context);
 });
@@ -1325,23 +1400,54 @@ app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
     return await ack({ response_action: 'errors', errors: { edit_description: `Description exceeds maximum length of ${MAX_POLL_DESCRIPTION_LENGTH} characters.` } });
   }
 
+  // Same deadline as a vote: the result goes in the ack when the save is
+  // quick, and a holding screen goes there when it is not. Refreshing every
+  // copy of the poll waits until after, so it can never be the reason the
+  // creator sees "trouble connecting" on an edit that saved.
+  const work = saveEdit(pollId, newTitle, newDesc);
+  let timer;
+  const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), VOTE_ACK_DEADLINE_MS); });
+  let outcome = await Promise.race([work, deadline]);
+  clearTimeout(timer);
+
+  if (outcome) {
+    await ack({ response_action: 'update', view: outcome.view });
+  } else {
+    await ack({ response_action: 'update', view: buildNoticeModal('Saving', '⏳ Saving your edit…') });
+    const ackedAt = Date.now();
+    outcome = await work;
+    const gap = VOTE_UPDATE_SPACING_MS - (Date.now() - ackedAt);
+    if (gap > 0) await new Promise(resolve => setTimeout(resolve, gap));
+    try {
+      await client.views.update({ view_id: view.id, view: outcome.view });
+    } catch (err) {
+      console.warn('edit result view failed:', err.data?.error || err.message);
+    }
+  }
+  if (outcome.poll) await updatePollMessage(client, outcome.poll);
+});
+
+// Writes the title and description and nothing else, so a vote or a close
+// that lands meanwhile is not undone - and only while the poll is open, so an
+// edit can never reopen one. Never throws: every ending is a screen.
+async function saveEdit(pollId, title, description) {
   try {
-    const poll = await getPoll(pollId);
-    if (!poll) { await ack(); return; }
-    const updated = { ...poll, title: newTitle, description: newDesc };
-    await savePoll(updated);
-    await updatePollMessage(client, updated);
-    await ack({ response_action: 'update', view: {
-      type: 'modal',
-      title: { type: 'plain_text', text: 'Poll Updated' },
-      close: { type: 'plain_text', text: 'Close' },
-      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${newTitle}* has been updated.` } }]
-    }});
+    const { rows } = await pool.query(
+      "UPDATE polls SET title=$1, description=$2 WHERE id=$3 AND status='active' RETURNING *",
+      [title, description, pollId]
+    );
+    if (!rows.length) {
+      return { view: buildNoticeModal('Poll Closed', '🔒 This poll has closed, so it can no longer be edited. Nothing was changed.') };
+    }
+    return {
+      poll: rowToPoll(rows[0]),
+      view: buildNoticeModal('Poll Updated', `✅ *${escapeMrkdwn(title)}* has been updated.`)
+    };
   } catch (err) {
     console.error('poll_edit_submit error:', err);
-    await ack();
+    return { view: buildNoticeModal('Edit Not Saved', '⚠️ Something went wrong saving your edit. Nothing was changed - please try again.') };
   }
-});
+}
 
 app.action('share_poll', async ({ ack, body, client, action, respond }) => {
   await ack();
@@ -1383,18 +1489,20 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
 
     if (!fresh.length && !failures.length) {
       return await dmUser(client, actor, targets.length
-        ? `⚠️ *${pollDisplayTitle(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
+        ? `⚠️ *${pollTitleMrkdwn(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
         : '⚠️ Pick at least one channel or person to send the poll to.');
     }
 
     const { posted, failures: postFailures } = await postPollTo(client, pollMessage(poll), fresh);
     if (posted.length) {
-      const refs = [...(poll.messageRefs || []), ...toMessageRefs(posted)];
-      await pool.query('UPDATE polls SET message_refs=$1 WHERE id=$2', [JSON.stringify(refs), pollId]);
+      // Appended rather than rewritten, so two people sending at once both keep
+      // their copy on record - a forgotten copy never updates again.
+      await pool.query('UPDATE polls SET message_refs=(message_refs::jsonb || $1::jsonb)::text WHERE id=$2',
+        [JSON.stringify(toMessageRefs(posted)), pollId]);
     }
 
     const parts = [];
-    if (posted.length) parts.push(`✅ *${pollDisplayTitle(poll)}* sent to ${posted.map(p => p.label).join(', ')}.`);
+    if (posted.length) parts.push(`✅ *${pollTitleMrkdwn(poll)}* sent to ${posted.map(p => p.label).join(', ')}.`);
     const allFailures = [...failures, ...postFailures];
     if (allFailures.length) {
       // Same durable record as the create path: a share can refuse for every
@@ -1628,7 +1736,7 @@ async function recordVote({ pollId, userId, values, wantsNotify }) {
       if (!block) return;
       if (q.type === 'open_ended') {
         const text = block.response?.value;
-        if (text) poll.votes[qi][userId] = text;
+        if (text) poll.votes[qi][userId] = text.slice(0, MAX_ANSWER_LENGTH);
       } else if (q.allowMultiple) {
         (block.selected?.selected_options || []).forEach(opt => {
           const oi = parseInt(opt.value);
@@ -1749,13 +1857,13 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
       if (picked(qv[oi])) {
         if (!poll.allowRevote) {
           await dbClient.query('ROLLBACK');
-          return await tell(`🔒 You already picked *${q.options[oi]}*, and the creator turned off vote changes.`);
+          return await tell(`🔒 You already picked *${escapeMrkdwn(q.options[oi])}*, and the creator turned off vote changes.`);
         }
         qv[oi] = (qv[oi] || []).filter(id => id !== userId);
-        note = `Took back your vote for *${q.options[oi]}*.`;
+        note = `Took back your vote for *${escapeMrkdwn(q.options[oi])}*.`;
       } else {
         qv[oi] = [...(qv[oi] || []), userId];
-        note = `Added your vote for *${q.options[oi]}*.`;
+        note = `Added your vote for *${escapeMrkdwn(q.options[oi])}*.`;
       }
     } else {
       if (answered && !poll.allowRevote) {
@@ -1768,11 +1876,11 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
         // poll there is nothing worth a line. The dropdown is still reset in the
         // finally below, and the rollback above has already released the row.
         if (poll.anonymous) return;
-        return await tell(`✅ You already voted for *${q.options[oi]}* - nothing changed.`);
+        return await tell(`✅ You already voted for *${escapeMrkdwn(q.options[oi])}* - nothing changed.`);
       }
       Object.keys(qv).forEach(k => { qv[k] = (qv[k] || []).filter(id => id !== userId); });
       qv[oi] = [...(qv[oi] || []), userId];
-      note = `Your vote for *${q.options[oi]}* is in.`;
+      note = `Your vote for *${escapeMrkdwn(q.options[oi])}* is in.`;
     }
 
     const voteTimestamps = poll.voteTimestamps || {};
@@ -1955,7 +2063,7 @@ moreAction('more_export', 'export that poll', async ({ poll, userId, client, not
   if (!isCreatorOrCoCreator(poll, userId)) return await notice('Export', `❌ Only <@${poll.creator}> can export this poll.`);
   const own = await client.conversations.open({ users: userId });
   await uploadPollCsv(client, poll, own.channel.id);
-  await notice('Export', `⬇️ The CSV for *${pollDisplayTitle(poll)}* is in your DM with me.`);
+  await notice('Export', `⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.`);
 });
 
 moreAction('more_close', 'close the poll', async ({ poll, userId, client, push, notice, channelId }) => {
@@ -1964,7 +2072,7 @@ moreAction('more_close', 'close the poll', async ({ poll, userId, client, push, 
   const participants = getAllVoters(poll).size;
   if (participants > 0) return await push(buildCloseConfirmModal(poll, channelId, participants));
   const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channelId), channelId);
-  await notice('Close poll', said || `🔒 *${pollDisplayTitle(poll)}* is closed.`);
+  await notice('Close poll', said || `🔒 *${pollTitleMrkdwn(poll)}* is closed.`);
 });
 
 // Confirmation modal shown by the Close button and by /poll-close when the poll
