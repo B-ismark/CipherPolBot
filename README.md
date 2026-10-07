@@ -34,7 +34,7 @@ Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these six:
 | `chat:write.public` | Posting to a public channel without being invited to it first |
 | `im:write` | Opening a DM — polls sent to people, polls created in DMs, close notifications, error reports |
 | `files:write` | The CSV from `/poll-export` |
-| `users:read` | Names in the CSV export, beside each person's Slack ID (without it, the export shows the IDs alone) |
+| `users:read` | Names in the CSV export, beside each person's Slack ID (without it, the export shows the IDs alone). It lets the bot look up member names and profiles - not email addresses |
 
 That is the complete set: those are the only Slack methods the bot calls
 (`chat.postMessage`, `chat.postEphemeral`, `chat.update`, `conversations.open`,
@@ -52,6 +52,8 @@ do not honour `chat:write.public` either, so every export, `/poll-export` includ
 arrives in your DM with the bot.
 
 Click **Install to Workspace** and copy your **Bot Token** (`xoxb-...`)
+
+**Upgrading an install from before `users:read`:** add the scope, then click **reinstall your app** in the banner Slack shows (in multi-workspace mode, open `/slack/install` again in each workspace). Nothing else changes - the bot stays in its channels and the token normally stays the same. Until then, exports work as before, with IDs only.
 
 ### 3. Copy your Signing Secret
 
@@ -573,5 +575,6 @@ Org-wide (Enterprise Grid) installs work too: one installation covers the org, k
 | ngrok URL changed | Update Request URLs in Slack app settings |
 | Bot exits at boot with a DB error | Check `DATABASE_URL`; the bot retries five times, then exits so the host restarts it |
 | `self signed certificate` on connect | The database is not presenting a trusted certificate. Use managed Postgres, or `sslmode=no-verify` for local dev only |
+| CSV shows Slack IDs, no names | The app predates `users:read`: add it and reinstall (see Add Bot Token Scopes). The log says which: `CSV export: 0 of N named … users:read` |
 | Can't create polls in DMs | Add `im:write` and `im:history` scopes, then reinstall the app |
 | Picked people get no DM | The confirmation names Slack's own error per person, a DM repeats it so it outlives a reload, and the same line goes to the log — which is the one that survives when DMs are themselves the problem. `missing_scope` means the app predates `im:write` and must be reinstalled; `user_disabled` or `cannot_dm_bot` means the pick was not a reachable person; a capped recipient clears within the hour |
