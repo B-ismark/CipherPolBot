@@ -705,9 +705,17 @@ async function reportButtonFailure({ respond, client, userId, err, doing }) {
 // `load` returns the finished view, or throws. A throw before the placeholder
 // is up reaches the caller as it always did; one after it is shown on the
 // placeholder, since that is what the person is looking at.
+//
+// Some presses end in a message rather than a screen ("already closed", or a
+// poll with no votes closing straight away). For those `load` returns
+// { say: text } instead of a view: sent with `say` when it was quick, as it
+// always was, and shown on the placeholder when that is already up - or sent
+// with `say` after all, when the placeholder could not be opened or filled.
+// { say: null, shown: text } says nothing when quick - the outcome speaks for
+// itself - and puts `shown` on the placeholder, which has to say something.
 const OPEN_SCREEN_WAIT_MS = 800;
 
-async function openScreen(client, triggerId, title, load) {
+async function openScreen(client, triggerId, title, load, { say, doing = 'load this' } = {}) {
   const work = Promise.resolve().then(load);
   // Settled later than the race below may look, so never left unhandled.
   work.catch(() => {});
@@ -719,19 +727,42 @@ async function openScreen(client, triggerId, title, load) {
   } finally {
     clearTimeout(timer);
   }
-  if (quick) return client.views.open({ trigger_id: triggerId, view: quick.view });
+  if (quick) {
+    if (!('say' in quick.view)) return client.views.open({ trigger_id: triggerId, view: quick.view });
+    if (quick.view.say) await say(quick.view.say);
+    return;
+  }
 
-  const opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
-  let view;
+  // A message never needed the trigger, so it must not come to depend on one:
+  // when there is no screen to show it on, it goes out the way it always did.
+  // By then the work behind it (a poll closing) may already be done.
+  const sayInstead = async result => {
+    if (!result || !('say' in result)) return false;
+    if (result.say) await say(result.say);
+    return true;
+  };
+
+  let opened;
   try {
-    view = await work;
+    opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
+  } catch (err) {
+    // Too late even for the placeholder.
+    const result = await work.catch(e => { console.error(`${title} screen failed to load:`, e); return null; });
+    if (await sayInstead(result)) return;
+    throw err;
+  }
+  let result, view;
+  try {
+    result = await work;
+    view = 'say' in result ? buildNoticeModal(title, result.say || result.shown) : result;
   } catch (err) {
     console.error(`${title} screen failed to load:`, err);
-    view = buildNoticeModal(title, `❌ Could not load this: ${err.message}`);
+    view = buildNoticeModal(title, `❌ Could not ${doing}: ${err.message}`);
   }
   try {
     await client.views.update({ view_id: opened.view.id, view });
   } catch (err) {
+    if (await sayInstead(result)) return;
     // Closed while it loaded: they chose to leave, so there is nothing to tell.
     if ((err.data?.error || err.message) === 'not_found') return;
     throw err;
@@ -1001,49 +1032,52 @@ function closeOutcomeText(poll, outcome, channel) {
 
 app.command('/poll-close', async ({ ack, body, client }) => {
   await ack();
+  const userId = body.user_id;
+  let channel;
+  const say = text => client.chat.postEphemeral({ channel, user: userId, text });
   try {
-    const userId = body.user_id;
-    const channel = await resolveChannel(client, body.channel_id, userId);
-    const pollId = body.text.trim().replace(/`/g, '');
-    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-close POLL_ID`' });
-    const poll = await getPoll(pollId);
-    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can close this poll.' });
-    if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: '⚠️ This poll is already closed.' });
+    await openScreen(client, body.trigger_id, 'Close poll', async () => {
+      channel = await resolveChannel(client, body.channel_id, userId);
+      const pollId = body.text.trim().replace(/`/g, '');
+      if (!pollId) return { say: '❌ Usage: `/poll-close POLL_ID`' };
+      const poll = await getPoll(pollId);
+      if (!poll) return { say: `❌ Poll not found: \`${pollId}\`` };
+      if (!isCreator(poll, userId)) return { say: '❌ Only the poll creator can close this poll.' };
+      if (poll.status === 'closed') return { say: '⚠️ This poll is already closed.' };
 
-    const participants = getAllVoters(poll).size;
-    // Require confirmation when votes exist (error prevention)
-    if (participants > 0) {
-      return client.views.open({
-        trigger_id: body.trigger_id,
-        view: buildCloseConfirmModal(poll, channel, participants)
-      });
-    }
+      const participants = getAllVoters(poll).size;
+      // Require confirmation when votes exist (error prevention)
+      if (participants > 0) return buildCloseConfirmModal(poll, channel, participants);
 
-    const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channel), channel);
-    if (said) await client.chat.postEphemeral({ channel, user: userId, text: said });
+      const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channel), channel);
+      return { say: said, shown: `🔒 *${pollTitleMrkdwn(poll)}* is closed.` };
+    }, { say, doing: 'close the poll' });
   } catch (err) {
     console.error('/poll-close error:', err);
-    await dmUser(client, body.user_id, `❌ /poll-close failed: ${err.message}`);
+    await dmUser(client, userId, isExpiredTrigger(err) ? WAKE_UP_MESSAGE : `❌ /poll-close failed: ${err.message}`);
   }
 });
 
 app.command('/poll-edit', async ({ ack, body, client }) => {
   await ack();
+  const userId = body.user_id;
+  let channel;
+  const say = text => client.chat.postEphemeral({ channel, user: userId, text });
   try {
-    const userId = body.user_id;
-    const channel = await resolveChannel(client, body.channel_id, userId);
-    const pollId = body.text.trim().replace(/`/g, '');
-    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-edit POLL_ID`' });
-    const poll = await getPoll(pollId);
-    if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
-    if (!isCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can edit this poll.' });
-    // Its final results are already out under this title.
-    if (poll.status === 'closed') return client.chat.postEphemeral({ channel, user: userId, text: `🔒 *${pollTitleMrkdwn(poll)}* has closed, so it can no longer be edited.` });
-    await client.views.open({ trigger_id: body.trigger_id, view: buildEditModal(poll) });
+    await openScreen(client, body.trigger_id, 'Edit poll', async () => {
+      channel = await resolveChannel(client, body.channel_id, userId);
+      const pollId = body.text.trim().replace(/`/g, '');
+      if (!pollId) return { say: '❌ Usage: `/poll-edit POLL_ID`' };
+      const poll = await getPoll(pollId);
+      if (!poll) return { say: `❌ Poll not found: \`${pollId}\`` };
+      if (!isCreator(poll, userId)) return { say: '❌ Only the poll creator can edit this poll.' };
+      // Its final results are already out under this title.
+      if (poll.status === 'closed') return { say: `🔒 *${pollTitleMrkdwn(poll)}* has closed, so it can no longer be edited.` };
+      return buildEditModal(poll);
+    }, { say, doing: 'open the poll for editing' });
   } catch (err) {
     console.error('/poll-edit error:', err);
-    await dmUser(client, body.user_id, `❌ /poll-edit failed: ${err.message}`);
+    await dmUser(client, userId, isExpiredTrigger(err) ? WAKE_UP_MESSAGE : `❌ /poll-edit failed: ${err.message}`);
   }
 });
 
@@ -1982,28 +2016,23 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
   const deny = text => respond({ response_type: 'ephemeral', replace_original: false, text });
 
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) return await deny('❌ That poll no longer exists.');
-    if (!isCreator(poll, userId)) {
-      return await deny(`❌ Only <@${poll.creator}> can close this poll.`);
-    }
-    if (poll.status === 'closed') return await deny('⚠️ This poll is already closed.');
+    await openScreen(client, body.trigger_id, 'Close poll', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) return { say: '❌ That poll no longer exists.' };
+      if (!isCreator(poll, userId)) return { say: `❌ Only <@${poll.creator}> can close this poll.` };
+      if (poll.status === 'closed') return { say: '⚠️ This poll is already closed.' };
 
-    // Final results belong where the poll was being read, not necessarily where
-    // it was first posted - the same poll can be in several channels. But this
-    // button is on the poll lists now as well, and those can be run anywhere:
-    // a click from a channel the poll was never posted to falls back to the
-    // poll's own channel rather than dropping its results into a bystander.
-    const channel = closeChannelFor(poll, body.channel?.id);
-    const participants = getAllVoters(poll).size;
-    if (participants > 0) {
-      return await client.views.open({
-        trigger_id: body.trigger_id,
-        view: buildCloseConfirmModal(poll, channel, participants)
-      });
-    }
-    const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channel), channel);
-    if (said) await deny(said);
+      // Final results belong where the poll was being read, not necessarily where
+      // it was first posted - the same poll can be in several channels. But this
+      // button is on the poll lists now as well, and those can be run anywhere:
+      // a click from a channel the poll was never posted to falls back to the
+      // poll's own channel rather than dropping its results into a bystander.
+      const channel = closeChannelFor(poll, body.channel?.id);
+      const participants = getAllVoters(poll).size;
+      if (participants > 0) return buildCloseConfirmModal(poll, channel, participants);
+      const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channel), channel);
+      return { say: said, shown: `🔒 *${pollTitleMrkdwn(poll)}* is closed.` };
+    }, { say: deny, doing: 'close the poll' });
   } catch (err) {
     console.error('close_poll error:', err);
     await reportButtonFailure({ respond, client, userId, err, doing: 'close the poll' });
