@@ -1043,11 +1043,61 @@ test('a quote in an answer does not break the row', () => {
 test('the export names whoever wrote an answer, with the id kept beside it', () => {
   const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
   const p = poll({ questions: [open, question()], votes: { 0: { U7: 'Fine', U8: 'Meh' }, 1: { 0: ['U9'] } } });
-  assert.deepStrictEqual(csvVoterIds(p), ['U7', 'U8'], 'only people the CSV lists by name');
+  assert.deepStrictEqual(csvVoterIds(p).sort(), ['U7', 'U8', 'U9'], 'everyone who answered anything');
   const csv = buildPollCsv(p, { U7: '=Ama' });
   assert.ok(csv.includes(`"'=Ama (U7)","Fine"`), 'named, id kept, and a name is no formula');
   assert.ok(csv.includes('"U8","Meh"'), 'no name found: the id alone');
   assert.deepStrictEqual(csvVoterIds({ ...p, anonymous: true }), [], 'an anonymous poll looks nobody up');
+});
+
+test('the export lists who answered what, for every kind of question', () => {
+  const qs = [
+    { text: 'Lunch?', type: 'yes_no', options: ['Yes', 'No'], allowMultiple: false },
+    { text: 'Toppings?', type: 'multiple_choice', options: ['Cheese', 'Olives', 'Ham'], allowMultiple: true },
+    { text: 'Rate it', type: 'likert', options: ['Fast', 'Cheap'], allowMultiple: false },
+    { text: 'Order?', type: 'ranking', options: ['Search', 'Export', 'Share'], allowMultiple: false },
+    { text: 'Why?', type: 'open_ended', options: [], allowMultiple: false }
+  ];
+  const p = poll({
+    questions: qs,
+    votes: {
+      0: { 0: ['UB'], 1: ['UA'] },
+      1: { 0: ['UA'], 2: ['UA'] },
+      2: { 0: { 4: ['UA'] }, 1: { 0: ['UA'] } },
+      3: { UA: '2,1,0' },
+      4: { UA: 'Hungry' }
+    },
+    voteTimestamps: { UA: '2026-10-07T12:04:00.000Z' }
+  });
+  const csv = buildPollCsv(p, { UA: 'Ama Mensah', UB: 'Kofi' });
+  const after = csv.split('\n"Responses"\n')[1];
+  assert.ok(after, 'a Responses section follows the totals');
+  const lines = after.split('\n');
+  assert.strictEqual(lines[0], '"Person","Slack ID","Question","Answer","Voted At"');
+  assert.deepStrictEqual(lines.slice(1), [
+    '"Ama Mensah","UA","Lunch?","No","2026-10-07T12:04:00.000Z"',
+    '"Ama Mensah","UA","Toppings?","Cheese; Ham","2026-10-07T12:04:00.000Z"',
+    '"Ama Mensah","UA","Rate it — Fast","5 — Strongly Agree","2026-10-07T12:04:00.000Z"',
+    '"Ama Mensah","UA","Rate it — Cheap","1 — Strongly Disagree","2026-10-07T12:04:00.000Z"',
+    '"Ama Mensah","UA","Order?","1. Export; 2. Search","2026-10-07T12:04:00.000Z"',
+    '"Ama Mensah","UA","Why?","Hungry","2026-10-07T12:04:00.000Z"',
+    '"Kofi","UB","Lunch?","Yes",""'
+  ]);
+  assert.ok(csv.startsWith('\uFEFF"Question","Type"'), 'the totals still come first, marked as UTF-8 for Excel');
+});
+
+test('an anonymous written answer carries no time that could name its writer', () => {
+  const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
+  const p = poll({ questions: [open], votes: { 0: { U7: 'Fine' } }, voteTimestamps: { U7: '2026-10-07T12:04:00.000Z' } });
+  assert.ok(!buildPollCsv({ ...p, anonymous: true }).includes('2026-10-07'));
+  assert.ok(buildPollCsv(p).includes('2026-10-07'), 'a named poll keeps it');
+});
+
+test('an anonymous poll, or one nobody answered, has no Responses section', () => {
+  const p = poll({ votes: { 0: { 0: ['UA'] } } });
+  assert.ok(!buildPollCsv({ ...p, anonymous: true }).includes('Responses'));
+  assert.ok(!buildPollCsv({ ...p, anonymous: true }).includes('UA'));
+  assert.ok(!buildPollCsv(poll({ votes: {} })).includes('Responses'));
 });
 
 test('an anonymous poll does not name its voters in the export', () => {

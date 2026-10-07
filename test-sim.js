@@ -457,6 +457,17 @@ scenario('the CSV names the people who wrote answers, and keeps their Slack ID b
   assert.match(sim.slack.files.at(-1).content, /"Person UK \(UK\)","Loved it"/);
 });
 
+scenario('a Yes/No poll\'s export says who voted which way', async sim => {
+  const ama = sim.user('UAMA'), k = sim.user('UK'), e = sim.user('UE');
+  const made = await ama.createPoll({ questions: [{ text: 'Is it lunch?', type: 'yes_no', options: ['Yes', 'No'], allowMultiple: false }] });
+  clean(await k.press('vote_option_0_0', {}, at(made.messageRefs[0])));
+  clean(await e.press('vote_option_0_1', {}, at(made.messageRefs[0])));
+  clean(await ama.command('/poll-export', made.id));
+  const csv = sim.slack.files.at(-1).content;
+  assert.match(csv, /"Person UE","UE","Is it lunch\?","No"/);
+  assert.match(csv, /"Person UK","UK","Is it lunch\?","Yes"/);
+});
+
 scenario('before the app is reinstalled with users:read, the CSV still goes out, with IDs alone', async sim => {
   const ama = sim.user('UAMA'), k = sim.user('UK');
   const made = await ama.createPoll({ questions: [{ text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false }] });
