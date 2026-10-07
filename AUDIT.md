@@ -115,14 +115,14 @@ modal immediately (no database call), then `views.update` it with the real
 content. Only the *pressed* button needs the trigger; the slow work does not.
 Built for the buttons on the poll message (Vote, More, View Results, and the
 older Send): if the poll has not loaded within 0.8 seconds, a "Loading…" screen
-opens and is filled in when it has. Then extended to `/poll-edit`, `/poll-close`
-and the Close button on poll lists, whose "are you sure?" screen fills the
-placeholder the same way; when one of them ends in a message instead (poll not
-found, already closed), the message goes on the placeholder. Tested by *a
-database waking from sleep no longer costs…*. The poll lists' Results button
-followed. A press that reaches the bot after its three
-seconds are already gone (the bot itself asleep, not just its database) still
-gets the "press again" message; nothing can open a screen then.
+opens and is filled in when it has. Then extended to `/poll-edit`, `/poll-close`,
+and the Close and Results buttons on poll lists; Close's "are you sure?" screen
+fills the placeholder the same way. When one of them ends in a message instead
+(poll not found, already closed), the message goes on the placeholder. Tested
+by *a database waking from sleep no longer costs…*. A press that reaches the
+bot after its three seconds are already gone (the bot itself asleep, not just
+its database) still gets the "press again" message; nothing can open a screen
+then.
 
 ### 13. Written answers can freeze a poll for everyone (high) - fixed
 Every open-ended answer, with its author's name, goes into one block of the
