@@ -709,7 +709,8 @@ async function reportButtonFailure({ respond, client, userId, err, doing }) {
 // Some presses end in a message rather than a screen ("already closed", or a
 // poll with no votes closing straight away). For those `load` returns
 // { say: text } instead of a view: sent with `say` when it was quick, as it
-// always was, and shown on the placeholder when that is already up.
+// always was, and shown on the placeholder when that is already up - or sent
+// with `say` after all, when the placeholder could not be opened or filled.
 // { say: null, shown: text } says nothing when quick - the outcome speaks for
 // itself - and puts `shown` on the placeholder, which has to say something.
 const OPEN_SCREEN_WAIT_MS = 800;
@@ -732,11 +733,27 @@ async function openScreen(client, triggerId, title, load, { say, doing = 'load t
     return;
   }
 
-  const opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
-  let view;
+  // A message never needed the trigger, so it must not come to depend on one:
+  // when there is no screen to show it on, it goes out the way it always did.
+  // By then the work behind it (a poll closing) may already be done.
+  const sayInstead = async result => {
+    if (!result || !('say' in result)) return false;
+    if (result.say) await say(result.say);
+    return true;
+  };
+
+  let opened;
   try {
-    view = await work;
-    if ('say' in view) view = buildNoticeModal(title, view.say || view.shown);
+    opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
+  } catch (err) {
+    // Too late even for the placeholder.
+    if (await sayInstead(await work.catch(() => null))) return;
+    throw err;
+  }
+  let result, view;
+  try {
+    result = await work;
+    view = 'say' in result ? buildNoticeModal(title, result.say || result.shown) : result;
   } catch (err) {
     console.error(`${title} screen failed to load:`, err);
     view = buildNoticeModal(title, `❌ Could not ${doing}: ${err.message}`);
@@ -744,6 +761,7 @@ async function openScreen(client, triggerId, title, load, { say, doing = 'load t
   try {
     await client.views.update({ view_id: opened.view.id, view });
   } catch (err) {
+    if (await sayInstead(result)) return;
     // Closed while it loaded: they chose to leave, so there is nothing to tell.
     if ((err.data?.error || err.message) === 'not_found') return;
     throw err;

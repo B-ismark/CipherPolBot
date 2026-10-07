@@ -222,6 +222,39 @@ scenario('when a slow /poll-close or /poll-edit ends in a message, it is shown o
   assert.strictEqual(announcements(sim).length, 1);
 });
 
+scenario('too late even for the Loading screen, an answer that is only a message still arrives', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  // The trigger is gone before the placeholder can use it.
+  const expiredFirst = () => sim.db.before(/^SELECT \* FROM polls WHERE id/, async () => {
+    sim.clock.advance(3000);
+    await new Promise(r => setTimeout(r, 1000));
+  });
+  expiredFirst();
+  const missing = await ama.command('/poll-edit', 'nope');
+  clean(missing);
+  assert.match(missing.ephemerals[0].text, /Poll not found/);
+  assert.deepStrictEqual(ama.dms(), [], 'not told to run it again');
+  // No votes: it closes, and the person is not told to try again.
+  expiredFirst();
+  const closed = await ama.command('/poll-close', made.id);
+  clean(closed);
+  assert.strictEqual(sim.db.row(made.id).status, 'closed');
+  assert.strictEqual(announcements(sim).length, 1);
+  assert.deepStrictEqual(ama.dms(), [], 'not told to run it again');
+});
+
+scenario('closing the Loading screen does not swallow an answer that was only a message', async sim => {
+  const ama = sim.user('UAMA');
+  sim.db.before(/^SELECT \* FROM polls WHERE id/, async () => {
+    await new Promise(r => setTimeout(r, 1000));
+    ama.dismiss();
+  });
+  const r = await ama.command('/poll-edit', 'nope');
+  clean(r);
+  assert.match(r.ephemerals[0].text, /Poll not found/);
+});
+
 scenario('a quick /poll-close or /poll-edit answers as it always did, with no extra screen', async sim => {
   const ama = sim.user('UAMA');
   const made = await ama.createPoll({ questions: [LUNCH()] });
