@@ -1887,8 +1887,8 @@ function closeChannelFor(poll, from) {
 // and Export where they read it and nobody is offered a button that can only
 // refuse. See buildMoreModal.
 //
-// Everything on that screen opens another view on top of it (views.push) rather
-// than replying in place: a button inside a modal has no response_url.
+// Screens it opens go on top of it (views.push), and what it has to say replaces
+// it (views.update): a button inside a modal has no response_url to reply through.
 
 app.action('poll_more', async ({ ack, body, client, action, respond }) => {
   await ack();
@@ -1914,7 +1914,19 @@ function moreAction(name, doing, run) {
     await ack();
     const userId = body.user.id;
     const push = view => client.views.push({ trigger_id: body.trigger_id, view });
-    const notice = (title, text) => push(buildNoticeModal(title, text));
+    // The outcome replaces the More screen rather than stacking on it. A push
+    // needs the press's trigger_id, which is good for three seconds - and Export
+    // and Close do their work first, so by the time they have something to say it
+    // has lapsed, and a poll that closed would be reported as a failure. An update
+    // only needs the open screen; if that is gone, the person gets a DM.
+    const notice = async (title, text) => {
+      try {
+        await client.views.update({ view_id: body.view.id, view: buildNoticeModal(title, text) });
+      } catch (err) {
+        console.warn(`${name}: could not update the screen (${err.data?.error || err.message}); sent a DM instead`);
+        await dmUser(client, userId, text);
+      }
+    };
     try {
       const poll = await getPoll(action.value);
       if (!poll) return await notice('Poll options', '❌ That poll no longer exists.');
