@@ -1933,7 +1933,7 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
     console.error('vote_option connect error:', err.message);
     return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
   }
-  let finalPoll = null, note = null, lapsed = null, seen = null, hadAnswer = false;
+  let finalPoll = null, note = null, lapsed = null, seen = null, hadAnswer = false, firstPress = false;
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
@@ -1965,6 +1965,7 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
       return await tell('⚠️ That option is not part of this poll any more. Press *🗳️ Vote* to answer it.');
     }
 
+    firstPress = answeredQuestions(poll, userId).size === 0;
     poll.votes[qi] = poll.votes[qi] || {};
     const qv = poll.votes[qi];
     const picked = ids => (ids || []).includes(userId);
@@ -2036,11 +2037,13 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
   // A whisper cannot be edited or replaced, so every press leaves another line
   // behind. Skip it when someone is changing an earlier answer and the poll
   // message already shows it - their name moves to the new option. The first
-  // answer, anonymous polls and hidden tallies have no other signal, and a
-  // pending question that needs the modal is news worth a line.
+  // answer, anonymous polls and hidden tallies have no other signal. A pending
+  // question that needs the modal is said on the first press only: repeating it
+  // on every press stacked identical lines, and the poll itself carries the hint.
   const pollShowsIt = !finalPoll.anonymous && canViewResults(finalPoll, null);
-  if (!(hadAnswer && pollShowsIt && !needsModal)) {
-    await tell(`✅ ${note}${needsModal ? '  This poll also has questions that need the *🗳️ Vote* button.' : ''}`);
+  const remind = needsModal && firstPress;
+  if (remind || !(hadAnswer && pollShowsIt)) {
+    await tell(`✅ ${note}${remind ? '  This poll also has questions that need the *🗳️ Vote* button.' : ''}`);
   }
   await updatePollMessage(client, finalPoll);
 });

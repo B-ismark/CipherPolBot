@@ -187,9 +187,14 @@ captured when you press the button, not only when the poll is posted.
 Votes cast anywhere the poll appears count toward the same poll, and every copy
 of the message updates on every vote.
 
-**Voting from the message.** Every option carries its own numbered button, so a
-poll can be answered where it is read - no modal, one press. That works in a
-channel and in a DM alike.
+**Voting from the message.** Every option carries its own button, so a poll can
+be answered where it is read - no modal, one press. That works in a channel and
+in a DM alike. The button says what pressing it does: **Vote**, **Pick** on a
+multi-select (where a press adds or takes back), or the score itself on a scale.
+Options are numbered in plain text rather than with keycap emoji, which drew a
+key inside every button and lost contrast in dark mode. A screen reader hears
+each button with its option, *Vote for Thai*, so a row of identical words is not
+a row of identical buttons.
 
 Two things a button cannot do, because Slack renders one message for everyone
 and it cannot be personalised:
@@ -201,8 +206,10 @@ and it cannot be personalised:
 - **It cannot express a ranking or a Likert grid.** There is no single click that
   means "third place", so those question types have no inline buttons and still
   open the modal. Multiple choice, yes/no, agree/disagree and NPS all get them.
-  A mixed poll gets buttons on the questions that can take them, and the reply
-  says the rest still need the modal.
+  A mixed poll gets buttons on the questions that can take them, and each of
+  the rest says *Answer this one with 🗳️ Vote* on the poll itself. Your first
+  press also says so in its private reply - only the first, since those replies
+  cannot be edited and a reminder on every press stacks up line after line.
 
 On a multi-select question a press toggles that option, so you can pick several
 and take one back. Adding a choice is allowed even when the creator turned vote
@@ -214,7 +221,7 @@ So the message steps down, keeping the richest layout that fits:
 
 | Layout | When | Voting from the message |
 |---|---|---|
-| A block per option | Most polls | A numbered button on each option |
+| A block per option | Most polls | A Vote button on each option |
 | A block per question | Longer polls (options across all questions past ~40) | One **Vote…** dropdown per question - same rules as the buttons |
 | Questions packed into text | Very large polls | None - the message says to press **🗳️ Vote** |
 
