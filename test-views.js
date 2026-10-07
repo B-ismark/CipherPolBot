@@ -668,10 +668,8 @@ test('a voter\'s More screen offers results and send, and nothing to manage', ()
   assert.deepStrictEqual(moreIds({}, 'UVOTER'), ['more_results', 'more_send']);
 });
 
-test('the creator and a co-creator also get export and close', () => {
-  assert.deepStrictEqual(moreIds({ coCreators: ['UCO'] }, 'U0123456789'),
-    ['more_results', 'more_send', 'more_export', 'more_close']);
-  assert.deepStrictEqual(moreIds({ coCreators: ['UCO'] }, 'UCO'),
+test('the creator also gets export and close', () => {
+  assert.deepStrictEqual(moreIds({}, 'U0123456789'),
     ['more_results', 'more_send', 'more_export', 'more_close']);
 });
 
@@ -964,11 +962,10 @@ test('every poll on a list carries buttons rather than an id to copy', () => {
 });
 
 test('a list offers Close and Export only on the polls its viewer runs', () => {
-  const list = (viewerId, opts = {}) => pollListBlocks([poll({ coCreators: ['UCO'] })], { viewerId, ...opts })
+  const list = (viewerId, opts = {}) => pollListBlocks([poll()], { viewerId, ...opts })
     .filter(b => b.type === 'actions')[0].elements.map(e => e.action_id);
   for (const id of ['close_poll', 'list_poll_export']) {
     assert.ok(list('U0123456789').includes(id), `${id}: the creator`);
-    assert.ok(list('UCO').includes(id), `${id}: a co-creator`);
     assert.ok(!list('UBYSTANDER').includes(id), `${id}: someone who only sees it posted here`);
     assert.ok(!list(undefined).includes(id), `${id}: nobody in particular`);
   }

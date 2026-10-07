@@ -8,10 +8,10 @@ fixing the bug and deleting the `todo` option made the test a guard.
 ## Status
 
 Fixed, each with its test now a guard: 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 16.
-15 is half done: the picker now says *Only to creator, until it closes*; making
-it private for good is still a product decision. 8 is fixed for the buttons
-on the poll message. Open: 9 and 10 (product decisions), 11 (fine on one
-always-on instance).
+9 is done: co-creators were taken out. 15 is half done: the picker now says
+*Only to creator, until it closes*; making it private for good is still a
+product decision. 8 is fixed for the buttons on the poll message. Open: 10
+(product decision), 11 (fine on one always-on instance).
 
 Ranked by what it costs a person, not by how hard it is to fix. Items 13 to 16
 came from a second pass; they are numbered after the first pass so the `todo`
@@ -157,11 +157,16 @@ the same moment…*.
 
 ## Found by reading, not by running
 
-### 9. "Co-creators" can never exist
+### 9. "Co-creators" can never exist - fixed by taking them out
 `coCreators` is always `[]` at creation and nothing adds to it, yet the README,
 the permission checks, the More screen's wording and the lists all talk about
 co-creators. Either build how to add one or take the word out; right now it
 promises a feature that is not there.
+
+Taken out: only the creator runs a poll, and the README and the More screen
+(*Only you see this part*) say so. Since nobody could ever be added, nobody
+loses anything. The `co_creators` column stays in the table, unread, so no
+migration is needed.
 
 ### 10. Anyone who can see a poll can send it anywhere
 *Send to another channel* is open to every member by design (README). A poll in a
