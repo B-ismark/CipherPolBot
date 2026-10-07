@@ -8,10 +8,16 @@ fixing the bug and deleting the `todo` option made the test a guard.
 ## Status
 
 Fixed, each with its test now a guard: 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 16.
-9 is done: co-creators were taken out. 15 is half done: the picker now says
-*Only to creator, until it closes*; making it private for good is still a
-product decision. 8 is fixed for the buttons on the poll message. Open: 10
-(product decision), 11 (fine on one always-on instance).
+9 is done: co-creators were taken out. 8 is fixed for the buttons on the poll
+message. 10 is decided: Send stays open to everyone, as designed. 15 is
+relabelled (*Only to creator, until it closes*), and the rest is in the
+backlog below. 11 is left as is: fine on one instance.
+
+Backlog:
+- 15: offer *Only to creator, always* next to *Only to creator, until it
+  closes*, for sensitive polls whose results should never go public.
+- 8: the Loading screen could also cover slash commands, the list buttons and
+  Close's confirm screen, which still ask for a second press after a sleep.
 
 Ranked by what it costs a person, not by how hard it is to fix. Items 13 to 16
 came from a second pass; they are numbered after the first pass so the `todo`
@@ -168,7 +174,7 @@ Taken out: only the creator runs a poll, and the README and the More screen
 loses anything. The `co_creators` column stays in the table, unread, so no
 migration is needed.
 
-### 10. Anyone who can see a poll can send it anywhere
+### 10. Anyone who can see a poll can send it anywhere - kept, by decision
 *Send to another channel* is open to every member by design (README). A poll in a
 private channel can therefore be posted to a public one, with its current tally
 and voter names, by anyone who can see it. It is capped at ten places an hour per person. If
@@ -184,7 +190,7 @@ Fine on one always-on instance; worth knowing before scaling.
 `/poll-edit` changes the title of a poll after its final results were posted
 under the old one. Probably worth refusing on closed polls.
 
-### 15. "Only to creator" is only until the poll closes (needs a decision) - relabelled
+### 15. "Only to creator" is only until the poll closes - relabelled, rest in backlog
 The results picker offers *Only to creator*. When the poll closes, the bot posts
 the full results in the channel, with names unless the poll is anonymous, and
 anyone can open them from then on. The README says this, but the screen where
