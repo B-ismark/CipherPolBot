@@ -248,13 +248,26 @@ given one, and it is never told who the other person is. So pick them under
 **People** and they get the poll directly. If you pick nothing, the poll lands
 in your own DM with the bot with a **Send it on** button.
 
-**Closing a poll.** The poll message has no Close button: Slack shows every
-reader the same copy of a message, so the button would be offered to every
-voter and refused to all but the creator. Close it from `/polls-list`, where
-each poll you run carries a **🔒 Close** button (the creator's and co-creators'
-only). A poll that already has votes asks for confirmation first.
-`/poll-close POLL_ID` still works, and an auto-close time set when the poll
-was created still closes it on its own.
+**The More button.** Under every active poll sit two buttons, **🗳️ Vote** and
+**More**. Slack shows every reader the same copy of a message, so a Close or
+Export button on it would be offered to every voter and refused to all but the
+creator. More is the same button for everyone, but what it opens is built for
+whoever pressed it:
+
+- **Everyone** sees who made the poll, whether it is open and when it closes, the
+  poll's rules in a line (anonymous or names shown, vote changes, when results
+  appear), and **Results** (unless the poll is hiding them) and **Send to another
+  channel**.
+- **The creator and co-creators** also get **Export CSV** and **Close poll**, in a
+  part of the screen labelled as theirs. Both are checked again when pressed.
+
+**Closing a poll.** Press **More** on the poll, then **Close poll**. A poll that
+already has votes asks for confirmation first. `/polls-list` has a **🔒 Close**
+button on each poll you run, `/poll-close POLL_ID` still works, and an auto-close
+time set when the poll was created still closes it on its own. Polls posted
+before the More button existed keep their old Close button until their message
+next refreshes (on the next vote); pressing it as anyone but the creator is
+refused as before.
 
 ```
 /poll-results poll_1706234567_abc12345

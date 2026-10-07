@@ -16,7 +16,7 @@ const views = require('./lib/views');
 const {
   buildComposeModal, buildOptionsModal, buildPreviewModal, buildQuestionModal,
   buildResultsModal, buildPollBlocks, buildVoteModal, buildEditModal,
-  buildShareModal, buildCloseConfirmModal, pollListBlocks, buildPollCsv,
+  buildShareModal, buildCloseConfirmModal, buildMoreModal, pollListBlocks, buildPollCsv,
   buildQuestion, restoreQuestion, rebuildComposeView, readOptionsSettings,
   settingsSummary, questionTypeIcon, questionTypeLabel,
   DEFAULT_SHOW_RESULTS, QUESTION_TYPE_GROUPS, buildResultsBlocks
@@ -647,12 +647,74 @@ test('the posted poll is a valid message', () => {
   auditMessage(buildPollBlocks(poll()), 'poll-message');
 });
 
-test('an active poll offers a vote and a send, and no close', () => {
-  // The message is one copy shared by the whole channel, so a Close button on
-  // it would be offered to every voter and refused to all but the creator.
+test('an active poll offers a vote and a More button, and nothing only some can use', () => {
+  // The message is one copy shared by the whole channel, so a Close or Export
+  // button on it would be offered to every voter and refused to all but the
+  // creator. More is for everyone; what it opens is built per person.
   const blocks = buildPollBlocks(poll());
-  const ids = blocks.find(b => b.type === 'actions').elements.map(e => e.action_id);
-  assert.deepStrictEqual(ids, ['open_vote_modal', 'share_poll']);
+  const buttons = blocks.find(b => b.type === 'actions').elements;
+  assert.deepStrictEqual(buttons.map(e => e.action_id), ['open_vote_modal', 'poll_more']);
+  assert.strictEqual(buttons[1].text.text, 'More', 'a plain word - no icon to explain');
+  assert.strictEqual(buttons[1].value, poll().id);
+});
+
+// ==================== the More screen ====================
+
+const more = (over, viewerId) => buildMoreModal(poll(over), viewerId, 'C1');
+const moreIds = (over, viewerId) => more(over, viewerId).blocks
+  .filter(b => b.type === 'actions').flatMap(b => b.elements.map(e => e.action_id));
+
+test('a voter\'s More screen offers results and send, and nothing to manage', () => {
+  assert.deepStrictEqual(moreIds({}, 'UVOTER'), ['more_results', 'more_send']);
+});
+
+test('the creator and a co-creator also get export and close', () => {
+  assert.deepStrictEqual(moreIds({ coCreators: ['UCO'] }, 'U0123456789'),
+    ['more_results', 'more_send', 'more_export', 'more_close']);
+  assert.deepStrictEqual(moreIds({ coCreators: ['UCO'] }, 'UCO'),
+    ['more_results', 'more_send', 'more_export', 'more_close']);
+});
+
+test('close is not offered for a poll that is already closed, export still is', () => {
+  assert.deepStrictEqual(moreIds({ status: 'closed' }, 'U0123456789'),
+    ['more_results', 'more_send', 'more_export']);
+});
+
+test('a voter is not offered results the poll is hiding, and is told why', () => {
+  const m = more({ showResults: 'on_close' }, 'UVOTER');
+  assert.deepStrictEqual(moreIds({ showResults: 'on_close' }, 'UVOTER'), ['more_send']);
+  assert.ok(JSON.stringify(m.blocks).includes('Results visible after poll closes'));
+  // The people running it always see their own.
+  assert.ok(moreIds({ showResults: 'on_close' }, 'U0123456789').includes('more_results'));
+});
+
+test('the More screen says the rules, and carries where it was opened', () => {
+  const text = JSON.stringify(more({ anonymous: true, allowRevote: true }, 'UVOTER').blocks);
+  assert.ok(text.includes('Anonymous') && text.includes('Vote changes allowed'));
+  assert.deepStrictEqual(JSON.parse(more({}, 'UVOTER').private_metadata), { pollId: poll().id, channelId: 'C1' });
+});
+
+test('the More screen is a valid view for every viewer', () => {
+  for (const viewer of ['UVOTER', 'U0123456789']) {
+    auditView(more({}, viewer), `more/${viewer}`);
+    auditView(more({ status: 'closed', showResults: 'creator_only', anonymous: true }, viewer), `more-closed/${viewer}`);
+  }
+});
+
+// ==================== the question hint ====================
+
+const hintOf = blocks => blocks.find(b => b.type === 'section' && /1\. /.test(b.text?.text || '')).text.text;
+
+test('a live ballot does not explain its own buttons', () => {
+  const live = hintOf(buildPollBlocks(poll({ votes: {} })));
+  assert.ok(!/press a number|Multiple choice/i.test(live), live);
+  assert.ok(!live.includes('\n'), 'a fresh pick-one has no hint line at all');
+});
+
+test('a live ballot says the count, and says so when several answers are allowed', () => {
+  assert.ok(hintOf(buildPollBlocks(poll())).includes('3 votes'));
+  const multi = { ...question(), type: 'multiple_select', allowMultiple: true };
+  assert.ok(hintOf(buildPollBlocks(poll({ questions: [multi] }))).includes('Pick several'));
 });
 
 test('a closed poll is a record, so the ballot buttons go', () => {
