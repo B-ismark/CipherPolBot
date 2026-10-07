@@ -288,7 +288,7 @@ are the creator's business anyway.
 ```
 /poll-share poll_1706234567_abc12345
 ```
-→ Posts current results into the channel. Creator and co-creators only, since everyone there can read them - and refused while the poll still restricts its results, because the voters were told they were private. Close the poll or change the setting first.
+→ Posts current results into the channel. Creator and co-creators only, since everyone there can read them - and refused while the poll still restricts its results, because the voters were told they were private. Close the poll first; the results setting cannot be changed after creation.
 
 ```
 /poll-export poll_1706234567_abc12345
