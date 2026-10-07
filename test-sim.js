@@ -165,6 +165,76 @@ scenario('a database waking from sleep no longer costs the first press: a Loadin
   }
 });
 
+// A real second, then three more on the clock, before the next poll lookup:
+// four seconds in all, past the three-second trigger.
+const coldNextLookup = sim => sim.db.before(/^SELECT \* FROM polls WHERE id/, async () => {
+  await new Promise(r => setTimeout(r, 1000));
+  sim.clock.advance(3000);
+});
+
+scenario('a database waking from sleep no longer costs /poll-edit, /poll-close or a Close button their screen', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  const ref = made.messageRefs[0];
+  await sim.user('UK').press('vote_option_0_0', {}, at(ref));
+  message(sim, ref).blocks.find(b => b.type === 'actions').elements.push(
+    { type: 'button', text: { type: 'plain_text', text: '🔒  Close' }, action_id: 'close_poll', value: made.id });
+  const tries = [
+    ['/poll-edit', () => ama.command('/poll-edit', made.id), 'poll_edit_submit'],
+    ['/poll-close', () => ama.command('/poll-close', made.id), 'poll_close_confirm'],
+    ['the Close button', () => ama.press('close_poll', {}, at(ref)), 'poll_close_confirm']
+  ];
+  for (const [what, run, filled] of tries) {
+    coldNextLookup(sim);
+    const r = await run();
+    clean(r);
+    const opened = r.calls.filter(c => c.method === 'views.open');
+    assert.strictEqual(opened.length, 1, `${what}: one screen`);
+    assert.match(text(opened[0].args.view.blocks), /Loading/, what);
+    assert.strictEqual(ama.top.view.callback_id, filled, `${what} filled in`);
+    assert.deepStrictEqual(r.ephemerals, [], `${what}: nobody is told to press again`);
+    assert.deepStrictEqual(ama.dms(), [], `${what}: or sent a DM`);
+    ama.dismiss();
+  }
+  // The filled-in confirmation still does its job.
+  coldNextLookup(sim);
+  await ama.command('/poll-close', made.id);
+  clean(await ama.submit({}));
+  assert.strictEqual(sim.db.row(made.id).status, 'closed');
+  assert.strictEqual(announcements(sim).length, 1);
+});
+
+scenario('when a slow /poll-close or /poll-edit ends in a message, it is shown on the Loading screen', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  coldNextLookup(sim);
+  const missing = await ama.command('/poll-edit', 'nope');
+  clean(missing);
+  assert.match(text(ama.top.view.blocks), /Poll not found/);
+  assert.deepStrictEqual(missing.ephemerals, [], 'said once, where they are looking');
+  ama.dismiss();
+  // No votes, so it closes without asking - and the screen has to say so.
+  coldNextLookup(sim);
+  const closed = await ama.command('/poll-close', made.id);
+  clean(closed);
+  assert.strictEqual(sim.db.row(made.id).status, 'closed');
+  assert.match(text(ama.top.view.blocks), /is closed/);
+  assert.strictEqual(announcements(sim).length, 1);
+});
+
+scenario('a quick /poll-close or /poll-edit answers as it always did, with no extra screen', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  const missing = await ama.command('/poll-edit', 'nope');
+  assert.match(missing.ephemerals[0].text, /Poll not found/);
+  assert.strictEqual(ama.top, null);
+  const closed = await ama.command('/poll-close', made.id);
+  clean(closed);
+  assert.strictEqual(sim.db.row(made.id).status, 'closed');
+  assert.deepStrictEqual(closed.calls.filter(c => c.method === 'views.open'), [], 'no votes: closed without a screen');
+  assert.deepStrictEqual(closed.ephemerals, [], 'the announcement in the channel says it');
+});
+
 scenario('closing the Loading screen before it fills in is not reported as a failure', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
   const k = sim.user('UKCLOSE');

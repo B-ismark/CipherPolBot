@@ -8,16 +8,16 @@ fixing the bug and deleting the `todo` option made the test a guard.
 ## Status
 
 Fixed, each with its test now a guard: 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 16.
-9 is done: co-creators were taken out. 8 is fixed for the buttons on the poll
-message. 10 is decided: Send stays open to everyone, as designed. 15 is
+9 is done: co-creators were taken out. 8 is fixed (the poll lists' Results
+button aside). 10 is decided: Send stays open to everyone, as designed. 15 is
 relabelled (*Only to creator, until it closes*), and the rest is in the
 backlog below. 11 is left as is: fine on one instance.
 
 Backlog:
 - 15: offer *Only to creator, always* next to *Only to creator, until it
   closes*, for sensitive polls whose results should never go public.
-- 8: the Loading screen could also cover slash commands, the list buttons and
-  Close's confirm screen, which still ask for a second press after a sleep.
+- 8: the Loading screen could also cover the Results button on poll lists,
+  which still asks for a second press after a sleep.
 
 Ranked by what it costs a person, not by how hard it is to fix. Items 13 to 16
 came from a second pass; they are numbered after the first pass so the `todo`
@@ -109,7 +109,7 @@ It posts as an active poll and closes at the next sweep or the first vote.
 Nothing says why. Reject it on the Options screen with an inline error. Test: *a
 poll cannot be created with a close time that has already passed*.
 
-### 8. The first press after the bot sleeps always fails (medium, verified) - fixed for the poll message's buttons
+### 8. The first press after the bot sleeps always fails (medium, verified) - fixed
 With a database slow enough to eat Slack's three seconds (a cold start), **More**
 and **Vote** cannot open and the person is told to press again. The message is
 kind and accurate, but the person has still done the thing twice. Slack's
@@ -118,8 +118,12 @@ modal immediately (no database call), then `views.update` it with the real
 content. Only the *pressed* button needs the trigger; the slow work does not.
 Built for the buttons on the poll message (Vote, More, View Results, and the
 older Send): if the poll has not loaded within 0.8 seconds, a "Loading…" screen
-opens and is filled in when it has. Tested by *a database waking from sleep no
-longer costs the first press…*. A press that reaches the bot after its three
+opens and is filled in when it has. Then extended to `/poll-edit`, `/poll-close`
+and the Close button on poll lists, whose "are you sure?" screen fills the
+placeholder the same way; when one of them ends in a message instead (poll not
+found, already closed), the message goes on the placeholder. Tested by *a
+database waking from sleep no longer costs…*. The poll lists' Results button is
+left as is. A press that reaches the bot after its three
 seconds are already gone (the bot itself asleep, not just its database) still
 gets the "press again" message; nothing can open a screen then.
 
