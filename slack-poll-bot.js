@@ -315,7 +315,7 @@ const {
   readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
   buildQuestion, buildVoteModal, ballotFits, BALLOT_FULL, isInlineVotable, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
-  buildCloseConfirmModal, buildNoticeModal, pollListBlocks, buildPollCsv,
+  buildCloseConfirmModal, buildMoreModal, buildNoticeModal, pollListBlocks, buildPollCsv,
   buildPostConfirmation, failureRecord, nowhereRecord
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
@@ -748,7 +748,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     const userId = body.user_id;
     const channel = await resolveChannel(client, body.channel_id, userId);
     const pollId = body.text.trim().replace(/`/g, '');
-    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID` - posts the *results* into this channel. To send another copy of the poll itself, press *📤 Send* on the poll.' });
+    if (!pollId) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Usage: `/poll-share POLL_ID` - posts the *results* into this channel. To send another copy of the poll itself, press *More* on the poll, then *Send*.' });
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can post results to a channel. Use `/poll-results` to view them privately.' });
@@ -1356,7 +1356,7 @@ app.action('share_poll', async ({ ack, body, client, action, respond }) => {
 });
 
 app.view('share_poll_submit', async ({ ack, body, view, client }) => {
-  await ack();
+  await ack({ response_action: 'clear' });
   const { pollId } = JSON.parse(view.private_metadata);
   const { destChannels: channelIds, destUsers: userIds } = readDestinations(view.state?.values);
   const actor = body.user.id;
@@ -1854,9 +1854,7 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
     // button is on the poll lists now as well, and those can be run anywhere:
     // a click from a channel the poll was never posted to falls back to the
     // poll's own channel rather than dropping its results into a bystander.
-    const from = body.channel?.id;
-    const showsThisPoll = from && pollMessageRefs(poll).some(r => r.channelId === from);
-    const channel = showsThisPoll ? from : (poll.channelId || from);
+    const channel = closeChannelFor(poll, body.channel?.id);
     const participants = getAllVoters(poll).size;
     if (participants > 0) {
       return await client.views.open({
@@ -1872,10 +1870,97 @@ app.action('close_poll', async ({ ack, body, client, action, respond }) => {
   }
 });
 
+// Where a poll's final results belong when it is closed from `from`: where the
+// poll was being read, which is not necessarily where it was first posted - the
+// same poll can be in several channels. A press from somewhere the poll was
+// never posted (a list run anywhere) falls back to the poll's own channel
+// rather than dropping its results into a bystander.
+function closeChannelFor(poll, from) {
+  const showsThisPoll = from && pollMessageRefs(poll).some(r => r.channelId === from);
+  return showsThisPoll ? from : (poll.channelId || from);
+}
+
+// ==================== THE MORE BUTTON ====================
+//
+// The poll message has one button for everybody, and this is what it opens: a
+// screen built for whoever pressed it, so the people running the poll find Close
+// and Export where they read it and nobody is offered a button that can only
+// refuse. See buildMoreModal.
+//
+// Everything on that screen opens another view on top of it (views.push) rather
+// than replying in place: a button inside a modal has no response_url.
+
+app.action('poll_more', async ({ ack, body, client, action, respond }) => {
+  await ack();
+  const userId = body.user.id;
+  try {
+    const poll = await getPoll(action.value);
+    if (!poll) throw new Error('that poll no longer exists');
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildMoreModal(poll, userId, closeChannelFor(poll, body.channel?.id))
+    });
+  } catch (err) {
+    console.error('poll_more error:', err);
+    await reportButtonFailure({ respond, client, userId, err, doing: 'open the poll options' });
+  }
+});
+
+// The shape every button on the More screen shares: find the poll, do the one
+// thing, and tell the person when there is something to say. A failure goes to
+// a DM, which is where a modal's buttons can reach.
+function moreAction(name, doing, run) {
+  app.action(name, async ({ ack, body, client, action }) => {
+    await ack();
+    const userId = body.user.id;
+    const push = view => client.views.push({ trigger_id: body.trigger_id, view });
+    const notice = (title, text) => push(buildNoticeModal(title, text));
+    try {
+      const poll = await getPoll(action.value);
+      if (!poll) return await notice('Poll options', '❌ That poll no longer exists.');
+      let meta = {};
+      try { meta = JSON.parse(body.view?.private_metadata || '{}'); } catch (e) { /* the poll is enough */ }
+      await run({ poll, userId, client, push, notice, channelId: meta.channelId || closeChannelFor(poll, null) });
+    } catch (err) {
+      console.error(`${name} error:`, err);
+      await reportButtonFailure({ respond: null, client, userId, err, doing });
+    }
+  });
+}
+
+moreAction('more_results', 'open those results', async ({ poll, userId, push, notice }) => {
+  if (!canViewResults(poll, userId)) return await notice('Poll results', `🔒 ${resultsHiddenReason(poll)}.`);
+  await push(buildResultsModal(poll, userId));
+});
+
+moreAction('more_send', 'open the send screen', async ({ poll, push }) => {
+  await push(buildShareModal(poll));
+});
+
+// Export and Close are checked here as well as hidden from other people's
+// screens: the button is only ever as private as the screen it was on.
+moreAction('more_export', 'export that poll', async ({ poll, userId, client, notice }) => {
+  if (!isCreatorOrCoCreator(poll, userId)) return await notice('Export', `❌ Only <@${poll.creator}> can export this poll.`);
+  const own = await client.conversations.open({ users: userId });
+  await uploadPollCsv(client, poll, own.channel.id);
+  await notice('Export', `⬇️ The CSV for *${pollDisplayTitle(poll)}* is in your DM with me.`);
+});
+
+moreAction('more_close', 'close the poll', async ({ poll, userId, client, push, notice, channelId }) => {
+  if (!isCreatorOrCoCreator(poll, userId)) return await notice('Close poll', `❌ Only <@${poll.creator}> can close this poll.`);
+  if (poll.status === 'closed') return await notice('Close poll', '⚠️ This poll is already closed.');
+  const participants = getAllVoters(poll).size;
+  if (participants > 0) return await push(buildCloseConfirmModal(poll, channelId, participants));
+  const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channelId), channelId);
+  await notice('Close poll', said || `🔒 *${pollDisplayTitle(poll)}* is closed.`);
+});
+
 // Confirmation modal shown by the Close button and by /poll-close when the poll
 // already has votes.
 app.view('poll_close_confirm', async ({ ack, body, view, client }) => {
-  await ack();
+  // 'clear' ends the whole stack: opened from the More screen, a plain ack would
+  // leave that screen behind still offering to close a poll that is closed.
+  await ack({ response_action: 'clear' });
   const { pollId, channelId } = JSON.parse(view.private_metadata);
   const userId = body.user.id;
   try {
