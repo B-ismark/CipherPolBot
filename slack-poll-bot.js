@@ -500,6 +500,11 @@ async function updatePollMessage(client, poll) {
 
 // ==================== POLL CREATION HELPER ====================
 
+const CLOSE_TIME_PASSED = 'The close time you set has already passed. Pick a later one under ⚙️ More options.';
+function closeTimePassed(closeAt) {
+  return Boolean(closeAt) && new Date(closeAt).getTime() <= Date.now();
+}
+
 async function createAndPostPoll(client, meta, teamId = null) {
   const { userId } = meta;
 
@@ -532,6 +537,7 @@ async function validateAndPost(client, meta, teamId) {
   // The screens above refuse this before it gets here; this is the floor for
   // any path that does not go through them.
   if (!ballotFits({ questions: savedQuestions, title, description })) throw new Error(BALLOT_FULL);
+  if (closeTimePassed(closeAt)) throw new Error(CLOSE_TIME_PASSED);
 
   const pollId = `poll_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
   const votes = {};
@@ -1238,6 +1244,11 @@ app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => 
     ? [...(meta.savedQuestions || []), buildQuestion(question.text, question.type, question.optionsRaw)]
     : [...(meta.savedQuestions || [])];
 
+  // Set in the future on More options, but that was a while ago.
+  if (closeTimePassed(meta.closeAt)) {
+    return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: CLOSE_TIME_PASSED } });
+  }
+
   // Still the ack, so still an inline error, on the field where cutting starts.
   if (!ballotFits({ questions: savedQuestions, title: meta.pollTitle, description: meta.pollDescription })) {
     return await ack({ response_action: 'errors', errors: { [`q_text_${qNum}`]: BALLOT_FULL } });
@@ -1254,6 +1265,11 @@ app.view('poll_compose_submit', async ({ ack, body, view, client, context }) => 
 app.view('poll_options_submit', async ({ ack, body, view, client }) => {
   const meta = JSON.parse(view.private_metadata);
   const merged = { ...meta, ...readOptionsSettings(view.state.values, meta) };
+  // A close time already gone would post an open poll that shuts at the next
+  // sweep or the first vote, with nothing to say why.
+  if (closeTimePassed(merged.closeAt)) {
+    return await ack({ response_action: 'errors', errors: { poll_close_at: 'Pick a time in the future.' } });
+  }
   await ack();
 
   // Acking pops this screen off and reveals the compose screen, which is then
