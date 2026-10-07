@@ -266,7 +266,7 @@ was created still closes it on its own.
 ```
 → Lists the open polls you run, plus any posted in the conversation you ran it
 in, each with its own row of buttons: **📊 Results**, **📤 Send**, **🔒 Close**
-(on polls you run) and **⬇️ Export**. `/polls-archive` does the same for closed polls, without the
+and **⬇️ Export** (both only on polls you run). `/polls-archive` does the same for closed polls, without the
 Close.
 
 It used to list every poll in the workspace, to anyone. On the default results

@@ -806,7 +806,7 @@ app.command('/polls-archive', async ({ ack, body, client }) => {
     await client.chat.postEphemeral({
       channel, user: userId,
       text: `${polls.length} closed poll${polls.length !== 1 ? 's' : ''}`,
-      blocks: pollListBlocks(polls, { closed: true })
+      blocks: pollListBlocks(polls, { closed: true, viewerId: userId })
     });
   } catch (err) {
     console.error('/polls-archive error:', err);

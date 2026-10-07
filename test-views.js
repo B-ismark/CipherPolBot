@@ -901,13 +901,23 @@ test('every poll on a list carries buttons rather than an id to copy', () => {
     ['list_poll_results', 'share_poll', 'close_poll', 'list_poll_export']);
 });
 
-test('a list offers Close only on the polls its viewer runs', () => {
-  const list = viewerId => pollListBlocks([poll({ coCreators: ['UCO'] })], { viewerId })
+test('a list offers Close and Export only on the polls its viewer runs', () => {
+  const list = (viewerId, opts = {}) => pollListBlocks([poll({ coCreators: ['UCO'] })], { viewerId, ...opts })
     .filter(b => b.type === 'actions')[0].elements.map(e => e.action_id);
-  assert.ok(list('U0123456789').includes('close_poll'), 'the creator');
-  assert.ok(list('UCO').includes('close_poll'), 'a co-creator');
-  assert.ok(!list('UBYSTANDER').includes('close_poll'), 'someone who only sees it posted here');
-  assert.ok(!list(undefined).includes('close_poll'), 'nobody in particular');
+  for (const id of ['close_poll', 'list_poll_export']) {
+    assert.ok(list('U0123456789').includes(id), `${id}: the creator`);
+    assert.ok(list('UCO').includes(id), `${id}: a co-creator`);
+    assert.ok(!list('UBYSTANDER').includes(id), `${id}: someone who only sees it posted here`);
+    assert.ok(!list(undefined).includes(id), `${id}: nobody in particular`);
+  }
+  assert.deepStrictEqual(list('UBYSTANDER'), ['list_poll_results', 'share_poll']);
+});
+
+test('the archive offers Export to the people who run a closed poll, and no Close', () => {
+  const ids = (viewerId) => pollListBlocks([poll({ status: 'closed' })], { closed: true, viewerId })
+    .find(b => b.type === 'actions').elements.map(e => e.action_id);
+  assert.deepStrictEqual(ids('U0123456789'), ['list_poll_results', 'share_poll', 'list_poll_export']);
+  assert.deepStrictEqual(ids('UBYSTANDER'), ['list_poll_results', 'share_poll']);
 });
 
 test('a closed poll cannot be closed again', () => {
