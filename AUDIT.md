@@ -2,8 +2,16 @@
 
 Done by running the real bot against a fake Slack and a fake database (`sim/`,
 exercised by `test-sim.js`) and by reading the code. Everything under
-**Confirmed by running it** has a `todo` test in `test-sim.js` that reproduces it;
-fix the bug, delete the `todo` option, and the test becomes a guard.
+**Confirmed by running it** had a `todo` test in `test-sim.js` that reproduced it;
+fixing the bug and deleting the `todo` option made the test a guard.
+
+## Status
+
+Fixed, each with its test now a guard: 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 16.
+15 is half done: the picker now says *Only to creator, until it closes*; making
+it private for good is still a product decision. Open: 8 (changes every button,
+so it is a separate, careful piece of work), 9 and 10 (product decisions), 11
+(fine on one always-on instance).
 
 Ranked by what it costs a person, not by how hard it is to fix. Items 13 to 16
 came from a second pass; they are numbered after the first pass so the `todo`
@@ -12,7 +20,7 @@ tests that name them keep their numbers. By cost, the order to fix in is 1, 13,
 
 ## Confirmed by running it
 
-### 1. A poll can ping the whole channel, and carry a disguised link (high)
+### 1. A poll can ping the whole channel, and carry a disguised link (high) - fixed
 Poll titles, descriptions, questions and options go into Slack messages as-is,
 and so do voters' written answers. Slack treats `<!channel>`, `<!here>` and
 `<!everyone>` as pings, `<@U123>` as a mention, and
@@ -31,7 +39,7 @@ headers, where an escaped `&lt;` would show up as typed. Tests: *a poll cannot
 ping the whole channel…*, *…carry a link whose visible text hides its
 destination*, and *a voter's written answer cannot ping the channel…*.
 
-### 2. The message can show an older tally than the database (medium)
+### 2. The message can show an older tally than the database (medium) - fixed
 Every vote refreshes the poll message from the poll *it* just wrote. If two votes
 land close together and their refreshes arrive out of order, the older tally
 overwrites the newer one and stays until the next vote. Reproduced: the database
@@ -46,7 +54,7 @@ refresh would silently leave a stale message (not reproduced here: the fake does
 not model Slack's rate limits). Test: *the message tally always matches
 the database…*.
 
-### 3. A poll with an NPS question can never be posted (high)
+### 3. A poll with an NPS question can never be posted (high) - fixed
 NPS has eleven choices (0 to 10). The limit is ten. The creator fills in the
 form, presses Post, the form closes, and then a DM says *"Question 1: exceeds
 maximum number of options (10)"*. The README advertises NPS. Nothing in the unit
@@ -63,7 +71,7 @@ Fix the buttons in the same change. They are numbered from 1️⃣, so on an NPS
 question the 1️⃣ button means a score of 0, and the score of 10 gets a plain
 "11." because there are only ten number emoji. Voters will press 1️⃣ to give a 1.
 
-### 4. A poll that fails to post still uses up the day's allowance (medium)
+### 4. A poll that fails to post still uses up the day's allowance (medium) - fixed
 The daily creation limit (10) is charged before the poll is validated or posted.
 Combined with #3, ten attempts at an NPS poll lock a person out of creating any
 poll for a day, with the message *"Rate limit: You can create a maximum of 10
@@ -75,14 +83,14 @@ Fix: charge after the poll has posted somewhere, or give the charge back on
 failure (the DM allowance already does this: `claimNotification` and
 `releaseNotification`).
 
-### 5. A closed poll gives its creator no way to export from the channel (medium)
+### 5. A closed poll gives its creator no way to export from the channel (medium) - fixed
 The More button (#11) is only on active polls, so after Close the message offers
 View Results and Send, and the creator's Export is gone from where they were
 reading. The More screen already handles closed polls (it hides Close and keeps
 Export), so this is a gap in how it was wired, not in the screen. Test: *a closed
 poll's message still gives its creator a way to export*.
 
-### 6. `/poll-export` fails in most public channels (medium)
+### 6. `/poll-export` fails in most public channels (medium) - fixed
 The command uploads the file into the channel it was typed in. Slack lets the
 bot *post* to a public channel it has not joined, but not *upload* to one, so the
 command fails with a raw `An API error occurred: not_in_channel` unless the bot
@@ -90,7 +98,7 @@ was invited. The Export buttons (More, `/polls-list`) already avoid this by
 sending the file to the creator's DM; the slash command should do the same.
 Test: */poll-export works in a public channel the bot has not joined*.
 
-### 7. A poll can be created with a close time in the past (low)
+### 7. A poll can be created with a close time in the past (low) - fixed
 It posts as an active poll and closes at the next sweep or the first vote.
 Nothing says why. Reject it on the Options screen with an inline error. Test: *a
 poll cannot be created with a close time that has already passed*.
@@ -105,7 +113,7 @@ content. Only the *pressed* button needs the trigger; the slow work does not.
 (Covered by the passing test *a sleeping database costs the first press its three
 seconds…*, which documents today's behaviour. Change it when this is built.)
 
-### 13. Written answers can freeze a poll for everyone (high)
+### 13. Written answers can freeze a poll for everyone (high) - fixed
 Every open-ended answer, with its author's name, goes into one block of the
 poll message, and Slack refuses any block over 3,000 characters. Ten people
 writing a few sentences each is enough, and those are the default settings (live
@@ -122,7 +130,7 @@ a count ("and 14 more, see Results"), cut each answer short in the message, and
 give the answer box a `max_length`. Test: *a poll with a paragraph from each of
 ten people still updates*.
 
-### 14. Three actions write back a stale copy of the whole poll (medium)
+### 14. Three actions write back a stale copy of the whole poll (medium) - fixed
 Votes and closes lock the poll row while they change it. Three other writes
 don't. Each one reads the poll, does slow work, then saves what it read:
 - **Creating a poll** saves it, posts it, then saves the whole poll again to
@@ -163,11 +171,11 @@ The creation, share and DM allowances are kept in memory. A restart or a wake fr
 sleep gives everyone a fresh allowance, and a second instance would double them.
 Fine on one always-on instance; worth knowing before scaling.
 
-### 12. A closed poll can still be edited
+### 12. A closed poll can still be edited - fixed
 `/poll-edit` changes the title of a poll after its final results were posted
 under the old one. Probably worth refusing on closed polls.
 
-### 15. "Only to creator" is only until the poll closes (needs a decision)
+### 15. "Only to creator" is only until the poll closes (needs a decision) - relabelled
 The results picker offers *Only to creator*. When the poll closes, the bot posts
 the full results in the channel, with names unless the poll is anonymous, and
 anyone can open them from then on. The README says this, but the screen where
@@ -177,7 +185,7 @@ private for good (final results go only to the creator, and the message says
 "closed"), or say it where the choice is made: *Only to creator, until it
 closes*.
 
-### 16. An edit can save and still show an error
+### 16. An edit can save and still show an error - fixed
 `/poll-edit` replies to Slack only after it has saved and refreshed every copy
 of the poll. With a slow database, or a poll posted in many places, that takes
 longer than Slack's three seconds, so the creator sees *"We had some trouble
@@ -189,8 +197,8 @@ it by showing a "Saving…" screen first and updating it afterwards.
 Pinned by passing tests in `test-sim.js`:
 
 - Twenty-five people voting at once lose no votes, and the message matches the
-  database (row locks work, for votes and closes; see 14 for the writes that
-  take no lock).
+  database (row locks work, for votes and closes; since 14 the other writes
+  change only their own columns).
 - A vote racing a Close is either counted in the final results or refused, and
   results are announced once; pressing Close twice announces once.
 - Votes after the close time are refused and the poll closes with results posted;
