@@ -1045,8 +1045,8 @@ test('the export names whoever wrote an answer, with the id kept beside it', () 
   const p = poll({ questions: [open, question()], votes: { 0: { U7: 'Fine', U8: 'Meh' }, 1: { 0: ['U9'] } } });
   assert.deepStrictEqual(csvVoterIds(p).sort(), ['U7', 'U8', 'U9'], 'everyone who answered anything');
   const csv = buildPollCsv(p, { U7: '=Ama' });
-  assert.ok(csv.includes(`"'=Ama (U7)","Fine"`), 'named, id kept, and a name is no formula');
-  assert.ok(csv.includes('"U8","Meh"'), 'no name found: the id alone');
+  assert.ok(csv.includes(`"'=Ama","U7","Thoughts?","Fine"`), 'named, id kept, and a name is no formula');
+  assert.ok(csv.includes('"U8","U8","Thoughts?","Meh"'), 'no name found: the id alone');
   assert.deepStrictEqual(csvVoterIds({ ...p, anonymous: true }), [], 'an anonymous poll looks nobody up');
 });
 
@@ -1104,7 +1104,35 @@ test('an anonymous poll does not name its voters in the export', () => {
   const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
   const csv = buildPollCsv(poll({ questions: [open], votes: { 0: { U7: 'It was fine' } }, anonymous: true }));
   assert.ok(!csv.includes('U7'), 'an anonymous export must not carry user ids');
-  assert.ok(csv.includes('(anonymous)'));
+  assert.ok(csv.includes('"Thoughts?","Open ended","It was fine"'), 'with no Responses section, the answers stay in the totals');
+});
+
+test('with a Responses section, the totals count written answers instead of repeating them', () => {
+  const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
+  const csv = buildPollCsv(poll({ questions: [open], votes: { 0: { U7: 'Fine', U8: 'Meh' } } }));
+  const lines = csv.slice(1).split('\n');
+  assert.deepStrictEqual(lines.slice(0, 2), ['"Question","Type","Answer","Responses"', '"Thoughts?","Open ended","See Responses below","2"']);
+  assert.strictEqual(csv.split('Fine').length, 2, 'each answer appears once, under Responses');
+  const none = buildPollCsv(poll({ questions: [open], votes: {} })).slice(1).split('\n');
+  assert.deepStrictEqual(none, ['"Question","Type","Answer"', '"Thoughts?","Open ended","(no responses)"']);
+});
+
+test('the export has only the columns its questions use', () => {
+  const header = qs => buildPollCsv(poll({ questions: qs, votes: {} })).slice(1).split('\n')[0];
+  const choice = { text: 'Lunch?', type: 'yes_no', options: ['Yes', 'No'], allowMultiple: false };
+  const rate = { text: 'Rate it', type: 'likert', options: ['Fast'], allowMultiple: false };
+  const rank = { text: 'Order?', type: 'ranking', options: ['A', 'B'], allowMultiple: false };
+  const open = { text: 'Why?', type: 'open_ended', options: [], allowMultiple: false };
+  assert.strictEqual(header([choice]), '"Question","Type","Option","Votes","Percentage"');
+  assert.strictEqual(header([rate]), '"Question","Type","Statement — Rating","Votes","Percentage"');
+  assert.strictEqual(header([rank]), '"Question","Type","Option","Average Rank"');
+  assert.strictEqual(header([open]), '"Question","Type","Answer"');
+  const all = buildPollCsv(poll({ questions: [choice, rate, rank, open], votes: { 3: { UA: 'Hi' } } })).slice(1).split('\n');
+  assert.strictEqual(all[0], '"Question","Type","Option / Statement — Rating / Answer","Votes / Average Rank / Responses","Percentage"');
+  assert.ok(all.every(line => !line || line.split('","').length <= 5), 'no row is wider than the table');
+  assert.ok(all.includes('"Order?","Ranking","A","avg rank: N/A",""'), 'labelled beside vote counts, and padded');
+  const ranked = buildPollCsv(poll({ questions: [rank], votes: { 0: { UA: '2,1' } } })).slice(1).split('\n');
+  assert.ok(ranked.includes('"Order?","Ranking","A","2.00"'), 'alone, a bare number');
 });
 
 test('a long choice with an ampersand still fits Slack\'s option limit once escaped', () => {
