@@ -24,6 +24,19 @@ const OPEN = text => ({ text, type: 'open_ended', options: [], allowMultiple: fa
 const at = ref => ({ channel: ref.channelId, ts: ref.messageTs });
 const message = (sim, ref) => sim.slack.messages.get(`${ref.channelId}:${ref.messageTs}`);
 const text = node => JSON.stringify(node);
+// What Slack reads markup in: every mrkdwn text, and a message's `text`.
+// plain_text shows `<!channel>` as typed, so it is not a way in.
+const mrkdwnOf = node => {
+  const out = [];
+  const walk = n => {
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (!n || typeof n !== 'object') return;
+    if (n.type === 'mrkdwn' && typeof n.text === 'string') out.push(n.text);
+    Object.values(n).forEach(walk);
+  };
+  walk(node);
+  return [typeof node?.text === 'string' ? node.text : '', ...out].join('\n');
+};
 const buttonsOn = m => m.blocks.filter(b => b.type === 'actions').flatMap(b => b.elements.map(e => e.action_id));
 const actionsIn = view => view.blocks.filter(b => b.type === 'actions').flatMap(b => b.elements.map(e => e.action_id));
 const votesOf = (sim, id) => JSON.parse(sim.db.row(id).votes);
@@ -359,14 +372,14 @@ scenario('a poll cannot ping the whole channel through its title, options or des
     questions: [Q('<!channel> ok?', ['<!channel>', 'No'])]
   });
   const m = message(sim, made.messageRefs[0]);
-  assert.doesNotMatch(m.text + text(m.blocks), /<!(channel|here|everyone)>/, 'Slack reads these as @channel / @here / @everyone');
-}, { todo: 'AUDIT #1: nothing escapes Slack control sequences in poll text' });
+  assert.doesNotMatch(mrkdwnOf(m), /<!(channel|here|everyone)>/, 'Slack reads these as @channel / @here / @everyone');
+});
 
 scenario('a poll cannot carry a link whose visible text hides its destination', async sim => {
   const made = await sim.user('UAMA').createPoll({ title: 'Sign in <https://evil.example|here>', questions: [LUNCH()] });
   const m = message(sim, made.messageRefs[0]);
-  assert.doesNotMatch(m.text + text(m.blocks), /<https:\/\/evil\.example\|here>/);
-}, { todo: 'AUDIT #1: poll text may contain <url|label> links' });
+  assert.doesNotMatch(mrkdwnOf(m), /<https:\/\/evil\.example\|here>/);
+});
 
 scenario('a voter\'s written answer cannot ping the channel when the results are posted', async sim => {
   const ama = sim.user('UAMA');
@@ -377,8 +390,8 @@ scenario('a voter\'s written answer cannot ping the channel when the results are
   await ama.command('/poll-close', made.id);
   await ama.submit({});
   const [final] = announcements(sim);
-  assert.doesNotMatch(text(final.args.blocks), /<!channel>/);
-}, { todo: 'AUDIT #1: open-ended answers come from any voter and are posted as written' });
+  assert.doesNotMatch(mrkdwnOf(final.args), /<!channel>/);
+});
 
 scenario('the message tally always matches the database, however votes interleave', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [Q('Lunch?', ['Thai', 'Sushi'])] });

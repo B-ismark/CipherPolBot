@@ -308,7 +308,7 @@ const {
   draftFitsInView
 } = require('./lib/validation');
 const { isCreatorOrCoCreator, canViewResults, resultsHiddenReason } = require('./lib/policy');
-const { getAllVoters, answeredQuestions, votingState, previousAnswers, pollMessageRefs, pollDisplayTitle } = require('./lib/poll');
+const { getAllVoters, answeredQuestions, votingState, previousAnswers, pollMessageRefs, pollDisplayTitle, escapeMrkdwn, pollTitleMrkdwn } = require('./lib/poll');
 const {
   readDestinations, buildQuestionModal, DEFAULT_SHOW_RESULTS, buildComposeModal,
   buildOptionsModal, buildEditModal, buildPreviewModal, METADATA_FULL, readCurrentQuestion,
@@ -331,7 +331,7 @@ const {
 async function sendCloseNotifications(client, poll) {
   const notifyUsers = (poll.notifyOnClose || []).slice(0, MAX_NOTIFY_SUBSCRIBERS_PER_POLL);
   if (!notifyUsers.length) return;
-  const title = pollDisplayTitle(poll);
+  const title = pollTitleMrkdwn(poll);
   await Promise.allSettled(notifyUsers.map(async uid => {
     // Claimed before the send and handed back if it fails - the same rule the
     // picker path follows, and this is the caller likelier to need it: it fires
@@ -399,7 +399,7 @@ async function resolveChannel(client, channelId, userId) {
 // poll, so lib/destinations.js needs no opinion about blocks and the two
 // modules do not have to require each other.
 function pollMessage(poll) {
-  return { text: `📊 ${pollDisplayTitle(poll)}`, blocks: buildPollBlocks(poll) };
+  return { text: `📊 ${pollTitleMrkdwn(poll)}`, blocks: buildPollBlocks(poll) };
 }
 
 // The way to reach one person when there is no channel to answer in, or when
@@ -465,7 +465,7 @@ async function updatePollMessage(client, poll) {
   const refs = pollMessageRefs(poll);
   const blocks = buildPollBlocks(poll);
   await Promise.allSettled(refs.map(({ channelId, messageTs }) =>
-    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollDisplayTitle(poll)}`, blocks })
+    client.chat.update({ channel: channelId, ts: messageTs, text: `📊 ${pollTitleMrkdwn(poll)}`, blocks })
   ));
 }
 
@@ -735,7 +735,7 @@ app.command('/poll-results', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!canViewResults(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: `🔒 ${resultsHiddenReason(poll)}.` });
-    await client.chat.postEphemeral({ channel, user: userId, text: `📊 Results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Poll Results', userId) });
+    await client.chat.postEphemeral({ channel, user: userId, text: `📊 Results: ${pollTitleMrkdwn(poll)}`, blocks: buildResultsBlocks(poll, 'Poll Results', userId) });
   } catch (err) {
     console.error('/poll-results error:', err);
     await dmUser(client, body.user_id, `❌ /poll-results failed: ${err.message}`);
@@ -759,7 +759,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
       user: userId,
       text: `🔒 Results for this poll are restricted (${resultsHiddenReason(poll).toLowerCase()}), so they cannot be posted to a channel yet. Close the poll with \`/poll-close ${poll.id}\` to release them - a poll's results setting cannot be changed once it is created.`
     });
-    await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
+    await client.chat.postMessage({ channel, text: `📊 Current results: ${pollTitleMrkdwn(poll)}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
     console.error('/poll-share error:', err);
     await dmUser(client, body.user_id, `❌ /poll-share failed: ${err.message}`);
@@ -846,7 +846,7 @@ app.action('list_poll_export', async ({ ack, body, client, action, respond }) =>
     if (!isCreatorOrCoCreator(poll, userId)) return await deny(`❌ Only <@${poll.creator}> can export this poll.`);
     const own = await client.conversations.open({ users: userId });
     await uploadPollCsv(client, poll, own.channel.id);
-    await deny(`⬇️ The CSV for *${poll.title}* is in your DM with me.`);
+    await deny(`⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.`);
   } catch (err) {
     console.error('list_poll_export error:', err);
     await dmUser(client, userId, `❌ Could not export that poll: ${err.message}`);
@@ -870,7 +870,7 @@ async function announceClose(client, closed, channel = closed.channelId) {
     try {
       await client.chat.postMessage({
         channel,
-        text: `🔒 Poll closed: ${pollDisplayTitle(closed)}`,
+        text: `🔒 Poll closed: ${pollTitleMrkdwn(closed)}`,
         blocks: buildResultsBlocks(closed, '🔒 Final Results')
       });
     } catch (err) {
@@ -894,11 +894,11 @@ async function finalizePollClose(client, poll, channel) {
 
 // What to tell whoever pressed Close, for each way finalizePollClose can end.
 function closeOutcomeText(poll, outcome, channel) {
-  if (!outcome) return `🔒 *${pollDisplayTitle(poll)}* was already closed - nothing more to do.`;
+  if (!outcome) return `🔒 *${pollTitleMrkdwn(poll)}* was already closed - nothing more to do.`;
   if (outcome.resultsError) {
     // A DM id renders as a broken channel link, so only channels are named.
     const where = /^[CG]/.test(channel || '') ? ` in <#${channel}>` : '';
-    return `🔒 *${pollDisplayTitle(poll)}* is closed, but I could not post its final results${where} (\`${outcome.resultsError}\`). \`/poll-results ${poll.id}\` shows them.`;
+    return `🔒 *${pollTitleMrkdwn(poll)}* is closed, but I could not post its final results${where} (\`${outcome.resultsError}\`). \`/poll-results ${poll.id}\` shows them.`;
   }
   return null;
 }
@@ -959,7 +959,7 @@ async function uploadPollCsv(client, poll, channel) {
     filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
     content: buildPollCsv(poll),
     title: `Results: ${poll.title}`,
-    initial_comment: `📊 Export for poll: *${poll.title}*  ·  ID: \`${poll.id}\``
+    initial_comment: `📊 Export for poll: *${pollTitleMrkdwn(poll)}*  ·  ID: \`${poll.id}\``
   });
 }
 
@@ -1335,7 +1335,7 @@ app.view('poll_edit_submit', async ({ ack, body, view, client }) => {
       type: 'modal',
       title: { type: 'plain_text', text: 'Poll Updated' },
       close: { type: 'plain_text', text: 'Close' },
-      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${newTitle}* has been updated.` } }]
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${escapeMrkdwn(newTitle)}* has been updated.` } }]
     }});
   } catch (err) {
     console.error('poll_edit_submit error:', err);
@@ -1383,7 +1383,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
 
     if (!fresh.length && !failures.length) {
       return await dmUser(client, actor, targets.length
-        ? `⚠️ *${pollDisplayTitle(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
+        ? `⚠️ *${pollTitleMrkdwn(poll)}* is already posted in ${targets.map(t => t.label).join(', ')}.`
         : '⚠️ Pick at least one channel or person to send the poll to.');
     }
 
@@ -1394,7 +1394,7 @@ app.view('share_poll_submit', async ({ ack, body, view, client }) => {
     }
 
     const parts = [];
-    if (posted.length) parts.push(`✅ *${pollDisplayTitle(poll)}* sent to ${posted.map(p => p.label).join(', ')}.`);
+    if (posted.length) parts.push(`✅ *${pollTitleMrkdwn(poll)}* sent to ${posted.map(p => p.label).join(', ')}.`);
     const allFailures = [...failures, ...postFailures];
     if (allFailures.length) {
       // Same durable record as the create path: a share can refuse for every
@@ -1749,13 +1749,13 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
       if (picked(qv[oi])) {
         if (!poll.allowRevote) {
           await dbClient.query('ROLLBACK');
-          return await tell(`🔒 You already picked *${q.options[oi]}*, and the creator turned off vote changes.`);
+          return await tell(`🔒 You already picked *${escapeMrkdwn(q.options[oi])}*, and the creator turned off vote changes.`);
         }
         qv[oi] = (qv[oi] || []).filter(id => id !== userId);
-        note = `Took back your vote for *${q.options[oi]}*.`;
+        note = `Took back your vote for *${escapeMrkdwn(q.options[oi])}*.`;
       } else {
         qv[oi] = [...(qv[oi] || []), userId];
-        note = `Added your vote for *${q.options[oi]}*.`;
+        note = `Added your vote for *${escapeMrkdwn(q.options[oi])}*.`;
       }
     } else {
       if (answered && !poll.allowRevote) {
@@ -1768,11 +1768,11 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
         // poll there is nothing worth a line. The dropdown is still reset in the
         // finally below, and the rollback above has already released the row.
         if (poll.anonymous) return;
-        return await tell(`✅ You already voted for *${q.options[oi]}* - nothing changed.`);
+        return await tell(`✅ You already voted for *${escapeMrkdwn(q.options[oi])}* - nothing changed.`);
       }
       Object.keys(qv).forEach(k => { qv[k] = (qv[k] || []).filter(id => id !== userId); });
       qv[oi] = [...(qv[oi] || []), userId];
-      note = `Your vote for *${q.options[oi]}* is in.`;
+      note = `Your vote for *${escapeMrkdwn(q.options[oi])}* is in.`;
     }
 
     const voteTimestamps = poll.voteTimestamps || {};
@@ -1955,7 +1955,7 @@ moreAction('more_export', 'export that poll', async ({ poll, userId, client, not
   if (!isCreatorOrCoCreator(poll, userId)) return await notice('Export', `❌ Only <@${poll.creator}> can export this poll.`);
   const own = await client.conversations.open({ users: userId });
   await uploadPollCsv(client, poll, own.channel.id);
-  await notice('Export', `⬇️ The CSV for *${pollDisplayTitle(poll)}* is in your DM with me.`);
+  await notice('Export', `⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.`);
 });
 
 moreAction('more_close', 'close the poll', async ({ poll, userId, client, push, notice, channelId }) => {
@@ -1964,7 +1964,7 @@ moreAction('more_close', 'close the poll', async ({ poll, userId, client, push, 
   const participants = getAllVoters(poll).size;
   if (participants > 0) return await push(buildCloseConfirmModal(poll, channelId, participants));
   const said = closeOutcomeText(poll, await finalizePollClose(client, poll, channelId), channelId);
-  await notice('Close poll', said || `🔒 *${pollDisplayTitle(poll)}* is closed.`);
+  await notice('Close poll', said || `🔒 *${pollTitleMrkdwn(poll)}* is closed.`);
 });
 
 // Confirmation modal shown by the Close button and by /poll-close when the poll
