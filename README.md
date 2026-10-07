@@ -248,12 +248,13 @@ given one, and it is never told who the other person is. So pick them under
 **People** and they get the poll directly. If you pick nothing, the poll lands
 in your own DM with the bot with a **Send it on** button.
 
-**Closing a poll.** Active polls carry a **🔒 Close** button next to Vote and
-Share. The button is visible to everyone - Slack cannot show one person a
-different version of a message - but only the creator and co-creators can use
-it; anyone else is told so privately. A poll that already has votes asks for
-confirmation first. `/poll-close POLL_ID` still works, and an auto-close time
-set when the poll was created still closes it on its own.
+**Closing a poll.** The poll message has no Close button: Slack shows every
+reader the same copy of a message, so the button would be offered to every
+voter and refused to all but the creator. Close it from `/polls-list`, where
+each poll you run carries a **🔒 Close** button (the creator's and co-creators'
+only). A poll that already has votes asks for confirmation first.
+`/poll-close POLL_ID` still works, and an auto-close time set when the poll
+was created still closes it on its own.
 
 ```
 /poll-results poll_1706234567_abc12345
@@ -265,7 +266,7 @@ set when the poll was created still closes it on its own.
 ```
 → Lists the open polls you run, plus any posted in the conversation you ran it
 in, each with its own row of buttons: **📊 Results**, **📤 Send**, **🔒 Close**
-and **⬇️ Export**. `/polls-archive` does the same for closed polls, without the
+(on polls you run) and **⬇️ Export**. `/polls-archive` does the same for closed polls, without the
 Close.
 
 It used to list every poll in the workspace, to anyone. On the default results
