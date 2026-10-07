@@ -315,7 +315,7 @@ const {
   readOptionsSettings, readComposeState, restoreQuestion, rebuildComposeView,
   buildQuestion, buildVoteModal, ballotFits, BALLOT_FULL, isInlineVotable, buildPollBlocks,
   buildShareModal, buildResultsBlocks, buildPostVoteModal, buildResultsModal,
-  buildCloseConfirmModal, buildMoreModal, buildNoticeModal, pollListBlocks, buildPollCsv,
+  buildCloseConfirmModal, buildMoreModal, buildNoticeModal, pollListBlocks, buildPollCsv, csvVoterIds,
   buildPostConfirmation, failureRecord, nowhereRecord
 } = require('./lib/views');
 const { parseComposeArgs, questionFormError, formTypeFor } = require('./lib/compose');
@@ -1089,6 +1089,49 @@ app.command('/poll-edit', async ({ ack, body, client }) => {
 });
 
 
+// Names for the people a CSV lists. Needs the users:read scope: on an install
+// from before it was added - or for anyone Slack will not look up - the id is
+// left on its own, as it always was, rather than costing the export. Ten at a
+// time, so a long poll does not queue hundreds of lookups one by one.
+//
+// On a client of their own, not the request's. Bolt shares one client per
+// workspace, and on a rate limit that client holds back every call behind it -
+// votes, screens opening - and retries for up to half an hour. A name is a
+// nicety, so these calls give up instead: no retries, a rate limit is an error
+// that ends the lookup, and so does NAME_LOOKUP_BUDGET_MS. Whoever is left
+// keeps their id.
+const NAME_LOOKUP_BUDGET_MS = 20000;
+
+function lookupClient(client) {
+  return client.token
+    ? new WebClient(client.token, { rejectRateLimitedCalls: true, retryConfig: { retries: 0 }, timeout: 5000 })
+    : client;
+}
+
+async function voterNames(client, poll) {
+  const names = {};
+  const ids = csvVoterIds(poll);
+  if (!ids.length) return names;
+  const lookup = lookupClient(client);
+  const started = Date.now();
+  let stop = null;
+  for (let i = 0; i < ids.length && !stop; i += 10) {
+    if (Date.now() - started > NAME_LOOKUP_BUDGET_MS) { stop = 'took too long'; break; }
+    await Promise.all(ids.slice(i, i + 10).map(async id => {
+      try {
+        const { user } = await lookup.users.info({ user: id });
+        const name = user?.real_name || user?.profile?.display_name || user?.name;
+        if (name) names[id] = name;
+      } catch (err) {
+        if (err.data?.error === 'missing_scope') stop = 'the app needs the users:read scope (add it and reinstall)';
+        else if (err.code === 'slack_webapi_rate_limited_error') stop = 'Slack rate-limited the lookups';
+      }
+    }));
+  }
+  if (stop) console.warn(`CSV export: ${Object.keys(names).length} of ${ids.length} named, the rest as ids - ${stop}`);
+  return names;
+}
+
 // Upload that CSV wherever the request came from. File uploads do not honour
 // chat:write.public, so this only works in a DM or a channel the bot is in -
 // hence the failure being reported rather than swallowed.
@@ -1096,7 +1139,7 @@ async function uploadPollCsv(client, poll, channel) {
   await client.files.uploadV2({
     channel_id: channel,
     filename: `${poll.title.replace(/[^a-z0-9]/gi, '_').slice(0, 40)}_results.csv`,
-    content: buildPollCsv(poll),
+    content: buildPollCsv(poll, await voterNames(client, poll)),
     title: `Results: ${poll.title}`,
     initial_comment: `📊 Export for poll: *${pollTitleMrkdwn(poll)}*  ·  ID: \`${poll.id}\``
   });

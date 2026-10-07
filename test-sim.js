@@ -447,6 +447,45 @@ scenario('a Vote press on a poll that has closed shows the final results, with n
   assert.doesNotMatch(shown, /poll-results|poll_\d/);
 });
 
+scenario('the CSV names the people who wrote answers, and keeps their Slack ID beside the name', async sim => {
+  const ama = sim.user('UAMA'), k = sim.user('UK');
+  const made = await ama.createPoll({ questions: [{ text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false }] });
+  await k.press('open_vote_modal', {}, at(made.messageRefs[0]));
+  const input = k.top.view.blocks.find(b => b.type === 'input');
+  clean(await k.submit({ [input.block_id]: { [input.element.action_id]: { type: 'plain_text_input', value: 'Loved it' } } }));
+  clean(await ama.command('/poll-export', made.id));
+  assert.match(sim.slack.files.at(-1).content, /"Person UK \(UK\)","Loved it"/);
+});
+
+scenario('before the app is reinstalled with users:read, the CSV still goes out, with IDs alone', async sim => {
+  const ama = sim.user('UAMA'), k = sim.user('UK');
+  const made = await ama.createPoll({ questions: [{ text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false }] });
+  await k.press('open_vote_modal', {}, at(made.messageRefs[0]));
+  const input = k.top.view.blocks.find(b => b.type === 'input');
+  clean(await k.submit({ [input.block_id]: { [input.element.action_id]: { type: 'plain_text_input', value: 'Loved it' } } }));
+  const missing = new Error('An API error occurred: missing_scope');
+  missing.data = { ok: false, error: 'missing_scope' };
+  sim.slack.failNext('users.info', missing, { times: 1 });
+  clean(await ama.command('/poll-export', made.id));
+  assert.match(sim.slack.files.at(-1).content, /"UK","Loved it"/);
+});
+
+scenario('a rate limit on the name lookups ends them, and the export goes out with ids', async sim => {
+  const ama = sim.user('UAMA');
+  const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
+  const made = await ama.createPoll({ questions: [open] });
+  // Twenty-five people answered: three rounds of lookups if nothing stops them.
+  const answers = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`UV${i}`, 'Yes']));
+  sim.db.row(made.id).votes = JSON.stringify({ 0: answers });
+  const limited = new Error('A rate-limit has been reached');
+  limited.code = 'slack_webapi_rate_limited_error';
+  sim.slack.failNext('users.info', limited, { times: 1 });
+  const r = await ama.command('/poll-export', made.id);
+  clean(r);
+  assert.strictEqual(r.calls.filter(c => c.method === 'users.info').length, 10, 'stopped after the round that hit the limit');
+  assert.match(sim.slack.files.at(-1).content, /"UV24","Yes"/);
+});
+
 // ==================== who is offered what ====================
 
 scenario('the poll list offers Close and Export only to the people who run the poll', async sim => {
