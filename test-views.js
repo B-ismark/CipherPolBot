@@ -1083,7 +1083,14 @@ test('the export lists who answered what, for every kind of question', () => {
     '"Ama Mensah","UA","Why?","Hungry","2026-10-07T12:04:00.000Z"',
     '"Kofi","UB","Lunch?","Yes",""'
   ]);
-  assert.ok(csv.startsWith('"Question","Type"'), 'the totals still come first');
+  assert.ok(csv.startsWith('\uFEFF"Question","Type"'), 'the totals still come first, marked as UTF-8 for Excel');
+});
+
+test('an anonymous written answer carries no time that could name its writer', () => {
+  const open = { text: 'Thoughts?', type: 'open_ended', options: [], allowMultiple: false };
+  const p = poll({ questions: [open], votes: { 0: { U7: 'Fine' } }, voteTimestamps: { U7: '2026-10-07T12:04:00.000Z' } });
+  assert.ok(!buildPollCsv({ ...p, anonymous: true }).includes('2026-10-07'));
+  assert.ok(buildPollCsv(p).includes('2026-10-07'), 'a named poll keeps it');
 });
 
 test('an anonymous poll, or one nobody answered, has no Responses section', () => {
