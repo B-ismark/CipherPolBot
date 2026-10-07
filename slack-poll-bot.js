@@ -1705,7 +1705,7 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
     console.error('vote_option connect error:', err.message);
     return await tell('⚠️ Something went wrong recording your vote. Nothing was saved - please try again.');
   }
-  let finalPoll = null, note = null, lapsed = null, seen = null;
+  let finalPoll = null, note = null, lapsed = null, seen = null, hadAnswer = false;
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query('SELECT * FROM polls WHERE id=$1 FOR UPDATE', [pollId]);
@@ -1741,6 +1741,7 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
     const qv = poll.votes[qi];
     const picked = ids => (ids || []).includes(userId);
     const answered = Object.values(qv).some(picked);
+    hadAnswer = answered;
 
     if (q.allowMultiple) {
       // Adding another choice is not changing your mind, so it is allowed even
@@ -1800,7 +1801,15 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
   // letting them think they are done - or nagging someone who already is.
   const done = answeredQuestions(finalPoll, userId);
   const needsModal = (finalPoll.questions || []).some((qq, i) => !isInlineVotable(qq.type) && !done.has(i));
-  await tell(`✅ ${note}${needsModal ? '  This poll also has questions that need the *🗳️ Vote* button.' : ''}`);
+  // A whisper cannot be edited or replaced, so every press leaves another line
+  // behind. Skip it when someone is changing an earlier answer and the poll
+  // message already shows it - their name moves to the new option. The first
+  // answer, anonymous polls and hidden tallies have no other signal, and a
+  // pending question that needs the modal is news worth a line.
+  const pollShowsIt = !finalPoll.anonymous && canViewResults(finalPoll, null);
+  if (!(hadAnswer && pollShowsIt && !needsModal)) {
+    await tell(`✅ ${note}${needsModal ? '  This poll also has questions that need the *🗳️ Vote* button.' : ''}`);
+  }
   await updatePollMessage(client, finalPoll);
 });
 
