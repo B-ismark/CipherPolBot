@@ -544,7 +544,7 @@ scenario('the "poll closed" DM opens the final results', async sim => {
   assert.match(JSON.stringify(k.top.view.blocks), /Team lunch/);
 });
 
-scenario('after posting, the creator is shown how to edit', async sim => {
+scenario('after posting, the creator is shown how to change the title', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
   const said = JSON.stringify(sim.user('UAMA').whispers().concat(sim.user('UAMA').dms()).map(m => m.blocks));
   assert.ok(said.includes(`/poll-edit ${made.id}`), said.slice(0, 300));

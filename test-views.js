@@ -1080,8 +1080,12 @@ test('a closed poll does not talk about a future it no longer has', () => {
   const more = JSON.stringify(buildMoreModal(closed, 'U1', 'C1').blocks);
   assert.match(more, /Final results are out/);
   assert.doesNotMatch(more, /after the poll closes|until it closes|Live results/);
-  assert.doesNotMatch(JSON.stringify(buildPollBlocks(closed)), /No votes yet/);
+  assert.doesNotMatch(JSON.stringify(buildPollBlocks(closed)), /No (votes|responses) yet/);
+  assert.match(JSON.stringify(buildPollBlocks(closed)), /No responses/);
   assert.match(JSON.stringify(buildPollBlocks({ ...base, status: 'active', showResults: 'realtime' })), /No votes yet/);
+  const open = { ...closed, questions: [{ text: 'Why?', type: 'open_ended', options: [] }], votes: { 0: {} }, showResults: 'realtime' };
+  assert.doesNotMatch(JSON.stringify(buildPollBlocks(open)), /No (votes|responses) yet/);
+  assert.match(JSON.stringify(buildPollBlocks({ ...open, status: 'active' })), /No responses yet/);
   assert.match(JSON.stringify(buildMoreModal({ ...base, status: 'active' }, 'U1', 'C1').blocks), /Results after the poll closes/);
 });
 
