@@ -9,9 +9,9 @@ fixing the bug and deleting the `todo` option made the test a guard.
 
 Fixed, each with its test now a guard: 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 16.
 15 is half done: the picker now says *Only to creator, until it closes*; making
-it private for good is still a product decision. Open: 8 (changes every button,
-so it is a separate, careful piece of work), 9 and 10 (product decisions), 11
-(fine on one always-on instance).
+it private for good is still a product decision. 8 is fixed for the buttons
+on the poll message. Open: 9 and 10 (product decisions), 11 (fine on one
+always-on instance).
 
 Ranked by what it costs a person, not by how hard it is to fix. Items 13 to 16
 came from a second pass; they are numbered after the first pass so the `todo`
@@ -103,15 +103,19 @@ It posts as an active poll and closes at the next sweep or the first vote.
 Nothing says why. Reject it on the Options screen with an inline error. Test: *a
 poll cannot be created with a close time that has already passed*.
 
-### 8. The first press after the bot sleeps always fails (medium, verified)
+### 8. The first press after the bot sleeps always fails (medium, verified) - fixed for the poll message's buttons
 With a database slow enough to eat Slack's three seconds (a cold start), **More**
 and **Vote** cannot open and the person is told to press again. The message is
 kind and accurate, but the person has still done the thing twice. Slack's
 guidance is to open the screen first and fill it in after: open a "Loading…"
 modal immediately (no database call), then `views.update` it with the real
 content. Only the *pressed* button needs the trigger; the slow work does not.
-(Covered by the passing test *a sleeping database costs the first press its three
-seconds…*, which documents today's behaviour. Change it when this is built.)
+Built for the buttons on the poll message (Vote, More, View Results, and the
+older Send): if the poll has not loaded within 0.8 seconds, a "Loading…" screen
+opens and is filled in when it has. Tested by *a database waking from sleep no
+longer costs the first press…*. A press that reaches the bot after its three
+seconds are already gone (the bot itself asleep, not just its database) still
+gets the "press again" message; nothing can open a screen then.
 
 ### 13. Written answers can freeze a poll for everyone (high) - fixed
 Every open-ended answer, with its author's name, goes into one block of the

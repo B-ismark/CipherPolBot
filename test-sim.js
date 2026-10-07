@@ -143,7 +143,29 @@ scenario('the sweeper closes an overdue poll, updates its message and announces 
   assert.deepStrictEqual(buttonsOn(message(sim, made.messageRefs[0])), ['view_results_modal', 'poll_more']);
 });
 
-scenario('a sleeping database costs the first press its three seconds, and the person is told to press again', async sim => {
+scenario('a database waking from sleep no longer costs the first press: a Loading screen opens and fills in', async sim => {
+  const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
+  const ref = made.messageRefs[0];
+  for (const [action, filled] of [['poll_more', 'more_send'], ['open_vote_modal', 'vote_submit']]) {
+    const k = sim.user(`UK_${action}`);
+    // A real second, then three more on the clock: four seconds in all, past
+    // the press's three-second trigger.
+    sim.db.before(/^SELECT \* FROM polls WHERE id/, async () => {
+      await new Promise(r => setTimeout(r, 1000));
+      sim.clock.advance(3000);
+    });
+    const r = await k.press(action, {}, at(ref));
+    clean(r);
+    const opened = r.calls.filter(c => c.method === 'views.open');
+    assert.strictEqual(opened.length, 1, `${action}: one screen`);
+    assert.match(text(opened[0].args.view.blocks), /Loading/);
+    const shown = JSON.stringify(k.top.view);
+    assert.ok(shown.includes(filled), `${action} filled in: ${shown.slice(0, 200)}`);
+    assert.deepStrictEqual(r.ephemerals, [], `${action}: nobody is told to press again`);
+  }
+});
+
+scenario('a press that reaches the bot too late to open anything is told to press again', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
   const ref = made.messageRefs[0];
   sim.db.latencyMs = 4000;

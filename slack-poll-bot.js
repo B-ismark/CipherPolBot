@@ -697,6 +697,44 @@ async function reportButtonFailure({ respond, client, userId, err, doing }) {
   await dmUser(client, userId, text);
 }
 
+// Slack lets a press open its screen for 3 seconds, and a database waking from
+// sleep can take longer than that to answer - so the first press after a quiet
+// spell used to fail and had to be made again. Now, when the screen's contents
+// are not ready within a moment, a "Loading…" screen opens with the press's
+// trigger while it is still good, and is filled in once the database answers.
+// When they are ready in time, which is nearly always, the real screen opens
+// straight away and nothing looks different.
+//
+// `load` returns the finished view, or throws. A throw before the placeholder
+// is up reaches the caller as it always did; one after it is shown on the
+// placeholder, since that is what the person is looking at.
+const OPEN_SCREEN_WAIT_MS = 800;
+
+async function openScreen(client, triggerId, title, load) {
+  const work = Promise.resolve().then(load);
+  // Settled later than the race below may look, so never left unhandled.
+  work.catch(() => {});
+  let timer;
+  const waited = new Promise(resolve => { timer = setTimeout(() => resolve(null), OPEN_SCREEN_WAIT_MS); });
+  let quick;
+  try {
+    quick = await Promise.race([work.then(view => ({ view })), waited]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (quick) return client.views.open({ trigger_id: triggerId, view: quick.view });
+
+  const opened = await client.views.open({ trigger_id: triggerId, view: buildNoticeModal(title, '⏳ Loading…') });
+  let view;
+  try {
+    view = await work;
+  } catch (err) {
+    console.error(`${title} screen failed to load:`, err);
+    view = buildNoticeModal(title, `❌ Could not load this: ${err.message}`);
+  }
+  await client.views.update({ view_id: opened.view.id, view });
+}
+
 async function handleNewPoll({ ack, body, client, respond }) {
   await ack();
   try {
@@ -1452,9 +1490,11 @@ async function saveEdit(pollId, title, description) {
 app.action('share_poll', async ({ ack, body, client, action, respond }) => {
   await ack();
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) throw new Error('that poll no longer exists');
-    await client.views.open({ trigger_id: body.trigger_id, view: buildShareModal(poll) });
+    await openScreen(client, body.trigger_id, 'Send poll', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) throw new Error('that poll no longer exists');
+      return buildShareModal(poll);
+    });
   } catch (err) {
     console.error('share_poll error:', err);
     await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the send screen' });
@@ -1522,33 +1562,29 @@ app.action('open_vote_modal', async ({ ack, body, client, action, respond }) => 
   // This used to have no error handling at all, so after a nap the Vote button
   // simply did nothing - the one button every voter presses.
   try {
-    await openVoteModal({ body, client, action });
+    await openScreen(client, body.trigger_id, 'Vote', () => voteScreen(action.value, body.user.id));
   } catch (err) {
     console.error('open_vote_modal error:', err);
     await reportButtonFailure({ respond, client, userId: body.user.id, err, doing: 'open the ballot' });
   }
 });
 
-async function openVoteModal({ body, client, action }) {
-  const poll = await getPoll(action.value);
+// What the Vote button opens for this person.
+async function voteScreen(pollId, userId) {
+  const poll = await getPoll(pollId);
   if (!poll) throw new Error('that poll no longer exists');
 
   if (poll.status === 'closed') {
-    return client.views.open({
-      trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        title: { type: 'plain_text', text: 'Poll Closed' },
-        close: { type: 'plain_text', text: 'Close' },
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results ${poll.id}\` to view the final results.` }] }
-        ]
-      }
-    });
+    return {
+      type: 'modal',
+      title: { type: 'plain_text', text: 'Poll Closed' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: '🔒 This poll is no longer accepting votes.' } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: `Use \`/poll-results ${poll.id}\` to view the final results.` }] }
+      ]
+    };
   }
-
-  const userId = body.user.id;
 
   // With vote changes off, what is answered stays answered - but only the
   // questions that are. Turning someone away for having answered anything was
@@ -1557,26 +1593,20 @@ async function openVoteModal({ body, client, action }) {
   // straight after the reply to their press told them to use this button.
   const { locked, finished } = votingState(poll, userId);
   if (finished) {
-    return client.views.open({
-      trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        title: { type: 'plain_text', text: 'Already Voted' },
-        close: { type: 'plain_text', text: 'Close' },
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: '✅ You have already submitted your vote for this poll.' } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Vote changes are not allowed for this poll.' }] }
-        ]
-      }
-    });
+    return {
+      type: 'modal',
+      title: { type: 'plain_text', text: 'Already Voted' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: '✅ You have already submitted your vote for this poll.' } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: 'Vote changes are not allowed for this poll.' }] }
+      ]
+    };
   }
 
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: poll.allowRevote
-      ? buildVoteModal(poll, previousAnswers(poll, userId))
-      : buildVoteModal(poll, {}, { locked })
-  });
+  return poll.allowRevote
+    ? buildVoteModal(poll, previousAnswers(poll, userId))
+    : buildVoteModal(poll, {}, { locked });
 }
 
 // Slack allows 3 seconds for the ack. A vote is normally written well inside
@@ -1929,11 +1959,10 @@ app.action(/^vote_(option|select)_/, async ({ ack, body, client, action, respond
 app.action('view_results_modal', async ({ ack, body, client, action, respond }) => {
   await ack();
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) throw new Error('that poll no longer exists');
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: buildResultsModal(poll, body.user.id)
+    await openScreen(client, body.trigger_id, 'Poll Results', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) throw new Error('that poll no longer exists');
+      return buildResultsModal(poll, body.user.id);
     });
   } catch (err) {
     console.error('view_results_modal error:', err);
@@ -2002,11 +2031,10 @@ app.action('poll_more', async ({ ack, body, client, action, respond }) => {
   await ack();
   const userId = body.user.id;
   try {
-    const poll = await getPoll(action.value);
-    if (!poll) throw new Error('that poll no longer exists');
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: buildMoreModal(poll, userId, closeChannelFor(poll, body.channel?.id))
+    await openScreen(client, body.trigger_id, 'Poll options', async () => {
+      const poll = await getPoll(action.value);
+      if (!poll) throw new Error('that poll no longer exists');
+      return buildMoreModal(poll, userId, closeChannelFor(poll, body.channel?.id));
     });
   } catch (err) {
     console.error('poll_more error:', err);
