@@ -46,9 +46,9 @@ app already has them, they are harmless, but a fresh install does not need them.
 
 **Private channels are the one gap.** `chat:write.public` covers public channels only,
 so to post a poll into a private channel the bot must be invited to it
-(`/invite @Cipher Pol`). `groups:write` does not substitute for membership. The same
-applies to `/poll-export`: file uploads do not honour `chat:write.public`, so run it
-in a DM or in a channel the bot belongs to.
+(`/invite @Cipher Pol`). `groups:write` does not substitute for membership. File uploads
+do not honour `chat:write.public` either, so every export, `/poll-export` included,
+arrives in your DM with the bot.
 
 Click **Install to Workspace** and copy your **Bot Token** (`xoxb-...`)
 
@@ -309,7 +309,7 @@ are the creator's business anyway.
 ```
 /poll-export poll_1706234567_abc12345
 ```
-→ Exports results as a CSV file, with per-voter rows for non-anonymous polls. Creator and co-creators only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
+→ Exports results as a CSV file, with per-voter rows for non-anonymous polls, into your DM with the bot. Creator and co-creators only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
 
 ```
 /poll-close poll_1706234567_abc12345

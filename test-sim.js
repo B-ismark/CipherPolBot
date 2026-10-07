@@ -438,9 +438,10 @@ scenario('a closed poll\'s message still gives its creator a way to export', asy
 scenario('/poll-export works in a public channel the bot has not joined', async sim => {
   const ama = sim.user('UAMA');
   const made = await ama.createPoll({ questions: [LUNCH()] });
-  await ama.command('/poll-export', made.id, { channel: 'C1' });
+  const r = await ama.command('/poll-export', made.id, { channel: 'C1' });
   assert.strictEqual(sim.slack.files.length, 1, ama.dms().map(m => m.text).join(' '));
-}, { todo: 'AUDIT #6: the command uploads to the channel it ran in, which fails with a raw Slack error unless the bot was invited' });
+  assert.match(r.ephemerals[0].text, /is in your DM with me/);
+});
 
 scenario('a poll cannot be created with a close time that has already passed', async sim => {
   const ama = sim.user('UAMA');

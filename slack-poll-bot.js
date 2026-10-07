@@ -1023,7 +1023,11 @@ app.command('/poll-export', async ({ ack, body, client }) => {
     const poll = await getPoll(pollId);
     if (!poll) return client.chat.postEphemeral({ channel, user: userId, text: `❌ Poll not found: \`${pollId}\`` });
     if (!isCreatorOrCoCreator(poll, userId)) return client.chat.postEphemeral({ channel, user: userId, text: '❌ Only the poll creator can export this poll.' });
-    await uploadPollCsv(client, poll, channel);
+    // To the DM, like the Export buttons: an upload to a channel the bot was
+    // never invited to fails, which is most public channels.
+    const own = await client.conversations.open({ users: userId });
+    await uploadPollCsv(client, poll, own.channel.id);
+    await client.chat.postEphemeral({ channel, user: userId, text: `⬇️ The CSV for *${pollTitleMrkdwn(poll)}* is in your DM with me.` });
   } catch (err) {
     console.error('/poll-export error:', err);
     await dmUser(client, body.user_id, `❌ /poll-export failed: ${err.message}`);
