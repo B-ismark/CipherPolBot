@@ -410,6 +410,31 @@ scenario('Send from More goes out, reports what failed, and refuses a channel th
   assert.ok(k.dms().some(m => /already posted in <#C2>/.test(m.text)));
 });
 
+scenario('Send with nothing picked stays open and says what is missing', async sim => {
+  const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
+  const k = sim.user('UK');
+  await k.press('poll_more', {}, at(made.messageRefs[0]));
+  await k.press('more_send', {});
+  const r = await k.submit({});
+  clean(r);
+  assert.match(r.viewErrors?.poll_dest_channels || '', /Pick at least one channel or person/);
+  assert.strictEqual(k.top.view.callback_id, 'share_poll_submit', 'the Send screen is still open');
+  assert.deepStrictEqual(k.dms(), [], 'nothing arrives in a DM');
+});
+
+scenario('a Vote press on a poll that has closed shows the final results, with no id to type', async sim => {
+  const ama = sim.user('UAMA'), k = sim.user('UK');
+  const made = await ama.createPoll({ questions: [LUNCH()] });
+  await ama.command('/poll-close', made.id);
+  // A Vote button that outlived the close - a copy whose update was missed.
+  const r = await k.press('open_vote_modal', { value: made.id }, { forge: true });
+  clean(r);
+  const shown = JSON.stringify(k.top.view.blocks);
+  assert.match(shown, /no longer takes votes/);
+  assert.match(shown, /Thai/, 'the results are on the screen');
+  assert.doesNotMatch(shown, /poll-results|poll_\d/);
+});
+
 // ==================== who is offered what ====================
 
 scenario('the poll list offers Close and Export only to the people who run the poll', async sim => {
