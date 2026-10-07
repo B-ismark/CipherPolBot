@@ -757,7 +757,7 @@ app.command('/poll-share', async ({ ack, body, client }) => {
     if (!canViewResults(poll, null)) return client.chat.postEphemeral({
       channel,
       user: userId,
-      text: `🔒 Results for this poll are restricted (${resultsHiddenReason(poll).toLowerCase()}), so they cannot be posted to a channel yet. Close the poll with \`/poll-close ${poll.id}\`, or change the setting with \`/poll-edit ${poll.id}\`.`
+      text: `🔒 Results for this poll are restricted (${resultsHiddenReason(poll).toLowerCase()}), so they cannot be posted to a channel yet. Close the poll with \`/poll-close ${poll.id}\` to release them - a poll's results setting cannot be changed once it is created.`
     });
     await client.chat.postMessage({ channel, text: `📊 Current results: ${poll.title}`, blocks: buildResultsBlocks(poll, 'Current Results', userId) });
   } catch (err) {
