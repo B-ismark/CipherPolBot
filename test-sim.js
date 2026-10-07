@@ -91,6 +91,36 @@ scenario('an anonymous voter is told once, and nothing when they press their own
   assert.ok(!text(message(sim, ref)).includes('<@UK>'), 'nobody is named');
 });
 
+scenario('a question that needs 🗳️ Vote is mentioned on the first press only, and stays on the poll', async sim => {
+  const trip = [Q('Can you join?', ['Yes', 'No', 'Maybe']), Q('Where?', ['Paintball', 'Safari Valley']), OPEN('Somewhere else?')];
+  const needsVote = /questions that need the \*🗳️ Vote\* button/;
+  for (const settings of [['allow_revote'], ['allow_revote', 'anonymous']]) {
+    const made = await sim.user('UAMA').createPoll({ questions: trip, settings });
+    const ref = made.messageRefs[0];
+    const k = sim.user('UK');
+    const said = [];
+    for (const id of ['vote_option_0_0', 'vote_option_0_1', 'vote_option_0_2', 'vote_option_1_0']) {
+      const r = await k.press(id, {}, at(ref));
+      clean(r);
+      said.push(...r.ephemerals.map(e => e.text));
+    }
+    assert.strictEqual(said.filter(t => needsVote.test(t)).length, 1, `${settings}: reminded once, not on every press`);
+    assert.match(said[0], needsVote, `${settings}: and on the first press`);
+    assert.strictEqual(text(message(sim, ref)).split('Answer this one with 🗳️ Vote').length - 1, 1,
+      `${settings}: the poll names the one question that needs the button`);
+  }
+});
+
+scenario('the poll hints at 🗳️ Vote on every question the buttons cannot answer, results shown or hidden', async sim => {
+  const ranking = { text: 'Rank these', type: 'ranking', options: ['A', 'B'], allowMultiple: false };
+  const likert = { text: 'Rate these', type: 'likert', options: ['Pace', 'Venue'], allowMultiple: false };
+  for (const showResults of ['realtime', 'on_close']) {
+    const made = await sim.user('UAMA').createPoll({ questions: [LUNCH(), OPEN('Thoughts?'), ranking, likert], showResults });
+    const shown = text(message(sim, made.messageRefs[0]));
+    assert.strictEqual(shown.split('Answer this one with 🗳️ Vote').length - 1, 3, `${showResults}: one hint per question`);
+  }
+});
+
 scenario('with vote changes off, a second answer is refused and the first stands', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()], settings: [] });
   const ref = made.messageRefs[0];

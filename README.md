@@ -201,8 +201,10 @@ and it cannot be personalised:
 - **It cannot express a ranking or a Likert grid.** There is no single click that
   means "third place", so those question types have no inline buttons and still
   open the modal. Multiple choice, yes/no, agree/disagree and NPS all get them.
-  A mixed poll gets buttons on the questions that can take them, and the reply
-  says the rest still need the modal.
+  A mixed poll gets buttons on the questions that can take them, and each of
+  the rest says *Answer this one with 🗳️ Vote* on the poll itself. Your first
+  press also says so in its private reply - only the first, since those replies
+  cannot be edited and a reminder on every press stacks up line after line.
 
 On a multi-select question a press toggles that option, so you can pick several
 and take one back. Adding a choice is allowed even when the creator turned vote
