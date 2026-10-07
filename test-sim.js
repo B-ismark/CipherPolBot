@@ -502,6 +502,54 @@ scenario('every question type that can be posted can also be voted on in the mod
   assert.ok(opened.modal, 'the vote modal opens');
 });
 
+// What Slack sends for a ballot: the answer picked, and the notify box as it
+// stands - including a tick it was opened with and nobody touched.
+const ballot = (view, pick, notify) => {
+  const input = view.blocks.find(b => b.type === 'input' && b.block_id === 'vote_q0');
+  const box = view.blocks.find(b => b.block_id === 'vote_notify').element;
+  const ticked = notify ?? (box.initial_options || []);
+  return {
+    vote_q0: { [input.element.action_id]: { type: input.element.type, selected_option: input.element.options[pick] } },
+    vote_notify: { value: { type: 'checkboxes', selected_options: ticked } }
+  };
+};
+
+scenario('changing your vote keeps your ask to be told when the poll closes', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ questions: [LUNCH()], settings: ['allow_revote'] });
+  const k = sim.user('UEFUA');
+  await k.press('open_vote_modal', {}, at(made.messageRefs[0]));
+  clean(await k.submit(ballot(k.top.view, 0, [{ value: 'notify' }])));
+  k.dismiss();
+  await k.press('open_vote_modal', {}, at(made.messageRefs[0]));
+  clean(await k.submit(ballot(k.top.view, 1)));
+  assert.deepStrictEqual(JSON.parse(sim.db.row(made.id).notify_on_close), ['UEFUA']);
+});
+
+scenario('the "poll closed" DM opens the final results', async sim => {
+  const ama = sim.user('UAMA');
+  const made = await ama.createPoll({ title: 'Team lunch', questions: [LUNCH()] });
+  const k = sim.user('UEFUA');
+  await k.press('open_vote_modal', {}, at(made.messageRefs[0]));
+  clean(await k.submit(ballot(k.top.view, 0, [{ value: 'notify' }])));
+  k.dismiss();
+  await ama.command('/poll-close', made.id);
+  clean(await ama.submit({}));
+  const dm = k.dms().find(m => /has been closed/.test(JSON.stringify(m.blocks)));
+  assert.ok(dm, 'the DM arrived');
+  const visible = dm.blocks.flatMap(b => [b.text?.text, ...(b.elements || []).map(e => e.text?.text ?? e.text)]).join(' ');
+  assert.doesNotMatch(visible, /poll_\d/, 'no raw id to decode');
+  const r = await k.press('view_results_modal', {}, { channel: dm.channel, ts: dm.ts });
+  clean(r);
+  assert.match(JSON.stringify(k.top.view.blocks), /Team lunch/);
+});
+
+scenario('after posting, the creator is shown how to edit', async sim => {
+  const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()] });
+  const said = JSON.stringify(sim.user('UAMA').whispers().concat(sim.user('UAMA').dms()).map(m => m.blocks));
+  assert.ok(said.includes(`/poll-edit ${made.id}`), said.slice(0, 300));
+});
+
 scenario('with vote changes off, the vote modal says so once you have voted', async sim => {
   const made = await sim.user('UAMA').createPoll({ questions: [LUNCH()], settings: [] });
   const k = sim.user('UK');

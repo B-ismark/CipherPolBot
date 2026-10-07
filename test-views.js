@@ -359,7 +359,43 @@ test('the settings summary stays inside two phone lines however much is changed'
     pollTitle: 'Q3 planning offsite venue', pollSettings: ['anonymous', 'allow_revote'],
     showResults: 'creator_only', orderByVotes: true, closeAt: Date.now()
   });
-  assert.ok(longest.length <= MOBILE_LINE * 2, `summary is ${longest.length} chars: "${longest}"`);
+  // Measured as read: the close time is a date token that Slack shows as a
+  // short local date, so it counts at the widest that date can be.
+  const shown = longest.replace(/<!date\^[^>]*>/, 'Sep 30, 2026 at 12:00 PM');
+  assert.ok(shown.length <= MOBILE_LINE * 2, `summary is ${shown.length} chars: "${shown}"`);
+  assert.match(longest, /<!date\^\d+\^[^|>]+\|[^>]+>$/, 'the close time is whole, never cut');
+});
+
+test('close times are written for each reader\'s own time zone, not the server\'s', () => {
+  const at = Date.UTC(2026, 9, 9, 16, 0);
+  const token = views.closeTimeMrkdwn(at);
+  assert.strictEqual(token, `<!date^${at / 1000}^{date_short_pretty} at {time}|2026-10-09 16:00 UTC>`);
+  const poll = { id: 'p', title: 'T', creator: 'U1', questions: [question()], votes: { 0: { 0: [], 1: [] } }, status: 'active', closeAt: new Date(at) };
+  for (const [where, view] of [
+    ['poll message', { blocks: buildPollBlocks(poll) }],
+    ['ballot', buildVoteModal(poll)],
+    ['More', buildMoreModal(poll, 'U1', 'C1')],
+    ['list', { blocks: pollListBlocks([poll], { viewerId: 'U1' }) }],
+    ['preview', buildPreviewModal(draft({ savedQuestions: [question()], closeAt: at }))]
+  ]) {
+    const text = JSON.stringify(view.blocks);
+    assert.ok(text.includes(token.replace(/[\\"]/g, '\\$&')), `${where} uses the date token`);
+    assert.doesNotMatch(text, /\d:\d\d:\d\d/, `${where}: no server-formatted time`);
+  }
+});
+
+test('an untitled poll is previewed under the name it will be posted with', () => {
+  const header = view => view.blocks.find(b => b.type === 'header').text.text;
+  assert.strictEqual(header(buildPreviewModal(draft({ savedQuestions: [question('Lunch?')] }))), 'Lunch?');
+  assert.strictEqual(header(buildPreviewModal(draft({ savedQuestions: [question('Lunch?')], pollTitle: '  ' }))), 'Lunch?');
+  assert.strictEqual(header(buildPreviewModal(draft({ savedQuestions: [question('Lunch?')], pollTitle: 'Team lunch' }))), 'Team lunch');
+});
+
+test('the ballot\'s notify box starts out saying whether you are already subscribed', () => {
+  const poll = { id: 'p', title: 'T', creator: 'U1', questions: [question()], votes: { 0: { 0: [], 1: [] } }, status: 'active' };
+  const box = view => view.blocks.find(b => b.block_id === 'vote_notify').element;
+  assert.strictEqual(box(buildVoteModal(poll)).initial_options, undefined);
+  assert.deepStrictEqual(box(buildVoteModal(poll, {}, { subscribed: true })).initial_options.map(o => o.value), ['notify']);
 });
 
 test('no type picker entry can lose its meaning to truncation', () => {

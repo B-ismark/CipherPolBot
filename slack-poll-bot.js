@@ -345,7 +345,12 @@ async function sendCloseNotifications(client, poll) {
         text: `🔒 Poll closed: *${title}*`,
         blocks: [
           { type: 'section', text: { type: 'mrkdwn', text: `🔒 The poll *${title}* has been closed.` } },
-          { type: 'context', elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>  ·  ID: \`${poll.id}\`` }] }
+          // They asked so they could see how it ended: take them there.
+          { type: 'actions', elements: [{
+            type: 'button', text: { type: 'plain_text', text: '📊  View Results', emoji: true },
+            style: 'primary', action_id: 'view_results_modal', value: poll.id
+          }] },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `Created by <@${poll.creator}>` }] }
         ]
       });
     } catch (e) {
@@ -1643,9 +1648,10 @@ async function voteScreen(pollId, userId) {
     };
   }
 
+  const subscribed = (poll.notifyOnClose || []).includes(userId);
   return poll.allowRevote
-    ? buildVoteModal(poll, previousAnswers(poll, userId))
-    : buildVoteModal(poll, {}, { locked });
+    ? buildVoteModal(poll, previousAnswers(poll, userId), { subscribed })
+    : buildVoteModal(poll, {}, { locked, subscribed });
 }
 
 // Slack allows 3 seconds for the ack. A vote is normally written well inside
