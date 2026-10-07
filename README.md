@@ -34,7 +34,7 @@ Go to **OAuth & Permissions → Bot Token Scopes** and add exactly these six:
 | `chat:write.public` | Posting to a public channel without being invited to it first |
 | `im:write` | Opening a DM — polls sent to people, polls created in DMs, close notifications, error reports |
 | `files:write` | The CSV from `/poll-export` |
-| `users:read` | Names in the CSV export, beside each person's Slack ID (without it, the export shows the IDs alone). It lets the bot look up member names and profiles - not email addresses |
+| `users:read` | Names in the CSV export's Responses section, beside each person's Slack ID (without it, the export shows the IDs alone). It lets the bot look up member names and profiles - not email addresses |
 
 That is the complete set: those are the only Slack methods the bot calls
 (`chat.postMessage`, `chat.postEphemeral`, `chat.update`, `conversations.open`,
@@ -312,7 +312,7 @@ are the creator's business anyway.
 ```
 /poll-export poll_1706234567_abc12345
 ```
-→ Exports results as a CSV file, with per-voter rows for non-anonymous polls, into your DM with the bot. Creator only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
+→ Exports results as a CSV file into your DM with the bot: the totals first, then - unless the poll is anonymous - a **Responses** section with one row per person per answer (name, Slack ID, question, answer, time of their latest vote). Creator only. Usually unnecessary: use the **⬇️ Export** button on `/polls-list` or `/polls-archive`.
 
 ```
 /poll-close poll_1706234567_abc12345
