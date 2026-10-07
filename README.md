@@ -231,7 +231,7 @@ were reaching for, and two clicks in a dropdown to get to. Change it under
 **⚙️ More options** if this poll should be quieter.
 
 Hiding the tally does not hide the ballot. With **Show results** set to *Only to
-creator* or *After close*, the options and their buttons are still listed; only
+creator, until it closes* or *After close*, the options and their buttons are still listed; only
 the counts, bars and voter names are withheld. Previously the whole option list
 went with them, which left a question in the channel with no visible answers.
 
