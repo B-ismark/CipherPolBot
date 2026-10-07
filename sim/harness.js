@@ -314,8 +314,11 @@ class User {
       channelId: channel, userId: this.id, savedQuestions: questions, pollTitle: title, pollDescription: description,
       pollSettings: settings, showResults, orderByVotes: false, closeAt, destChannels, destUsers
     };
+    // The row this call made, not the newest: the clock may not have moved
+    // since the last poll, so created_at alone can tie.
+    const before = new Set(this.sim.db.rows().map(x => x.id));
     const r = await this.submitDirect('poll_preview_submit', { privateMetadata: JSON.stringify(meta) });
-    const row = this.sim.db.rows().filter(x => x.creator === this.id).sort((a, b) => b.created_at - a.created_at)[0];
+    const row = this.sim.db.rows().find(x => x.creator === this.id && !before.has(x.id));
     return { result: r, row, id: row && row.id, messageRefs: row ? JSON.parse(row.message_refs) : [] };
   }
 
